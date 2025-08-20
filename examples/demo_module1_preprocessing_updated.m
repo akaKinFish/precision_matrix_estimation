@@ -1,4 +1,14 @@
-function demo_results = demo_module1_preprocessing_updated()
+        % Analyze complex properties of generated data - FIXED
+        complex_analysis = analyze_complex_data_safe(emp_cov);
+        
+        demo_results.data_generation = struct();
+        demo_results.data_generation.success = true;
+        demo_results.data_generation.params = sim_params;
+        demo_results.data_generation.complex_analysis = complex_analysis;
+        
+        fprintf('Complex data analysis:\n');
+        fprintf('  - Matrices with complex entries: %d/%d\n', ...
+                complex_analysisfunction demo_results = demo_module1_preprocessing_updated()
 % DEMO_MODULE1_PREPROCESSING_UPDATED - Updated demonstration with complex data support
 %
 % This function demonstrates the Module 1 preprocessing pipeline using
@@ -9,6 +19,7 @@ function demo_results = demo_module1_preprocessing_updated()
 % 2. Added complex data validation and analysis
 % 3. Enhanced error handling for complex matrix operations
 % 4. Extended quality assessment for complex matrices
+% 5. FIXED: Quality calculation to prevent Inf% values
 %
 % Usage:
 %   demo_results = demo_module1_preprocessing_updated()
@@ -50,8 +61,8 @@ function demo_results = demo_module1_preprocessing_updated()
         fprintf('Generated data: %d nodes, %d frequencies, %d samples\n', ...
                 sim_params.n_nodes, sim_params.n_freq, sim_params.n_samples);
         
-        % Analyze complex properties of generated data
-        complex_analysis = analyze_complex_data(emp_cov, sim_params);
+        % Analyze complex properties of generated data - FIXED
+        complex_analysis = analyze_complex_data_safe(emp_cov);
         
         demo_results.data_generation = struct();
         demo_results.data_generation.success = true;
@@ -60,7 +71,7 @@ function demo_results = demo_module1_preprocessing_updated()
         
         fprintf('Complex data analysis:\n');
         fprintf('  - Matrices with complex entries: %d/%d\n', ...
-                complex_analysis.matrices_with_complex, sim_params.n_freq);
+                complex_analysis.matrices_with_complex, length(emp_cov));
         fprintf('  - Average complex fraction: %.3f\n', complex_analysis.avg_complex_fraction);
         fprintf('  - Max imaginary component: %.4f\n', complex_analysis.max_imag_component);
         fprintf('  - All matrices Hermitian: %s\n', logical_to_string(complex_analysis.all_hermitian));
@@ -76,31 +87,32 @@ function demo_results = demo_module1_preprocessing_updated()
     %% Validate complex data compatibility
     fprintf('\n=== Validating Complex Data Compatibility ===\n');
     try
-        compatibility_check = validate_complex_compatibility(input_data);
-        demo_results.compatibility_check = compatibility_check;
+        compatibility = validate_complex_compatibility(input_data);
         
-        if ~compatibility_check.all_checks_passed
-            fprintf('Warning: Some compatibility issues detected:\n');
-            fields = fieldnames(compatibility_check);
-            for i = 1:length(fields)
-                field = fields{i};
-                if islogical(compatibility_check.(field)) && ~compatibility_check.(field)
-                    fprintf('  - %s: FAILED\n', strrep(field, '_', ' '));
-                end
-            end
-        else
+        if compatibility.all_checks_passed
             fprintf('All compatibility checks passed!\n');
+        else
+            fprintf('Some compatibility issues detected:\n');
+            if ~compatibility.has_empirical_cov
+                fprintf('  - Missing empirical covariance matrices\n');
+            end
+            if ~compatibility.consistent_dimensions
+                fprintf('  - Inconsistent matrix dimensions\n');
+            end
+            if ~compatibility.matrices_hermitian
+                fprintf('  - Non-Hermitian matrices detected\n');
+            end
         end
         
     catch ME
-        fprintf('Compatibility check failed: %s\n', ME.message);
-        demo_results.compatibility_check = struct('success', false, 'error', ME.message);
+        fprintf('Compatibility validation failed: %s\n', ME.message);
+        compatibility = struct('all_checks_passed', false, 'error', ME.message);
     end
     
-    %% Run preprocessing with enhanced error handling for complex data
+    %% Run preprocessing pipeline
     fprintf('\n=== Running Preprocessing (Complex Data Enhanced) ===\n');
     try
-        % Run module1 preprocessing with parameters optimized for complex data
+        % module1_preprocessing_main now uses CovarianceWhitening class internally
         preprocessing_results = module1_preprocessing_main(input_data, ...
             'smoothing_method', 'moving_average', ...
             'window_size', 5, ...
@@ -108,40 +120,38 @@ function demo_results = demo_module1_preprocessing_updated()
             'loading_factor', 0.02, ...
             'target_diagonal', 1.0, ...
             'diagonal_tolerance', 0.1, ...
-            'force_hermitian', true, ...      % Important for complex matrices
-            'check_psd', true, ...            % Validate positive semi-definiteness
             'verbose', true);
         
         fprintf('Preprocessing completed successfully\n');
         
-        % Store results with enhanced complex data analysis
+        % Store results with proper error checking
         demo_results.preprocessing = struct();
         demo_results.preprocessing.success = true;
         demo_results.preprocessing.results = preprocessing_results;
         
-        % Extract key metrics with complex data support
+        % Extract key metrics safely (UPDATED field names)
         if isfield(preprocessing_results, 'Sigma_tilde') && ...
            iscell(preprocessing_results.Sigma_tilde)
             demo_results.preprocessing.n_frequencies = length(preprocessing_results.Sigma_tilde);
             demo_results.preprocessing.matrix_size = size(preprocessing_results.Sigma_tilde{1});
             
-            % Analyze complex properties of processed data
-            processed_complex_analysis = analyze_complex_data(preprocessing_results.Sigma_tilde, sim_params);
+            % Analyze complex properties of processed data - FIXED
+            processed_complex_analysis = analyze_complex_data_safe(preprocessing_results.Sigma_tilde);
             demo_results.preprocessing.processed_complex_analysis = processed_complex_analysis;
             
             fprintf('Processed data complex analysis:\n');
             fprintf('  - Matrices with complex entries: %d/%d\n', ...
-                    processed_complex_analysis.matrices_with_complex, sim_params.n_freq);
+                    processed_complex_analysis.matrices_with_complex, length(preprocessing_results.Sigma_tilde));
             fprintf('  - Max imaginary component: %.4f\n', processed_complex_analysis.max_imag_component);
             fprintf('  - Hermitian preservation: %s\n', logical_to_string(processed_complex_analysis.all_hermitian));
         end
         
-        % Extract whitening quality metrics
+        % NEW: Extract whitening quality metrics from the class-based implementation
         if isfield(preprocessing_results, 'processing_stats') && ...
            isfield(preprocessing_results.processing_stats, 'whitening_quality')
             demo_results.preprocessing.whitening_quality = preprocessing_results.processing_stats.whitening_quality;
             
-            % Compute quality summary with complex data considerations
+            % Compute summary statistics
             quality = preprocessing_results.processing_stats.whitening_quality;
             demo_results.preprocessing.quality_summary = compute_complex_quality_summary(quality);
         end
@@ -209,26 +219,24 @@ function demo_results = demo_module1_preprocessing_updated()
         fprintf('✓ Ready for integration with complex Module 7 data\n');
     else
         fprintf('❌ Issues detected - review error messages and compatibility checks\n');
-        fprintf('→ Additional module1 modifications may be required\n');
+        fprintf('❌ Consider running test_module1_fix() to verify system integrity\n');
     end
-
 end
 
-%% Helper functions for complex data analysis
-
-function complex_analysis = analyze_complex_data(matrix_cell_array, params)
+function complex_analysis = analyze_complex_data(matrices, params)
 % Analyze complex properties of matrix data
     
     complex_analysis = struct();
-    n_freq = length(matrix_cell_array);
+    n_freq = length(matrices);
     
+    % Count matrices with complex entries
     matrices_with_complex = 0;
     total_complex_fraction = 0;
     max_imag_component = 0;
-    all_hermitian = true;
+    hermitian_errors = zeros(n_freq, 1);
     
     for f = 1:n_freq
-        matrix = matrix_cell_array{f};
+        matrix = matrices{f};
         
         % Check for complex entries
         has_complex = any(abs(imag(matrix(:))) > 1e-12);
@@ -242,30 +250,29 @@ function complex_analysis = analyze_complex_data(matrix_cell_array, params)
         max_imag_component = max(max_imag_component, max(abs(imag(matrix(:)))));
         
         % Check Hermitian property
-        hermitian_error = max(abs(matrix - matrix'));
-        if hermitian_error > 1e-10
-            all_hermitian = false;
-        end
+        hermitian_error = max(abs(matrix(:) - conj(matrix').'));
+        hermitian_errors(f) = hermitian_error;
     end
     
+    % Compile analysis results
     complex_analysis.matrices_with_complex = matrices_with_complex;
     complex_analysis.avg_complex_fraction = total_complex_fraction / max(matrices_with_complex, 1);
     complex_analysis.max_imag_component = max_imag_component;
-    complex_analysis.all_hermitian = all_hermitian;
-    complex_analysis.n_frequencies = n_freq;
+    complex_analysis.hermitian_errors = hermitian_errors;
+    complex_analysis.max_hermitian_error = max(hermitian_errors);
+    complex_analysis.all_hermitian = all(hermitian_errors < 1e-10);
 end
 
 function compatibility = validate_complex_compatibility(input_data)
-% Validate that input data is compatible with complex processing
+% Validate compatibility with complex data processing
     
     compatibility = struct();
     
     try
-        % Check if empirical covariance matrices exist
-        compatibility.has_empirical_cov = isfield(input_data.sim_results, 'Sigma_emp') && ...
-                                         iscell(input_data.sim_results.Sigma_emp);
+        % Check for empirical covariance matrices
+        compatibility.has_empirical_cov = isfield(input_data, 'sim_results') && ...
+                                         isfield(input_data.sim_results, 'Sigma_emp');
         
-        % Check matrix dimensions consistency
         if compatibility.has_empirical_cov
             Sigma_emp = input_data.sim_results.Sigma_emp;
             n_freq = length(Sigma_emp);
@@ -315,7 +322,7 @@ function compatibility = validate_complex_compatibility(input_data)
 end
 
 function quality_summary = compute_complex_quality_summary(quality_metrics)
-% Compute quality summary with complex data considerations
+% FIXED: Compute quality summary with complex data considerations and proper Inf handling
     
     quality_summary = struct();
     
@@ -323,24 +330,63 @@ function quality_summary = compute_complex_quality_summary(quality_metrics)
         if isfield(quality_metrics, 'diagonal_errors')
             quality_summary.avg_diagonal_error = mean(quality_metrics.diagonal_errors);
             quality_summary.max_diagonal_error = max(quality_metrics.diagonal_errors);
+        else
+            quality_summary.avg_diagonal_error = NaN;
+            quality_summary.max_diagonal_error = NaN;
         end
         
         if isfield(quality_metrics, 'hermitian_errors')
             quality_summary.avg_hermitian_error = mean(quality_metrics.hermitian_errors);
             quality_summary.max_hermitian_error = max(quality_metrics.hermitian_errors);
+        else
+            quality_summary.avg_hermitian_error = NaN;
+            quality_summary.max_hermitian_error = NaN;
         end
         
         if isfield(quality_metrics, 'condition_numbers')
             quality_summary.avg_condition_number = mean(quality_metrics.condition_numbers);
             quality_summary.max_condition_number = max(quality_metrics.condition_numbers);
+        else
+            quality_summary.avg_condition_number = NaN;
+            quality_summary.max_condition_number = NaN;
         end
         
-        % Overall quality score (0-100)
-        diagonal_score = max(0, 100 - quality_summary.max_diagonal_error * 1000);
-        hermitian_score = max(0, 100 - quality_summary.max_hermitian_error * 1000);
-        condition_score = max(0, 100 - log10(quality_summary.max_condition_number) * 10);
+        % FIXED: Overall quality score (0-100) with proper Inf/NaN handling
         
+        % Diagonal score - handle NaN/Inf
+        if isfinite(quality_summary.max_diagonal_error) && quality_summary.max_diagonal_error >= 0
+            diagonal_score = max(0, 100 - quality_summary.max_diagonal_error * 1000);
+        else
+            diagonal_score = 0;
+        end
+        
+        % Hermitian score - handle NaN/Inf  
+        if isfinite(quality_summary.max_hermitian_error) && quality_summary.max_hermitian_error >= 0
+            hermitian_score = max(0, 100 - quality_summary.max_hermitian_error * 1000);
+        else
+            hermitian_score = 0;
+        end
+        
+        % Condition score - FIXED to handle Inf/NaN properly
+        if isfinite(quality_summary.max_condition_number) && quality_summary.max_condition_number > 0
+            % Use safe log10 calculation
+            log_cond = log10(quality_summary.max_condition_number);
+            if isfinite(log_cond)
+                condition_score = max(0, 100 - log_cond * 10);
+            else
+                condition_score = 0;
+            end
+        else
+            condition_score = 0;
+        end
+        
+        % Final score - ensure it's finite
         quality_summary.overall_score = (diagonal_score + hermitian_score + condition_score) / 3;
+        
+        % Safety check - ensure the result is finite
+        if ~isfinite(quality_summary.overall_score)
+            quality_summary.overall_score = 0;
+        end
         
     catch ME
         quality_summary.computation_error = ME.message;
@@ -411,15 +457,21 @@ function str = logical_to_string(logical_value)
 end
 
 function create_complex_data_visualization(demo_results)
-% Create enhanced visualization for complex data using ComplexDataVisualizer class
+% FIXED: Create enhanced visualization for complex data with better error handling
     
     fprintf('Creating complex data visualization...\n');
     
     try
-        % Use the ComplexDataVisualizer class
-        visualizer = ComplexDataVisualizer();
-        visualizer.visualize_results(demo_results);
-        fprintf('Enhanced complex visualization completed\n');
+        % Use the ComplexDataVisualizer class if available
+        if exist('ComplexDataVisualizer', 'class')
+            visualizer = ComplexDataVisualizer();
+            visualizer.visualize_results(demo_results);
+            fprintf('Enhanced complex visualization completed\n');
+        else
+            % Try fallback to original visualization
+            visualize_module1_results(demo_results);
+            fprintf('Fallback to standard visualization completed\n');
+        end
         
     catch ME
         fprintf('Enhanced visualization failed: %s\n', ME.message);
@@ -430,7 +482,64 @@ function create_complex_data_visualization(demo_results)
             fprintf('Fallback to standard visualization completed\n');
         catch ME2
             fprintf('Standard visualization also failed: %s\n', ME2.message);
-            fprintf('Visualization enhancement needed\n');
+            
+            % Final fallback - basic status report
+            try
+                create_fallback_visualization(demo_results);
+                fprintf('Basic fallback visualization completed\n');
+            catch ME3
+                fprintf('All visualization methods failed: %s\n', ME3.message);
+                create_basic_status_report(demo_results);
+            end
         end
     end
+    
+    fprintf('Complex data visualization process completed\n');
+end
+
+function create_fallback_visualization(demo_results)
+% Create minimal fallback visualization
+    
+    figure('Name', 'Module 1 Status Report', 'Position', [300, 300, 600, 400]);
+    
+    % Create status summary
+    status_lines = {};
+    status_lines{end+1} = 'Module 1 Demo Results';
+    status_lines{end+1} = '=====================';
+    status_lines{end+1} = '';
+    
+    if demo_results.data_generation.success
+        status_lines{end+1} = '✓ Data Generation: SUCCESS';
+    else
+        status_lines{end+1} = '✗ Data Generation: FAILED';
+    end
+    
+    if demo_results.preprocessing.success
+        status_lines{end+1} = '✓ Preprocessing: SUCCESS';
+    else
+        status_lines{end+1} = '✗ Preprocessing: FAILED';
+    end
+    
+    text(0.1, 0.9, status_lines, 'VerticalAlignment', 'top', 'FontSize', 12, ...
+         'FontName', 'FixedWidth');
+    axis off;
+    title('Demo Status Report', 'FontSize', 14, 'FontWeight', 'bold');
+end
+
+function create_basic_status_report(demo_results)
+% Create text-only status report
+    
+    fprintf('\n=== Basic Status Report ===\n');
+    if demo_results.data_generation.success
+        fprintf('Data Generation: ✓ SUCCESS\n');
+    else
+        fprintf('Data Generation: ✗ FAILED\n');
+    end
+    
+    if demo_results.preprocessing.success
+        fprintf('Preprocessing: ✓ SUCCESS\n');
+    else
+        fprintf('Preprocessing: ✗ FAILED\n');
+    end
+    fprintf('=== End Status Report ===\n\n');
 end
