@@ -28,25 +28,15 @@ function demo_results = demo_module1_preprocessing_updated()
     fprintf('=== Generating Complex Simulation Data ===\n');
     try
         % Use module7_simulation_improved_complex to generate complex Hermitian test data
-if exist('module7_simulation_improved_complex', 'file')
-    fprintf('Using enhanced complex simulation\n');
-    [true_prec, true_cov, emp_cov, sim_params] = module7_simulation_improved_complex(...
-        'n_nodes', 12, ...
-        'n_freq', 15, ...
-        'n_samples', 100, ...
-        'graph_type', 'chain', ...
-        'complex_strength', 1.0, ...  % 新参数：控制复数强度
-        'sparsity_variation', 0.3, ... % 新参数：稀疏性变化
-        'random_seed', 42);
-else
-    fprintf('Using original simulation (complex version not available)\n');
-    [true_prec, true_cov, emp_cov, sim_params] = module7_simulation(...
-        'n_nodes', 12, ...
-        'n_freq', 15, ...
-        'n_samples', 100, ...
-        'graph_type', 'chain', ...
-        'random_seed', 42);
-end
+        [true_prec, true_cov, emp_cov, sim_params] = module7_simulation_improved_complex(...
+            'n_nodes', 12, ...
+            'n_freq', 15, ...
+            'n_samples', 100, ...
+            'graph_type', 'chain', ...
+            'complex_strength', 1.0, ...  % Enable complex components
+            'sparsity_variation', 0.3, ...
+            'edge_activation_smoothness', 0.8, ...
+            'random_seed', 42);
         
         % Convert to input format expected by module1
         input_data = struct();
@@ -66,54 +56,6 @@ end
         demo_results.data_generation = struct();
         demo_results.data_generation.success = true;
         demo_results.data_generation.params = sim_params;
-
-        % 新增：分析复数数据特性
-fprintf('Analyzing data properties...\n');
-complex_analysis = struct();
-complex_analysis.n_frequencies = length(emp_cov);
-complex_analysis.matrices_with_complex = 0;
-complex_analysis.avg_complex_fraction = 0;
-complex_analysis.max_imag_component = 0;
-complex_analysis.all_hermitian = true;
-
-total_complex_fraction = 0;
-for f = 1:length(emp_cov)
-    matrix = emp_cov{f};
-    
-    % 检查复数元素
-    has_complex = any(abs(imag(matrix(:))) > 1e-12);
-    if has_complex
-        complex_analysis.matrices_with_complex = complex_analysis.matrices_with_complex + 1;
-        complex_fraction = sum(abs(imag(matrix(:))) > 1e-12) / numel(matrix);
-        total_complex_fraction = total_complex_fraction + complex_fraction;
-    end
-    
-    % 跟踪最大虚部
-    complex_analysis.max_imag_component = max(complex_analysis.max_imag_component, ...
-                                              max(abs(imag(matrix(:)))));
-    
-    % 检查 Hermitian 特性
-    hermitian_error = max(abs(matrix - matrix'));
-    if hermitian_error > 1e-10
-        complex_analysis.all_hermitian = false;
-    end
-end
-
-if complex_analysis.matrices_with_complex > 0
-    complex_analysis.avg_complex_fraction = total_complex_fraction / complex_analysis.matrices_with_complex;
-end
-
-demo_results.data_generation.complex_analysis = complex_analysis;
-
-% 显示复数数据分析结果
-fprintf('Complex data analysis:\n');
-fprintf('  - Matrices with complex entries: %d/%d\n', ...
-        complex_analysis.matrices_with_complex, complex_analysis.n_frequencies);
-fprintf('  - Average complex fraction: %.3f\n', complex_analysis.avg_complex_fraction);
-fprintf('  - Max imaginary component: %.4f\n', complex_analysis.max_imag_component);
-fprintf('  - All matrices Hermitian: %s\n', logical_to_string(complex_analysis.all_hermitian));
-
-
         demo_results.data_generation.complex_analysis = complex_analysis;
         
         fprintf('Complex data analysis:\n');
@@ -160,15 +102,15 @@ fprintf('  - All matrices Hermitian: %s\n', logical_to_string(complex_analysis.a
     try
         % Run module1 preprocessing with parameters optimized for complex data
         preprocessing_results = module1_preprocessing_main(input_data, ...
-    'smoothing_method', 'moving_average', ...
-    'window_size', 5, ...
-    'diagonal_loading', true, ...
-    'loading_factor', 0.02, ...
-    'target_diagonal', 1.0, ...
-    'diagonal_tolerance', 0.1, ...
-    'force_hermitian', true, ...      % 新增：强制 Hermitian 对称性
-    'check_psd', true, ...            % 新增：检查正半定性
-    'verbose', true);
+            'smoothing_method', 'moving_average', ...
+            'window_size', 5, ...
+            'diagonal_loading', true, ...
+            'loading_factor', 0.02, ...
+            'target_diagonal', 1.0, ...
+            'diagonal_tolerance', 0.1, ...
+            'force_hermitian', true, ...      % Important for complex matrices
+            'check_psd', true, ...            % Validate positive semi-definiteness
+            'verbose', true);
         
         fprintf('Preprocessing completed successfully\n');
         
@@ -178,46 +120,21 @@ fprintf('  - All matrices Hermitian: %s\n', logical_to_string(complex_analysis.a
         demo_results.preprocessing.results = preprocessing_results;
         
         % Extract key metrics with complex data support
-        % 新增：分析处理后的复数数据特性
-if isfield(preprocessing_results, 'Sigma_tilde') && iscell(preprocessing_results.Sigma_tilde)
-    processed_complex_analysis = struct();
-    processed_complex_analysis.n_frequencies = length(preprocessing_results.Sigma_tilde);
-    processed_complex_analysis.matrices_with_complex = 0;
-    processed_complex_analysis.max_imag_component = 0;
-    processed_complex_analysis.all_hermitian = true;
-    processed_complex_analysis.max_hermitian_error = 0;
-    
-    for f = 1:length(preprocessing_results.Sigma_tilde)
-        matrix = preprocessing_results.Sigma_tilde{f};
-        
-        % 检查复数保持
-        if any(abs(imag(matrix(:))) > 1e-12)
-            processed_complex_analysis.matrices_with_complex = processed_complex_analysis.matrices_with_complex + 1;
+        if isfield(preprocessing_results, 'Sigma_tilde') && ...
+           iscell(preprocessing_results.Sigma_tilde)
+            demo_results.preprocessing.n_frequencies = length(preprocessing_results.Sigma_tilde);
+            demo_results.preprocessing.matrix_size = size(preprocessing_results.Sigma_tilde{1});
+            
+            % Analyze complex properties of processed data
+            processed_complex_analysis = analyze_complex_data(preprocessing_results.Sigma_tilde, sim_params);
+            demo_results.preprocessing.processed_complex_analysis = processed_complex_analysis;
+            
+            fprintf('Processed data complex analysis:\n');
+            fprintf('  - Matrices with complex entries: %d/%d\n', ...
+                    processed_complex_analysis.matrices_with_complex, sim_params.n_freq);
+            fprintf('  - Max imaginary component: %.4f\n', processed_complex_analysis.max_imag_component);
+            fprintf('  - Hermitian preservation: %s\n', logical_to_string(processed_complex_analysis.all_hermitian));
         end
-        
-        % 跟踪最大虚部
-        processed_complex_analysis.max_imag_component = max(processed_complex_analysis.max_imag_component, ...
-                                                           max(abs(imag(matrix(:)))));
-        
-        % 检查 Hermitian 特性保持
-        hermitian_error = max(abs(matrix - matrix'));
-        processed_complex_analysis.max_hermitian_error = max(processed_complex_analysis.max_hermitian_error, ...
-                                                           hermitian_error);
-        if hermitian_error > 1e-10
-            processed_complex_analysis.all_hermitian = false;
-        end
-    end
-    
-    demo_results.preprocessing.processed_complex_analysis = processed_complex_analysis;
-    
-    fprintf('Processed data complex analysis:\n');
-    fprintf('  - Matrices with complex entries: %d/%d\n', ...
-            processed_complex_analysis.matrices_with_complex, processed_complex_analysis.n_frequencies);
-    fprintf('  - Max imaginary component: %.4f\n', processed_complex_analysis.max_imag_component);
-    fprintf('  - Hermitian preservation: %s\n', logical_to_string(processed_complex_analysis.all_hermitian));
-    fprintf('  - Max Hermitian error: %.2e\n', processed_complex_analysis.max_hermitian_error);
-end
-
         
         % Extract whitening quality metrics
         if isfield(preprocessing_results, 'processing_stats') && ...
@@ -494,25 +411,26 @@ function str = logical_to_string(logical_value)
 end
 
 function create_complex_data_visualization(demo_results)
-% Create enhanced visualization for complex data
-% This function will be implemented separately in the visualization module
+% Create enhanced visualization for complex data using ComplexDataVisualizer class
     
     fprintf('Creating complex data visualization...\n');
     
-    % For now, call the existing visualization with error handling
     try
-        visualize_module1_results(demo_results);
-        fprintf('Standard visualization completed\n');
+        % Use the ComplexDataVisualizer class
+        visualizer = ComplexDataVisualizer();
+        visualizer.visualize_results(demo_results);
+        fprintf('Enhanced complex visualization completed\n');
+        
     catch ME
-        fprintf('Standard visualization failed: %s\n', ME.message);
-        fprintf('Complex data visualization enhancement needed\n');
+        fprintf('Enhanced visualization failed: %s\n', ME.message);
+        
+        % Try fallback to original visualization
+        try
+            visualize_module1_results(demo_results);
+            fprintf('Fallback to standard visualization completed\n');
+        catch ME2
+            fprintf('Standard visualization also failed: %s\n', ME2.message);
+            fprintf('Visualization enhancement needed\n');
+        end
     end
-    
-    % TODO: Implement enhanced complex data visualization
-    % - Magnitude/phase plots for complex matrices
-    % - Hermitian property verification plots
-    % - Complex whitening quality assessment
-    
-    fprintf('Note: Enhanced complex visualization features to be implemented\n');
 end
-
