@@ -22,7 +22,7 @@ MATLAB implementation of frequency-domain precision matrix estimation with cross
 ## Modules
 
 1. **Module 1**: Data preprocessing and whitening
-2. **Module 2**: Initialization
+2. **Module 2**: E-step
 3. **Module 3**: Active set selection
 4. **Module 4**: Gradient computation
 5. **Module 5**: Proximal updates
