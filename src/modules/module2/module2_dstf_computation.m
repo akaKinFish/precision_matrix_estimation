@@ -1,255 +1,241 @@
 function T_jv = module2_dstf_computation(L, Sigma_jj_omega, Sigma_xi_xi, options)
-    % MODULE2_DSTF_COMPUTATION - Compute Data-to-Source Transfer Function (DSTF)
-    %
-    % Syntax:
-    %   T_jv = module2_dstf_computation(L, Sigma_jj_omega, Sigma_xi_xi)
-    %   T_jv = module2_dstf_computation(L, Sigma_jj_omega, Sigma_xi_xi, options)
-    %
-    % Description:
-    %   Computes the Data-to-Source Transfer Function (DSTF) for the E-step:
-    %   T_jv^(ω) = Σ_jj^(ω) L^H (L Σ_jj^(ω) L^H + Σ_ξξ)^(-1)
-    %   
-    %   This function implements the core computation for mapping from sensor
-    %   space to source space, accounting for both source prior covariance
-    %   and sensor noise characteristics.
-    %
-    % Input Arguments:
-    %   L - (double, p×n) Leadfield matrix mapping sources to sensors
-    %   Sigma_jj_omega - (complex, n×n) Source prior covariance matrix at frequency ω
-    %   Sigma_xi_xi - (complex, p×p) Sensor noise covariance matrix (typically diagonal)
-    %
-    % Name-Value Arguments:
-    %   regularization_factor - (double) Regularization parameter for numerical stability. Default: 1e-8
-    %   condition_threshold - (double) Condition number threshold for stability warning. Default: 1e12
-    %   use_pseudoinverse - (logical) Use pseudoinverse for near-singular matrices. Default: false
-    %   verbose - (logical) Enable verbose output for debugging. Default: false
-    %
-    % Output Arguments:
-    %   T_jv - (complex, n×p) Data-to-Source Transfer Function matrix
-    %
-    % Examples:
-    %   % Basic usage with simple matrices
-    %   L = randn(64, 100);  % 64 sensors, 100 sources
-    %   Sigma_jj = eye(100) * 0.5;  % Source prior covariance
-    %   Sigma_xi = eye(64) * 0.1;   % Sensor noise covariance
-    %   T_jv = module2_dstf_computation(L, Sigma_jj, Sigma_xi);
-    %   
-    %   % Advanced usage with regularization
-    %   T_jv = module2_dstf_computation(L, Sigma_jj, Sigma_xi, ...
-    %                                   'regularization_factor', 1e-6, ...
-    %                                   'verbose', true);
-    %
-    % Mathematical Background:
-    %   The DSTF represents the optimal linear estimator for source activity
-    %   given sensor measurements, derived from Bayesian inference under
-    %   Gaussian assumptions. The matrix inversion can be numerically
-    %   challenging when the matrix L*Sigma_jj*L^H + Sigma_xi_xi is
-    %   ill-conditioned, requiring careful regularization strategies.
-    %
-    % Edge Cases:
-    %   - Large source variance (Σ_jj >> Σ_ξξ): T_jv approaches pseudoinverse behavior
-    %   - High noise (Σ_ξξ >> L*Σ_jj*L^H): T_jv approaches zero
-    %   - Identity leadfield (L=I), diagonal covariances: T_jv = α/(α+σ²)*I
-    %
-    % See also: MODULE2_POSTERIOR_SOURCE_COVARIANCE, MODULE2_RESIDUAL_TRANSFER_FUNCTION
-    %
-    % Author: [Author Name]
-    % Date: [Current Date]
-    % Version: 1.0
-    
-    %% Input validation
+% MODULE2_DSTF_COMPUTATION - Compute Data-to-Source Transfer Function (DSTF)
+%
+% Syntax:
+%   T_jv = module2_dstf_computation(L, Sigma_jj_omega, Sigma_xi_xi)
+%   T_jv = module2_dstf_computation(L, Sigma_jj_omega, Sigma_xi_xi, options)
+%
+% Description:
+%   Computes the DSTF for the E-step:
+%       T_jv^(ω) = Σ_jj^(ω) L^H (L Σ_jj^(ω) L^H + Σ_ξξ)^(-1)
+%   This implementation prefers the information-form:
+%       T = (Σ_jj^{-1} + L^H Σ_ξξ^{-1} L)^{-1} L^H Σ_ξξ^{-1}
+%   It avoids explicit matrix inverses by solving linear systems with
+%   jittered Cholesky factorization for robustness.
+%
+% Name-Value Arguments (options):
+%   regularization_factor  - (double, >=0) base jitter scaling, default 1e-8
+%   jitter_max_tries       - (integer, >=0) max jitter escalations, default 6
+%   method                 - 'auto'|'information'|'sensor' (default 'auto')
+%   use_pseudoinverse      - (logical) fallback to pinv only if factorization fails
+%   verbose                - (logical) print diagnostic info
+%
+% Output:
+%   T_jv - (complex, n×p) Data-to-Source Transfer Function
+%
+% Notes:
+%   - No explicit inv(A) is used. We rely on mldivide and Cholesky.
+%   - Inputs are numerically symmetrized to reduce floating asymmetry.
+%   - If inputs are real and the result has tiny imaginary parts, cast to real.
+
+    %% -------- Input validation --------
     if ~isnumeric(L) || ndims(L) ~= 2
         error('module2_dstf_computation:invalid_leadfield', ...
               'Leadfield matrix L must be a 2D numeric array');
     end
-    
     [p, n] = size(L);
-    
+
     if ~isnumeric(Sigma_jj_omega) || ~ismatrix(Sigma_jj_omega)
         error('module2_dstf_computation:invalid_source_covariance', ...
               'Source covariance Sigma_jj_omega must be a numeric matrix');
     end
-    
-    if size(Sigma_jj_omega, 1) ~= n || size(Sigma_jj_omega, 2) ~= n
+    if size(Sigma_jj_omega,1) ~= n || size(Sigma_jj_omega,2) ~= n
         error('module2_dstf_computation:dimension_mismatch_source', ...
-              'Source covariance dimensions (%d×%d) must match leadfield sources (%d)', ...
-              size(Sigma_jj_omega, 1), size(Sigma_jj_omega, 2), n);
+              'Source covariance must be n×n where n = size(L,2)');
     end
-    
+
     if ~isnumeric(Sigma_xi_xi) || ~ismatrix(Sigma_xi_xi)
         error('module2_dstf_computation:invalid_noise_covariance', ...
               'Noise covariance Sigma_xi_xi must be a numeric matrix');
     end
-    
-    if size(Sigma_xi_xi, 1) ~= p || size(Sigma_xi_xi, 2) ~= p
+    if size(Sigma_xi_xi,1) ~= p || size(Sigma_xi_xi,2) ~= p
         error('module2_dstf_computation:dimension_mismatch_noise', ...
-              'Noise covariance dimensions (%d×%d) must match leadfield sensors (%d)', ...
-              size(Sigma_xi_xi, 1), size(Sigma_xi_xi, 2), p);
+              'Noise covariance must be p×p where p = size(L,1)');
     end
-    
-    % Check for NaN or Inf values
+
     if any(isnan(L(:))) || any(isinf(L(:)))
         error('module2_dstf_computation:invalid_leadfield_values', ...
-              'Leadfield matrix contains NaN or Inf values');
+              'Leadfield contains NaN or Inf');
     end
-    
     if any(isnan(Sigma_jj_omega(:))) || any(isinf(Sigma_jj_omega(:)))
         error('module2_dstf_computation:invalid_source_values', ...
-              'Source covariance contains NaN or Inf values');
+              'Source covariance contains NaN or Inf');
     end
-    
     if any(isnan(Sigma_xi_xi(:))) || any(isinf(Sigma_xi_xi(:)))
         error('module2_dstf_computation:invalid_noise_values', ...
-              'Noise covariance contains NaN or Inf values');
+              'Noise covariance contains NaN or Inf');
     end
-    
-    %% Parse optional arguments
-    if nargin < 4
-        options = struct();
-    end
-    
-    % Set default options
-    default_options = struct(...
+
+    %% -------- Parse options --------
+    if nargin < 4 || isempty(options); options = struct(); end
+    defaults = struct( ...
         'regularization_factor', 1e-8, ...
-        'condition_threshold', 1e12, ...
+        'jitter_max_tries', 6, ...
+        'method', 'auto', ...
         'use_pseudoinverse', false, ...
         'verbose', false);
-    
-    % Merge user options with defaults
-    option_names = fieldnames(default_options);
-    for i = 1:length(option_names)
-        field_name = option_names{i};
-        if ~isfield(options, field_name)
-            options.(field_name) = default_options.(field_name);
+    fns = fieldnames(defaults);
+    for i = 1:numel(fns)
+        if ~isfield(options, fns{i})
+            options.(fns{i}) = defaults.(fns{i});
         end
     end
-    
-    % Validate option types
-    if ~isscalar(options.regularization_factor) || ~isnumeric(options.regularization_factor) || options.regularization_factor < 0
+
+    if ~isscalar(options.regularization_factor) || options.regularization_factor < 0
         error('module2_dstf_computation:invalid_regularization', ...
               'regularization_factor must be a non-negative scalar');
     end
-    
-    if ~isscalar(options.condition_threshold) || ~isnumeric(options.condition_threshold) || options.condition_threshold <= 1
-        error('module2_dstf_computation:invalid_condition_threshold', ...
-              'condition_threshold must be a scalar greater than 1');
+    if ~isscalar(options.jitter_max_tries) || options.jitter_max_tries < 0 || fix(options.jitter_max_tries) ~= options.jitter_max_tries
+        error('module2_dstf_computation:invalid_jitter_max_tries', ...
+              'jitter_max_tries must be a non-negative integer');
     end
-    
+    if ~ischar(options.method) || ~ismember(lower(options.method), {'auto','information','sensor'})
+        error('module2_dstf_computation:invalid_method', ...
+              'method must be one of {''auto'',''information'',''sensor''}');
+    end
     if ~islogical(options.use_pseudoinverse) || ~isscalar(options.use_pseudoinverse)
         error('module2_dstf_computation:invalid_pseudoinverse_flag', ...
               'use_pseudoinverse must be a logical scalar');
     end
-    
     if ~islogical(options.verbose) || ~isscalar(options.verbose)
         error('module2_dstf_computation:invalid_verbose_flag', ...
               'verbose must be a logical scalar');
     end
-    
-    %% Main computation
-    try
-        if options.verbose
-            fprintf('Computing DSTF with dimensions: sensors=%d, sources=%d\n', p, n);
-        end
-        
-        % Step 1: Compute intermediate matrix A = L * Sigma_jj_omega * L^H + Sigma_xi_xi
-        L_Sigma_jj = L * Sigma_jj_omega;
-        A = L_Sigma_jj * L' + Sigma_xi_xi;
-        
-        % Step 2: Check numerical properties
-        if ~ishermitian(A)
-            if options.verbose
-                hermitian_error = norm(A - A', 'fro') / norm(A, 'fro');
-                fprintf('Matrix A is not Hermitian (relative error: %.2e), symmetrizing...\n', hermitian_error);
-            end
-            A = (A + A') / 2;  % Force Hermitian symmetry
-        end
-        
-        % Step 3: Condition number analysis and regularization
-        cond_A = cond(A);
-        if options.verbose
-            fprintf('Condition number of A: %.2e\n', cond_A);
-        end
-        
-        if cond_A > options.condition_threshold
-            if options.verbose
-                warning('module2_dstf_computation:high_condition_number', ...
-                        'High condition number (%.2e) detected, applying regularization', cond_A);
-            end
-            
-            % Apply regularization: A_reg = A + ε * trace(A)/p * I
-            reg_strength = options.regularization_factor * trace(A) / p;
-            A = A + reg_strength * eye(p);
-            
-            if options.verbose
-                fprintf('Applied regularization: strength = %.2e\n', reg_strength);
-                fprintf('New condition number: %.2e\n', cond(A));
-            end
-        end
-        
-        % Step 4: Matrix inversion with stability checks
-        if options.use_pseudoinverse
-            % Use pseudoinverse for robust handling of near-singular matrices
-            A_inv = pinv(A);
-            if options.verbose
-                fprintf('Used pseudoinverse for matrix inversion\n');
-            end
-        else
-            % Standard matrix inversion
-            A_inv = inv(A);
-        end
-        
-        % Step 5: Compute final DSTF
-        T_jv = Sigma_jj_omega * L' * A_inv;
-        
-        % Ensure numerical consistency for complex matrices
-        if ~isreal(T_jv) && isreal(L) && isreal(Sigma_jj_omega)
-            % If inputs are real but output is complex due to numerical errors
-            if max(abs(imag(T_jv(:)))) < 1e-14
-                T_jv = real(T_jv);
-            end
-        end
-        
-        if options.verbose
-            fprintf('DSTF computation completed successfully\n');
-            fprintf('Output matrix dimensions: %d×%d\n', size(T_jv, 1), size(T_jv, 2));
-        end
-        
-    catch ME
-        % Enhanced error handling with context
-        switch ME.identifier
-            case 'MATLAB:matrix:singular'
-                error('module2_dstf_computation:singular_matrix', ...
-                      'Matrix A = L*Sigma_jj*L^H + Sigma_xi_xi is singular. Consider increasing regularization_factor or using pseudoinverse');
-            case 'MATLAB:matrix:posdef'
-                error('module2_dstf_computation:not_positive_definite', ...
-                      'Matrix A is not positive definite. Check input covariance matrices for validity');
-            otherwise
-                rethrow(ME);
-        end
+
+    if options.verbose
+        fprintf('module2_dstf_computation: p=%d sensors, n=%d sources\n', p, n);
     end
-    
-    %% Output validation
-    % Check for NaN or Inf in output
+
+    %% -------- Numerical symmetrization (stability hygiene) --------
+    % Reduce floating-point non-Hermitian noise in covariance inputs.
+    Sigma_jj_omega = (Sigma_jj_omega + Sigma_jj_omega')/2;
+    Sigma_xi_xi    = (Sigma_xi_xi    + Sigma_xi_xi')/2;
+
+    %% -------- Choose computation form --------
+    method = lower(options.method);
+    if strcmp(method,'auto')
+        % Information-form is typically more stable and cheaper if p >> n.
+        method = 'information';
+    end
+
+    %% -------- Core computation (no explicit inverse) --------
+    if strcmp(method,'information')
+        % Information form:
+        %   G = Σ_jj^{-1} + L^H Σ_ξξ^{-1} L
+        %   RHS = L^H Σ_ξξ^{-1}
+        %   Solve G * X = RHS, then T = X
+        I_n = eye(n, class(Sigma_jj_omega));
+
+        % Compute Sigma_xi_xi^{-1} * L by solving linear systems
+        B = Sigma_xi_xi \ L;      % p×n
+
+        % Build G without explicit inversion of Σ_jj
+        G = (Sigma_jj_omega \ I_n) + (L' * B);  % n×n, theoretically Hermitian
+        G = (G + G')/2;                         % enforce symmetry numerically
+
+        RHS = B';                               % n×p, since L^H Σ_ξξ^{-1} = (Σ_ξξ^{-1} L)^H
+
+        [X, ok, info] = solve_spd_with_jitter(G, RHS, options.regularization_factor, options.jitter_max_tries, options.verbose);
+        if ~ok
+            if options.use_pseudoinverse
+                warning('module2_dstf_computation:using_pinv_fallback', ...
+                        'G factorization failed; falling back to pinv (not recommended).');
+                X = pinv(G) * RHS;
+            else
+                error('module2_dstf_computation:spd_solve_failed', ...
+                      'Failed to factorize G even with jitter (last jitter=%.3e).', info.last_jitter);
+            end
+        end
+
+        T_jv = X;  % n×p
+
+    else
+        % Sensor form:
+        %   A = L Σ_jj L^H + Σ_ξξ
+        %   Solve A * Y = L Σ_jj, then T = Y^H
+        L_Sigma = L * Sigma_jj_omega;       % p×n
+        A = L_Sigma * L' + Sigma_xi_xi;     % p×p
+        A = (A + A')/2;
+
+        [Y, ok, info] = solve_spd_with_jitter(A, L_Sigma, options.regularization_factor, options.jitter_max_tries, options.verbose);
+        if ~ok
+            if options.use_pseudoinverse
+                warning('module2_dstf_computation:using_pinv_fallback', ...
+                        'A factorization failed; falling back to pinv (not recommended).');
+                Y = pinv(A) * L_Sigma;
+            else
+                error('module2_dstf_computation:spd_solve_failed', ...
+                      'Failed to factorize A even with jitter (last jitter=%.3e).', info.last_jitter);
+            end
+        end
+
+        % A^{-1} (L Σ) is Y; T = (Σ L^H A^{-1}) = (A^{-1} L Σ)^H = Y'
+        T_jv = Y';
+    end
+
+    %% -------- Output checks and cleanup --------
     if any(isnan(T_jv(:))) || any(isinf(T_jv(:)))
         error('module2_dstf_computation:invalid_output', ...
-              'Output T_jv contains NaN or Inf values, indicating numerical instability');
+              'Output T_jv contains NaN or Inf');
     end
-    
-    % Verify output dimensions
-    if size(T_jv, 1) ~= n || size(T_jv, 2) ~= p
+    if size(T_jv,1) ~= n || size(T_jv,2) ~= p
         error('module2_dstf_computation:output_dimension_error', ...
-              'Output dimensions (%d×%d) do not match expected (%d×%d)', ...
-              size(T_jv, 1), size(T_jv, 2), n, p);
+              'Output must be n×p');
     end
-    
+
+    % If inputs are real and imaginary leakage is tiny, drop it.
+    if isreal(L) && isreal(Sigma_jj_omega) && isreal(Sigma_xi_xi)
+        imax = max(abs(imag(T_jv(:))));
+        if imax < 1e-13
+            T_jv = real(T_jv);
+        end
+    end
+
     if options.verbose
-        % Report on matrix properties
-        max_element = max(abs(T_jv(:)));
-        frobenius_norm = norm(T_jv, 'fro');
-        
-        fprintf('Output validation:\n');
-        fprintf('  - Maximum absolute element: %.6f\n', max_element);
-        fprintf('  - Frobenius norm: %.6f\n', frobenius_norm);
-        fprintf('  - Output is complex: %s\n', mat2str(~isreal(T_jv)));
+        fprintf('DSTF computation completed using method: %s\n', method);
+        fprintf('||T_jv||_F = %.6e\n', norm(T_jv,'fro'));
     end
+end
+
+%% ===== Helper: SPD linear solve with jittered Cholesky =====
+function [X, ok, info] = solve_spd_with_jitter(A, B, base_reg, max_tries, verbose)
+% Solve A * X = B where A is expected Hermitian (semi)PD.
+% Adds jitter*I progressively until Cholesky succeeds.
+    ok = false; X = [];
+    info = struct('last_jitter', 0, 'tries', 0);
+
+    if ~ishermitian(A)
+        if verbose
+            he = norm(A - A', 'fro')/max(1,norm(A,'fro'));
+            fprintf('  [sym] A not Hermitian (rel diff=%.2e). Symmetrizing...\n', he);
+        end
+        A = (A + A')/2;
+    end
+
+    scale = trace(A)/max(1,size(A,1));
+    if ~isfinite(scale) || scale <= 0, scale = 1; end
+    jitter0 = base_reg * scale;
+
+    for k = 0:max_tries
+        jitter = jitter0 * (10^k);
+        A_try = A + jitter * eye(size(A), class(A));
+        [R, flag] = chol(A_try);
+        if flag == 0
+            Y = R' \ B;
+            X = R  \ Y;
+            ok = true;
+            info.last_jitter = jitter;
+            info.tries = k+1;
+            if verbose
+                fprintf('  [chol] success with jitter = %.3e (tries=%d)\n', jitter, k+1);
+            end
+            return;
+        else
+            if verbose
+                fprintf('  [chol] fail @ jitter = %.3e\n', jitter);
+            end
+        end
+    end
+    info.last_jitter = jitter0 * (10^max_tries);
+    info.tries = max_tries + 1;
 end

@@ -1,310 +1,229 @@
 function Sigma_jj_post = module2_posterior_source_covariance(Sigma_jj_omega, L, Sigma_xi_xi, options)
-    % MODULE2_POSTERIOR_SOURCE_COVARIANCE - Compute Posterior Source Covariance (SPC)
-    %
-    % Syntax:
-    %   Sigma_jj_post = module2_posterior_source_covariance(Sigma_jj_omega, L, Sigma_xi_xi)
-    %   Sigma_jj_post = module2_posterior_source_covariance(Sigma_jj_omega, L, Sigma_xi_xi, options)
-    %
-    % Description:
-    %   Computes the posterior source covariance matrix for the E-step:
-    %   Σ_jj,post^(ω) = Σ_jj^(ω) - Σ_jj^(ω) L^H (L Σ_jj^(ω) L^H + Σ_ξξ)^(-1) L Σ_jj^(ω)
-    %   
-    %   This represents the uncertainty reduction in source estimates after
-    %   incorporating sensor measurements, following the Kalman filter update equations.
-    %
-    % Input Arguments:
-    %   Sigma_jj_omega - (complex, n×n) Source prior covariance matrix at frequency ω
-    %   L - (double, p×n) Leadfield matrix mapping sources to sensors
-    %   Sigma_xi_xi - (complex, p×p) Sensor noise covariance matrix
-    %
-    % Name-Value Arguments:
-    %   regularization_factor - (double) Regularization parameter for numerical stability. Default: 1e-8
-    %   condition_threshold - (double) Condition number threshold for stability warning. Default: 1e12
-    %   ensure_positive_definite - (logical) Force output to be positive definite. Default: true
-    %   min_eigenvalue_ratio - (double) Minimum eigenvalue as ratio of maximum. Default: 1e-12
-    %   verbose - (logical) Enable verbose output for debugging. Default: false
-    %
-    % Output Arguments:
-    %   Sigma_jj_post - (complex, n×n) Posterior source covariance matrix
-    %
-    % Examples:
-    %   % Basic usage
-    %   L = randn(64, 100);  % 64 sensors, 100 sources
-    %   Sigma_jj = eye(100) * 0.5;  % Source prior covariance
-    %   Sigma_xi = eye(64) * 0.1;   % Sensor noise covariance
-    %   Sigma_post = module2_posterior_source_covariance(Sigma_jj, L, Sigma_xi);
-    %   
-    %   % Usage with numerical stability options
-    %   Sigma_post = module2_posterior_source_covariance(Sigma_jj, L, Sigma_xi, ...
-    %                                                     'ensure_positive_definite', true, ...
-    %                                                     'min_eigenvalue_ratio', 1e-10);
-    %
-    % Mathematical Background:
-    %   The posterior covariance represents the Bayesian update of source
-    %   uncertainty after incorporating sensor measurements. It satisfies:
-    %   - Σ_jj,post ≼ Σ_jj (uncertainty reduction)
-    %   - Σ_jj,post → Σ_jj as sensor noise increases
-    %   - Σ_jj,post → 0 as sensor noise decreases (perfect observations)
-    %
-    % Numerical Considerations:
-    %   The computation involves matrix subtraction which can lead to loss of
-    %   positive definiteness due to numerical errors. The function includes
-    %   options to enforce matrix properties through eigenvalue clipping.
-    %
-    % See also: MODULE2_DSTF_COMPUTATION, MODULE2_RESIDUAL_TRANSFER_FUNCTION
-    %
-    % Author: [Author Name]
-    % Date: [Current Date]
-    % Version: 1.0
-    
-    %% Input validation
+% MODULE2_POSTERIOR_SOURCE_COVARIANCE - Compute Posterior Source Covariance (SPC)
+%
+% Syntax:
+%   Sigma_jj_post = module2_posterior_source_covariance(Sigma_jj_omega, L, Sigma_xi_xi)
+%   Sigma_jj_post = module2_posterior_source_covariance(Sigma_jj_omega, L, Sigma_xi_xi, options)
+%
+% Description:
+%   Computes the posterior source covariance for the E-step using the
+%   information-form update:
+%       Sigma_post = (Sigma_jj^{-1} + L^H * Sigma_xi^{-1} * L)^{-1}
+%   This is numerically more stable than the subtractive form
+%       Sigma_post = Sigma_jj - Sigma_jj L^H (L Sigma_jj L^H + Sigma_xi)^{-1} L Sigma_jj
+%   as it avoids potential loss of positive semidefiniteness due to
+%   subtraction/cancellation.
+%
+% Name-Value Arguments (options):
+%   regularization_factor   - (double >=0) base jitter scaling, default 1e-8
+%   jitter_max_tries        - (integer >=0) maximum jitter escalations, default 6
+%   ensure_positive_definite- (logical) clip eigenvalues if needed, default true
+%   min_eigenvalue_ratio    - (double in (0,1)) min eig floor as ratio of max eig, default 1e-12
+%   verbose                 - (logical) print diagnostics, default false
+%
+% Output:
+%   Sigma_jj_post - (complex, n×n) posterior source covariance (Hermitian PSD/PD)
+%
+% Notes:
+%   - No explicit inv/cond; solve linear systems via jittered Cholesky.
+%   - Inputs are numerically symmetrized to reduce floating asymmetry.
+%   - If inputs are real and the result has tiny imaginary leakage, cast to real.
+
+    %% -------- Input validation --------
     if ~isnumeric(Sigma_jj_omega) || ~ismatrix(Sigma_jj_omega)
         error('module2_posterior_source_covariance:invalid_source_covariance', ...
-              'Source covariance Sigma_jj_omega must be a numeric matrix');
+              'Sigma_jj_omega must be a numeric matrix');
     end
-    
-    [n1, n2] = size(Sigma_jj_omega);
+    [n1,n2] = size(Sigma_jj_omega);
     if n1 ~= n2
         error('module2_posterior_source_covariance:not_square_source', ...
-              'Source covariance must be square, got %d×%d', n1, n2);
+              'Sigma_jj_omega must be square, got %d×%d', n1, n2);
     end
     n = n1;
-    
+
     if ~isnumeric(L) || ndims(L) ~= 2
         error('module2_posterior_source_covariance:invalid_leadfield', ...
-              'Leadfield matrix L must be a 2D numeric array');
+              'L must be a 2D numeric array');
     end
-    
     [p, n_sources] = size(L);
     if n_sources ~= n
         error('module2_posterior_source_covariance:dimension_mismatch_leadfield', ...
-              'Leadfield sources (%d) must match source covariance dimension (%d)', ...
-              n_sources, n);
+              'Leadfield columns (%d) must match Sigma_jj_omega size (%d)', n_sources, n);
     end
-    
+
     if ~isnumeric(Sigma_xi_xi) || ~ismatrix(Sigma_xi_xi)
         error('module2_posterior_source_covariance:invalid_noise_covariance', ...
-              'Noise covariance Sigma_xi_xi must be a numeric matrix');
+              'Sigma_xi_xi must be a numeric matrix');
     end
-    
-    if size(Sigma_xi_xi, 1) ~= p || size(Sigma_xi_xi, 2) ~= p
+    if size(Sigma_xi_xi,1) ~= p || size(Sigma_xi_xi,2) ~= p
         error('module2_posterior_source_covariance:dimension_mismatch_noise', ...
-              'Noise covariance dimensions (%d×%d) must match leadfield sensors (%d)', ...
-              size(Sigma_xi_xi, 1), size(Sigma_xi_xi, 2), p);
+              'Sigma_xi_xi must be p×p where p = size(L,1)');
     end
-    
-    % Check for valid covariance matrices (Hermitian)
-    if ~ishermitian(Sigma_jj_omega)
-        hermitian_error = norm(Sigma_jj_omega - Sigma_jj_omega', 'fro') / norm(Sigma_jj_omega, 'fro');
-        if hermitian_error > 1e-10
-            error('module2_posterior_source_covariance:not_hermitian_source', ...
-                  'Source covariance is not Hermitian (relative error: %.2e)', hermitian_error);
-        end
-    end
-    
-    if ~ishermitian(Sigma_xi_xi)
-        hermitian_error = norm(Sigma_xi_xi - Sigma_xi_xi', 'fro') / norm(Sigma_xi_xi, 'fro');
-        if hermitian_error > 1e-10
-            error('module2_posterior_source_covariance:not_hermitian_noise', ...
-                  'Noise covariance is not Hermitian (relative error: %.2e)', hermitian_error);
-        end
-    end
-    
-    % Check for NaN or Inf values
+
     if any(isnan(Sigma_jj_omega(:))) || any(isinf(Sigma_jj_omega(:)))
         error('module2_posterior_source_covariance:invalid_source_values', ...
-              'Source covariance contains NaN or Inf values');
+              'Sigma_jj_omega contains NaN or Inf');
     end
-    
     if any(isnan(L(:))) || any(isinf(L(:)))
         error('module2_posterior_source_covariance:invalid_leadfield_values', ...
-              'Leadfield matrix contains NaN or Inf values');
+              'Leadfield L contains NaN or Inf');
     end
-    
     if any(isnan(Sigma_xi_xi(:))) || any(isinf(Sigma_xi_xi(:)))
         error('module2_posterior_source_covariance:invalid_noise_values', ...
-              'Noise covariance contains NaN or Inf values');
+              'Sigma_xi_xi contains NaN or Inf');
     end
-    
-    %% Parse optional arguments
-    if nargin < 4
-        options = struct();
-    end
-    
-    % Set default options
-    default_options = struct(...
+
+    %% -------- Parse options --------
+    if nargin < 4 || isempty(options); options = struct(); end
+    defaults = struct( ...
         'regularization_factor', 1e-8, ...
-        'condition_threshold', 1e12, ...
+        'jitter_max_tries', 6, ...
         'ensure_positive_definite', true, ...
         'min_eigenvalue_ratio', 1e-12, ...
         'verbose', false);
-    
-    % Merge user options with defaults
-    option_names = fieldnames(default_options);
-    for i = 1:length(option_names)
-        field_name = option_names{i};
-        if ~isfield(options, field_name)
-            options.(field_name) = default_options.(field_name);
+    fns = fieldnames(defaults);
+    for i = 1:numel(fns)
+        if ~isfield(options, fns{i})
+            options.(fns{i}) = defaults.(fns{i});
         end
     end
-    
-    % Validate option types
-    if ~isscalar(options.regularization_factor) || ~isnumeric(options.regularization_factor) || options.regularization_factor < 0
+    if ~isscalar(options.regularization_factor) || options.regularization_factor < 0
         error('module2_posterior_source_covariance:invalid_regularization', ...
               'regularization_factor must be a non-negative scalar');
     end
-    
-    if ~isscalar(options.min_eigenvalue_ratio) || ~isnumeric(options.min_eigenvalue_ratio) || ...
-            options.min_eigenvalue_ratio <= 0 || options.min_eigenvalue_ratio >= 1
+    if ~isscalar(options.jitter_max_tries) || options.jitter_max_tries < 0 || fix(options.jitter_max_tries) ~= options.jitter_max_tries
+        error('module2_posterior_source_covariance:invalid_jitter_max_tries', ...
+              'jitter_max_tries must be a non-negative integer');
+    end
+    if ~isscalar(options.min_eigenvalue_ratio) || options.min_eigenvalue_ratio <= 0 || options.min_eigenvalue_ratio >= 1
         error('module2_posterior_source_covariance:invalid_eigenvalue_ratio', ...
-              'min_eigenvalue_ratio must be a scalar in (0, 1)');
+              'min_eigenvalue_ratio must be in (0,1)');
     end
-    
-    %% Main computation
-    try
-        if options.verbose
-            fprintf('Computing posterior source covariance with dimensions: sources=%d, sensors=%d\n', n, p);
-        end
-        
-        % Step 1: Compute intermediate matrices
-        L_Sigma_jj = L * Sigma_jj_omega;
-        A = L_Sigma_jj * L' + Sigma_xi_xi;  % Sensor space covariance
-        
-        % Step 2: Ensure A is Hermitian and well-conditioned
-        if ~ishermitian(A)
-            if options.verbose
-                hermitian_error = norm(A - A', 'fro') / norm(A, 'fro');
-                fprintf('Matrix A is not Hermitian (relative error: %.2e), symmetrizing...\n', hermitian_error);
-            end
-            A = (A + A') / 2;
-        end
-        
-        % Step 3: Check condition number and apply regularization if needed
-        cond_A = cond(A);
-        if options.verbose
-            fprintf('Condition number of sensor covariance: %.2e\n', cond_A);
-        end
-        
-        if cond_A > options.condition_threshold
-            if options.verbose
-                warning('module2_posterior_source_covariance:high_condition_number', ...
-                        'High condition number (%.2e) detected, applying regularization', cond_A);
-            end
-            
-            reg_strength = options.regularization_factor * trace(A) / p;
-            A = A + reg_strength * eye(p);
-            
-            if options.verbose
-                fprintf('Applied regularization: strength = %.2e\n', reg_strength);
-                fprintf('New condition number: %.2e\n', cond(A));
-            end
-        end
-        
-        % Step 4: Compute the correction term: Σ_jj L^H A^(-1) L Σ_jj
-        A_inv = inv(A);
-        correction_term = Sigma_jj_omega * L' * A_inv * L * Sigma_jj_omega;
-        
-        % Step 5: Compute posterior covariance
-        Sigma_jj_post = Sigma_jj_omega - correction_term;
-        
-        % Step 6: Ensure Hermitian symmetry (critical for numerical stability)
-        Sigma_jj_post = (Sigma_jj_post + Sigma_jj_post') / 2;
-        
-        % Step 7: Enforce positive definiteness if requested
-        if options.ensure_positive_definite
-            [V, D] = eig(Sigma_jj_post);
-            eigenvals = real(diag(D));
-            
-            % Check if any eigenvalues are negative or too small
-            min_allowed_eigenval = options.min_eigenvalue_ratio * max(eigenvals);
-            negative_eigenvals = sum(eigenvals < 0);
-            small_eigenvals = sum(eigenvals < min_allowed_eigenval & eigenvals >= 0);
-            
-            if negative_eigenvals > 0 || small_eigenvals > 0
+    if ~islogical(options.ensure_positive_definite) || ~isscalar(options.ensure_positive_definite)
+        error('module2_posterior_source_covariance:invalid_epd_flag', ...
+              'ensure_positive_definite must be a logical scalar');
+    end
+    if ~islogical(options.verbose) || ~isscalar(options.verbose)
+        error('module2_posterior_source_covariance:invalid_verbose_flag', ...
+              'verbose must be a logical scalar');
+    end
+
+    if options.verbose
+        fprintf('module2_posterior_source_covariance: n=%d sources, p=%d sensors\n', n, p);
+    end
+
+    %% -------- Numerical symmetrization (stability hygiene) --------
+    % Reduce floating-point non-Hermitian noise in covariance inputs.
+    Sigma_jj_omega = (Sigma_jj_omega + Sigma_jj_omega')/2;
+    Sigma_xi_xi    = (Sigma_xi_xi    + Sigma_xi_xi')/2;
+
+    %% -------- Information-form assembly --------
+    % Compute Sigma_xi_xi^{-1} * L via linear solves (no explicit inverse)
+    B = Sigma_xi_xi \ L;                 % p×n
+    % Build the information matrix:
+    %   G = Sigma_jj^{-1} + L^H * Sigma_xi^{-1} * L  (n×n, Hermitian)
+    I_n = eye(n, class(Sigma_jj_omega));
+    G = (Sigma_jj_omega \ I_n) + (L' * B);
+    G = (G + G')/2;                      % enforce symmetry numerically
+
+    %% -------- Compute Sigma_post by solving G * X = I --------
+    % Solve for the inverse via jittered Cholesky:
+    [R, jitter, ok] = chol_with_jitter(G, options.regularization_factor, options.jitter_max_tries, options.verbose);
+    if ~ok
+        error('module2_posterior_source_covariance:spd_factorization_failed', ...
+              'Failed to factorize G even with jitter (last jitter=%.3e)', jitter);
+    end
+    % Inverse from Cholesky: G = R'R  =>  G^{-1} = R \ (R' \ I)
+    Y = R' \ I_n;
+    Sigma_jj_post = R \ Y;
+
+    % Ensure Hermitian numerically
+    Sigma_jj_post = (Sigma_jj_post + Sigma_jj_post')/2;
+
+    %% -------- Optional eigenvalue clipping (rarely needed with info-form) --------
+    if options.ensure_positive_definite
+        % In practice, Sigma_post should be PD if Sigma_jj and Sigma_xi are PD.
+        % For PSD inputs or severe round-off, clip eigenvalues to a relative floor.
+        [V, D] = eig(Sigma_jj_post);
+        d = real(diag(D));
+        dmax = max(d);
+        if ~isempty(dmax) && isfinite(dmax)
+            floor_val = options.min_eigenvalue_ratio * max(dmax, eps(class(dmax)));
+            idx = d < floor_val;
+            if any(idx)
                 if options.verbose
-                    fprintf('Eigenvalue correction: %d negative, %d too small\n', ...
-                            negative_eigenvals, small_eigenvals);
+                    fprintf('Eigenvalue clipping applied: min %.3e -> floor %.3e (count=%d)\n', ...
+                            min(d), floor_val, nnz(idx));
                 end
-                
-                % Clip eigenvalues to ensure positive definiteness
-                eigenvals(eigenvals < min_allowed_eigenval) = min_allowed_eigenval;
-                
-                % Reconstruct matrix
-                Sigma_jj_post = V * diag(eigenvals) * V';
-                
-                % Ensure Hermitian after reconstruction
-                Sigma_jj_post = (Sigma_jj_post + Sigma_jj_post') / 2;
-                
-                if options.verbose
-                    fprintf('Applied eigenvalue clipping, min eigenvalue: %.2e\n', min(eigenvals));
-                end
+                d(idx) = floor_val;
+                Sigma_jj_post = V * diag(d) * V';
+                Sigma_jj_post = (Sigma_jj_post + Sigma_jj_post')/2;
             end
-        end
-        
-        if options.verbose
-            fprintf('Posterior source covariance computation completed successfully\n');
-        end
-        
-    catch ME
-        % Enhanced error handling with context
-        switch ME.identifier
-            case 'MATLAB:matrix:singular'
-                error('module2_posterior_source_covariance:singular_matrix', ...
-                      'Sensor covariance matrix is singular. Consider increasing regularization_factor');
-            case 'MATLAB:matrix:posdef'
-                error('module2_posterior_source_covariance:not_positive_definite', ...
-                      'Input covariance matrices are not positive definite');
-            otherwise
-                rethrow(ME);
         end
     end
-    
-    %% Output validation
-    % Check for NaN or Inf in output
+
+    %% -------- Output checks --------
     if any(isnan(Sigma_jj_post(:))) || any(isinf(Sigma_jj_post(:)))
         error('module2_posterior_source_covariance:invalid_output', ...
-              'Output contains NaN or Inf values, indicating numerical instability');
+              'Output contains NaN or Inf');
     end
-    
-    % Verify output dimensions
-    if size(Sigma_jj_post, 1) ~= n || size(Sigma_jj_post, 2) ~= n
+    if size(Sigma_jj_post,1) ~= n || size(Sigma_jj_post,2) ~= n
         error('module2_posterior_source_covariance:output_dimension_error', ...
-              'Output dimensions (%d×%d) do not match expected (%d×%d)', ...
-              size(Sigma_jj_post, 1), size(Sigma_jj_post, 2), n, n);
+              'Output must be n×n');
     end
-    
-    % Verify uncertainty reduction property: Σ_post ≼ Σ_prior
-    try
-        eigenvals_diff = eig(Sigma_jj_omega - Sigma_jj_post);
-        if any(real(eigenvals_diff) < -1e-10)  % Allow small numerical errors
-            warning('module2_posterior_source_covariance:uncertainty_increase', ...
-                    'Posterior covariance may not satisfy uncertainty reduction property');
-        end
-    catch
-        % Skip this check if eigenvalue computation fails
-        if options.verbose
-            fprintf('Skipped uncertainty reduction check due to numerical issues\n');
+
+    % If inputs are real and imaginary leakage is tiny, drop it
+    if isreal(L) && isreal(Sigma_jj_omega) && isreal(Sigma_xi_xi)
+        imax = max(abs(imag(Sigma_jj_post(:))));
+        if imax < 1e-13
+            Sigma_jj_post = real(Sigma_jj_post);
         end
     end
-    
+
+    % Optional diagnostic: uncertainty reduction (Sigma_prior - Sigma_post) >= 0
     if options.verbose
-        % Report on matrix properties
-        frobenius_norm = norm(Sigma_jj_post, 'fro');
-        trace_ratio = trace(Sigma_jj_post) / trace(Sigma_jj_omega);
-        
         try
-            min_eigenval = min(real(eig(Sigma_jj_post)));
-            condition_number = cond(Sigma_jj_post);
+            Dred = eig(Sigma_jj_omega - Sigma_jj_post);
+            if any(real(Dred) < -1e-10)
+                warning('module2_posterior_source_covariance:uncertainty_increase', ...
+                        'Uncertainty reduction check failed (numerical tolerance exceeded).');
+            end
+            fprintf('||Sigma_post||_F = %.6e, trace ratio = %.6f\n', ...
+                     norm(Sigma_jj_post,'fro'), trace(Sigma_jj_post)/max(1,trace(Sigma_jj_omega)));
         catch
-            min_eigenval = NaN;
-            condition_number = NaN;
+            fprintf('Skipped uncertainty reduction eigen-check due to numerical issues.\n');
         end
-        
-        fprintf('Output validation:\n');
-        fprintf('  - Frobenius norm: %.6f\n', frobenius_norm);
-        fprintf('  - Trace reduction ratio: %.6f\n', trace_ratio);
-        fprintf('  - Minimum eigenvalue: %.2e\n', min_eigenval);
-        fprintf('  - Condition number: %.2e\n', condition_number);
-        fprintf('  - Is Hermitian: %s\n', mat2str(ishermitian(Sigma_jj_post)));
     end
+end
+
+%% ===== Helper: Cholesky with jitter for (semi)SPD matrices =====
+function [R, last_jitter, ok] = chol_with_jitter(A, base_reg, max_tries, verbose)
+% Attempt a Cholesky factorization of A. If it fails, add jitter*I with
+% geometrically increasing jitter until success or attempts exhausted.
+    ok = false;
+    A = (A + A')/2; % enforce symmetry
+    scale = trace(A)/max(1,size(A,1));
+    if ~isfinite(scale) || scale <= 0, scale = 1; end
+    jitter0 = base_reg * scale;
+    last_jitter = 0;
+
+    for k = 0:max_tries
+        jitter = jitter0 * (10^k);
+        At = A + jitter * eye(size(A), class(A));
+        [R, flag] = chol(At);
+        if flag == 0
+            ok = true;
+            last_jitter = jitter;
+            if verbose
+                fprintf('  [chol] success with jitter = %.3e (tries=%d)\n', jitter, k+1);
+            end
+            return;
+        else
+            if verbose
+                fprintf('  [chol] fail @ jitter = %.3e\n', jitter);
+            end
+        end
+    end
+    R = [];
+    last_jitter = jitter0 * (10^max_tries);
 end

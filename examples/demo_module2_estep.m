@@ -1,48 +1,42 @@
 function demo_results = demo_module2_estep()
-    % DEMO_MODULE2_ESTEP - Demonstration of Module 2 E-step computation (Full Source Model)
-    %
-    % Returns:
-    %   demo_results - Structure containing demonstration results and analysis
-    %
-    % Description:
-    %   This demonstration showcases the capabilities of Module 2 for E-step
-    %   computation in the EM algorithm for precision matrix estimation.
-    %   Uses Module7 simulation for realistic data with comprehensive visualization.
-    %
-    % Demonstration Coverage:
-    %   1. Basic E-step computation with Module7 EEG-like data
-    %   2. Mathematical property verification with visualization
-    %   3. Parameter sensitivity analysis
-    %   4. Performance analysis across different problem sizes
-    %   5. Comparison with ground truth from simulation
-    %
-    % Author: [Author Name]
-    % Date: [Current Date]  
-    % Version: 2.0 - Full Source Model with Module7 Integration
-    
+% DEMO_MODULE2_ESTEP - Demonstration of Module 2 E-step computation (Full Source Model)
+%
+% Returns:
+%   demo_results - structure with results, metrics, and (optional) figures
+%
+% Highlights:
+%   - Uses Module7 simulation to create realistic EEG-like data
+%   - Runs the full Module2 E-step pipeline
+%   - Verifies key mathematical properties (corrected: RTF is a contraction)
+%   - Performs parameter sensitivity and performance scaling analyses
+%
+% NOTE:
+%   Plotting is automatically skipped in headless environments.
+
+    rng(2025); % reproducibility across runs
     fprintf('========================================\n');
     fprintf('Module 2 E-step Computation Demonstration\n');
     fprintf('Full Source Model with Module7 Simulation\n');
     fprintf('========================================\n\n');
-    
+
     demo_results = struct();
     demo_results.timestamp = datetime('now');
     demo_results.matlab_version = version();
-    
+
     %% Demo 1: Basic E-step with Module7 EEG Data
     fprintf('Demo 1: Basic E-step with Module7 EEG-like Data\n');
     fprintf('-----------------------------------------------\n');
-    
+
     try
-        % Create realistic EEG-like parameters
+        % Realistic EEG-like parameters
         demo_params = struct();
-        demo_params.n_sensors = 32;        % EEG sensor count
-        demo_params.n_sources = 50;        % Cortical source locations  
-        demo_params.n_frequencies = 6;     % Alpha band frequencies
-        demo_params.frequency_range = [8, 12]; % Alpha band
-        demo_params.snr_db = 15;           % Signal-to-noise ratio
-        demo_params.edge_density = 0.25;   % Graph connectivity
-        
+        demo_params.n_sensors = 32;               % EEG sensors
+        demo_params.n_sources = 50;               % Cortical sources
+        demo_params.n_frequencies = 6;            % e.g. alpha band bins
+        demo_params.frequency_range = [8, 12];    % alpha band
+        demo_params.snr_db = 15;                  % in dB
+        demo_params.edge_density = 0.25;          % graph connectivity
+
         fprintf('Creating Module7 simulation data:\n');
         fprintf('  - Sensors: %d\n', demo_params.n_sensors);
         fprintf('  - Sources: %d\n', demo_params.n_sources);
@@ -50,214 +44,195 @@ function demo_results = demo_module2_estep()
                 demo_params.n_frequencies, demo_params.frequency_range(1), demo_params.frequency_range(2));
         fprintf('  - SNR: %d dB\n', demo_params.snr_db);
         fprintf('  - Edge density: %.2f\n', demo_params.edge_density);
-        
-        % Generate Module7 simulation data
+
+        % Generate Module7 data and pack input for Module2
         [input_data, ground_truth] = create_module7_eeg_data(demo_params);
         demo_results.demo1.input_params = demo_params;
         demo_results.demo1.ground_truth = ground_truth;
-        
-        % Run E-step computation
+
+        % Run Module2 E-step
         fprintf('\nRunning E-step computation...\n');
         estep_params = struct('verbose', true, 'regularization_factor', 1e-6);
-        
-        tic;
+        t0 = tic;
         estep_results = module2_estep_main(input_data, estep_params);
-        computation_time = toc;
-        
+        computation_time = toc(t0);
+
         demo_results.demo1.estep_results = estep_results;
         demo_results.demo1.computation_time = computation_time;
-        
-        % Analyze and visualize results
+
         if estep_results.success
             fprintf('\n✓ E-step computation successful!\n');
             fprintf('  - Total time: %.3f seconds\n', computation_time);
             fprintf('  - Successful frequencies: %d/%d\n', ...
                     estep_results.computation_stats.successful_frequencies, demo_params.n_frequencies);
-            
-            % Create comprehensive visualization
-            create_demo1_visualization(estep_results, ground_truth, demo_params);
-            
-            % Analyze precision matrix quality
+
+            % Comprehensive visualization
+            if can_make_plots(), create_demo1_visualization(estep_results, ground_truth, demo_params); end
+
+            % Precision quality analysis
             precision_analysis = analyze_precision_quality(estep_results, ground_truth);
             demo_results.demo1.precision_analysis = precision_analysis;
-            
+
             fprintf('  - Average recovery accuracy: %.2f%%\n', precision_analysis.avg_recovery_rate * 100);
             fprintf('  - Sparsity preservation: %.2f%%\n', precision_analysis.sparsity_preservation * 100);
-            
         else
             fprintf('\n✗ E-step computation failed\n');
             demo_results.demo1.error_message = 'E-step computation failed';
         end
-        
+
         demo_results.demo1.success = estep_results.success;
-        
+
     catch ME
         fprintf('\n✗ Demo 1 failed: %s\n', ME.message);
         demo_results.demo1.success = false;
         demo_results.demo1.error_message = ME.message;
     end
-    
+
     %% Demo 2: Parameter Sensitivity Analysis
     fprintf('\n\nDemo 2: Parameter Sensitivity Analysis\n');
     fprintf('--------------------------------------\n');
-    
+
     try
-        if demo_results.demo1.success
+        if isfield(demo_results,'demo1') && demo_results.demo1.success
             fprintf('Analyzing sensitivity to key parameters...\n');
-            
-            % Test different regularization factors
-            reg_factors = [1e-8, 1e-6, 1e-4, 1e-2];
-            noise_levels = [0.01, 0.05, 0.1, 0.2];
-            
+
+            reg_factors  = [1e-8, 1e-6, 1e-4, 1e-2];
+            noise_levels = [0.01, 0.05, 0.10, 0.20];
+
             sensitivity_results = analyze_parameter_sensitivity(input_data, reg_factors, noise_levels);
             demo_results.demo2.sensitivity_results = sensitivity_results;
-            
-            % Create sensitivity visualization
-            create_sensitivity_visualization(sensitivity_results);
-            
+
+            if can_make_plots(), create_sensitivity_visualization(sensitivity_results); end
+
             fprintf('Parameter sensitivity analysis completed:\n');
             fprintf('  - Optimal regularization: %.0e\n', sensitivity_results.optimal_regularization);
-            fprintf('  - Noise robustness range: %.3f - %.3f\n', ...
-                    min(noise_levels), max(noise_levels));
-            
+            fprintf('  - Noise robustness range tested: %.3f - %.3f\n', min(noise_levels), max(noise_levels));
+
             demo_results.demo2.success = true;
-            
         else
             fprintf('Skipping sensitivity analysis due to Demo 1 failure\n');
             demo_results.demo2.success = false;
             demo_results.demo2.skip_reason = 'Demo 1 failed';
         end
-        
     catch ME
         fprintf('\n✗ Demo 2 failed: %s\n', ME.message);
         demo_results.demo2.success = false;
         demo_results.demo2.error_message = ME.message;
     end
-    
-    %% Demo 3: Mathematical Property Verification
+
+    %% Demo 3: Mathematical Property Verification (corrected)
     fprintf('\n\nDemo 3: Mathematical Property Verification\n');
     fprintf('-----------------------------------------\n');
-    
+
     try
-        fprintf('Verifying mathematical properties with visualization...\n');
-        
-        % Test mathematical properties using controlled scenarios
+        fprintf('Verifying mathematical properties...\n');
         math_verification = verify_mathematical_properties();
         demo_results.demo3.math_verification = math_verification;
-        
-        % Create mathematical property visualization
-        create_math_property_visualization(math_verification);
-        
-        fprintf('Mathematical property verification:\n');
-        fprintf('  - Idempotent property: %s (error: %.2e)\n', ...
-                pass_fail_string(math_verification.idempotent.passed), math_verification.idempotent.error);
-        fprintf('  - Complementary projection: %s (error: %.2e)\n', ...
+
+        if can_make_plots(), create_math_property_visualization(math_verification); end
+
+        fprintf('Summary:\n');
+        fprintf('  - Complementary identity: %s (error: %.2e)\n', ...
                 pass_fail_string(math_verification.complementary.passed), math_verification.complementary.error);
+        fprintf('  - Contraction (whitened spectrum): %s (min=%.2e, max=%.2e)\n', ...
+                pass_fail_string(math_verification.contraction.passed), ...
+                math_verification.contraction.min_eval, math_verification.contraction.max_eval);
         fprintf('  - Uncertainty reduction: %s\n', ...
                 pass_fail_string(math_verification.uncertainty_reduction.passed));
-        
-        demo_results.demo3.success = all([math_verification.idempotent.passed, ...
-                                         math_verification.complementary.passed, ...
-                                         math_verification.uncertainty_reduction.passed]);
-        
+
+        demo_results.demo3.success = all([ ...
+            math_verification.complementary.passed, ...
+            math_verification.contraction.passed, ...
+            math_verification.uncertainty_reduction.passed]);
+
     catch ME
         fprintf('\n✗ Demo 3 failed: %s\n', ME.message);
         demo_results.demo3.success = false;
         demo_results.demo3.error_message = ME.message;
     end
-    
+
     %% Demo 4: Performance Analysis
     fprintf('\n\nDemo 4: Performance Analysis\n');
     fprintf('----------------------------\n');
-    
+
     try
         fprintf('Analyzing computational performance across problem sizes...\n');
-        
-        problem_sizes = [12, 16, 24, 32];  % Different numbers of sensors
+        problem_sizes = [12, 16, 24, 32];  % different numbers of sensors
         performance_data = analyze_performance_scaling(problem_sizes);
         demo_results.demo4.performance_data = performance_data;
-        
-        % Create performance visualization
-        create_performance_visualization(performance_data);
-        
-        % Analyze scaling behavior
-        if length(performance_data.successful_sizes) >= 3
+
+        if can_make_plots(), create_performance_visualization(performance_data); end
+
+        if numel(performance_data.successful_sizes) >= 3
             scaling_analysis = analyze_computational_scaling(performance_data);
             demo_results.demo4.scaling_analysis = scaling_analysis;
-            
+
             fprintf('Performance analysis results:\n');
-            fprintf('  - Scaling exponent: %.2f\n', scaling_analysis.exponent);
+            fprintf('  - Scaling exponent: %.2f (R^2=%.2f)\n', ...
+                    scaling_analysis.exponent, scaling_analysis.r_squared);
             fprintf('  - Interpretation: %s\n', scaling_analysis.interpretation);
             fprintf('  - Largest tested size: %d sensors\n', max(problem_sizes));
         end
-        
-        demo_results.demo4.success = length(performance_data.successful_sizes) >= 3;
-        
+
+        demo_results.demo4.success = numel(performance_data.successful_sizes) >= 3;
+
     catch ME
         fprintf('\n✗ Demo 4 failed: %s\n', ME.message);
         demo_results.demo4.success = false;
         demo_results.demo4.error_message = ME.message;
     end
-    
+
     %% Demo 5: Ground Truth Comparison
     fprintf('\n\nDemo 5: Ground Truth Comparison Analysis\n');
     fprintf('---------------------------------------\n');
-    
+
     try
-        if demo_results.demo1.success
+        if isfield(demo_results,'demo1') && demo_results.demo1.success
             fprintf('Comparing E-step results with Module7 ground truth...\n');
-            
             comparison_analysis = compare_with_ground_truth(estep_results, ground_truth);
             demo_results.demo5.comparison_analysis = comparison_analysis;
-            
-            % Create ground truth comparison visualization
-            create_ground_truth_visualization(estep_results, ground_truth, comparison_analysis);
-            
+
+            if can_make_plots(), create_ground_truth_visualization(estep_results, ground_truth, comparison_analysis); end
+
             fprintf('Ground truth comparison results:\n');
             fprintf('  - Edge detection accuracy: %.2f%%\n', comparison_analysis.edge_detection_accuracy * 100);
             fprintf('  - Value correlation: %.3f\n', comparison_analysis.value_correlation);
             fprintf('  - Sparsity match: %.2f%%\n', comparison_analysis.sparsity_match * 100);
-            
+
             demo_results.demo5.success = comparison_analysis.overall_quality > 0.7;
-            
         else
             fprintf('Skipping ground truth comparison due to Demo 1 failure\n');
             demo_results.demo5.success = false;
             demo_results.demo5.skip_reason = 'Demo 1 failed';
         end
-        
     catch ME
         fprintf('\n✗ Demo 5 failed: %s\n', ME.message);
         demo_results.demo5.success = false;
         demo_results.demo5.error_message = ME.message;
     end
-    
+
     %% Summary and Recommendations
     fprintf('\n\n========================================\n');
     fprintf('Demonstration Summary\n');
     fprintf('========================================\n');
-    
-    demo_success_flags = [
-        demo_results.demo1.success, ...
-        demo_results.demo2.success, ...
-        demo_results.demo3.success, ...
-        demo_results.demo4.success, ...
-        demo_results.demo5.success
-    ];
-    
-    overall_success_rate = sum(demo_success_flags) / length(demo_success_flags);
+
+    flags = [safe_flag(demo_results,'demo1'), safe_flag(demo_results,'demo2'), ...
+             safe_flag(demo_results,'demo3'), safe_flag(demo_results,'demo4'), ...
+             safe_flag(demo_results,'demo5')];
+
+    overall_success_rate = sum(flags) / numel(flags);
     demo_results.overall_success_rate = overall_success_rate;
     demo_results.overall_success = overall_success_rate >= 0.8;
-    
+
     fprintf('Individual demo results:\n');
-    fprintf('  1. Basic E-step with Module7: %s\n', success_symbol(demo_results.demo1.success));
-    fprintf('  2. Parameter sensitivity: %s\n', success_symbol(demo_results.demo2.success));
-    fprintf('  3. Mathematical properties: %s\n', success_symbol(demo_results.demo3.success));
-    fprintf('  4. Performance analysis: %s\n', success_symbol(demo_results.demo4.success));
-    fprintf('  5. Ground truth comparison: %s\n', success_symbol(demo_results.demo5.success));
-    
+    fprintf('  1. Basic E-step with Module7: %s\n', success_symbol(flags(1)));
+    fprintf('  2. Parameter sensitivity: %s\n',   success_symbol(flags(2)));
+    fprintf('  3. Mathematical properties: %s\n', success_symbol(flags(3)));
+    fprintf('  4. Performance analysis: %s\n',    success_symbol(flags(4)));
+    fprintf('  5. Ground truth comparison: %s\n', success_symbol(flags(5)));
+
     fprintf('\nOverall success rate: %.1f%%\n', overall_success_rate * 100);
-    
+
     if demo_results.overall_success
         fprintf('\n🎉 OVERALL RESULT: SUCCESS!\n');
         fprintf('   Module 2 E-step computation is ready for production use.\n');
@@ -267,902 +242,719 @@ function demo_results = demo_module2_estep()
         fprintf('   Some issues detected. Review failed demos and visualizations.\n');
         generate_troubleshooting_guide(demo_results);
     end
-    
+
     demo_results.completion_time = datetime('now');
     fprintf('\nDemonstration completed at: %s\n', char(demo_results.completion_time));
     fprintf('Check generated figures for detailed visualizations.\n');
     fprintf('========================================\n');
 end
 
-%% Helper Functions
+%% ======================= Helper Functions =======================
 
 function [input_data, ground_truth] = create_module7_eeg_data(params)
-    % Create EEG-like data using Module7 simulation
-    
+% Create EEG-like Module7 data and Module2 inputs
+
     fprintf('Generating Module7 simulation data...\n');
-    
-    % Call Module7 simulation (移除verbose参数)
     [true_precision, true_covariance, empirical_covariance, sim_params] = ...
-        module7_simulation_improved_complex(...
-            'n_nodes', params.n_sensors, ...
-            'n_freq', params.n_frequencies, ...
+        module7_simulation_improved_complex( ...
+            'n_nodes',   params.n_sensors, ...
+            'n_freq',    params.n_frequencies, ...
             'n_samples', 150, ...
-            'graph_type', 'random', ...
+            'graph_type','random', ...
             'edge_density', params.edge_density, ...
             'sigma_coef', 0.5);
-    
-    % Create leadfield matrix 
+
+    % Leadfield
     p = params.n_sensors;
     n = params.n_sources;
-    L = randn(p, n) / sqrt(n);  % Normalized for numerical stability
-    
-    % Create frequency vector
+    L = randn(p, n) / sqrt(n); % normalization helps conditioning
+
+    % Frequency grid
     frequencies = linspace(params.frequency_range(1), params.frequency_range(2), params.n_frequencies);
-    
-    % Prepare input data structure
+
+    % Pack Module2 input
     input_data = struct();
     input_data.leadfield_matrix = L;
     input_data.empirical_covariances = empirical_covariance;
-    input_data.source_prior_covariances = cell(params.n_frequencies, 1);
+    input_data.source_prior_covariances = repmat({eye(n)*0.3}, params.n_frequencies, 1);
     input_data.frequencies = frequencies;
-    
-    % Noise covariance based on SNR
-    snr_linear = 10^(params.snr_db / 10);
-    noise_variance = 1 / snr_linear;
+
+    % Noise covariance from SNR
+    snr_linear   = 10^(params.snr_db/10);
+    noise_variance = 1 / max(1e-12, snr_linear);
     input_data.noise_covariance = eye(p) * noise_variance;
-    
-    % Create source prior covariances
-    for f = 1:params.n_frequencies
-        % Use reasonable source prior
-        input_data.source_prior_covariances{f} = eye(n) * 0.3;
-    end
-    
-    % Ground truth storage
+
+    % Ground truth
     ground_truth = struct();
-    ground_truth.true_precision_matrices = true_precision;
+    ground_truth.true_precision_matrices  = true_precision;
     ground_truth.true_covariance_matrices = true_covariance;
-    ground_truth.simulation_parameters = sim_params;
-    ground_truth.empirical_covariances = empirical_covariance;
-    ground_truth.leadfield_matrix = L;
-    
+    ground_truth.empirical_covariances    = empirical_covariance;
+    ground_truth.simulation_parameters     = sim_params;
+    ground_truth.leadfield_matrix         = L;
+
     fprintf('Module7 simulation completed:\n');
-    fprintf('  - Generated %d precision matrices\n', length(true_precision));
+    fprintf('  - Generated %d precision matrices\n', numel(true_precision));
     fprintf('  - Graph edges: %d\n', sim_params.n_edges);
     fprintf('  - Complex matrices: %s\n', logical_to_string(any(cellfun(@(x) ~isreal(x), true_precision))));
 end
 
 function create_demo1_visualization(estep_results, ground_truth, demo_params)
-    % Create comprehensive visualization for Demo 1
-    
-    figure('Name', 'Demo 1: E-step Results Overview', 'Position', [50, 50, 1400, 1000]);
-    
-    F = length(estep_results.initial_precision_matrices);
-    
-    % Processing performance
-    subplot(3, 4, 1);
+% Comprehensive visualization for Demo 1 (skips if headless)
+    if ~can_make_plots(), return; end
+
+    figure('Name','Demo 1: E-step Results Overview','Position',[50,50,1400,1000]);
+    F = numel(estep_results.initial_precision_matrices);
+
+    % Processing times (first four steps)
+    subplot(3,4,1);
     if isfield(estep_results.computation_stats, 'processing_times')
-        bar(estep_results.computation_stats.processing_times(:, 1:4));
+        bar(estep_results.computation_stats.processing_times(:,1:4));
         title('Processing Times by Step');
-        xlabel('Frequency');
-        ylabel('Time (s)');
-        legend({'DSTF', 'Posterior', 'Residual TF', 'Residual Cov'}, 'Location', 'best');
+        xlabel('Frequency'); ylabel('Time (s)');
+        legend({'DSTF','Posterior','Residual TF','Residual Cov'}, 'Location','best');
+    else
+        axis off; text(0.1,0.5,'No timing stats','FontWeight','bold');
     end
-    
-    % Condition numbers
-    subplot(3, 4, 2);
+
+    % Condition numbers (only if available)
+    subplot(3,4,2);
     if isfield(estep_results.computation_stats, 'condition_numbers')
         semilogy(estep_results.computation_stats.condition_numbers);
-        title('Condition Numbers');
-        xlabel('Frequency');
-        ylabel('log(Condition Number)');
-        legend({'Sensor Cov', 'Post Source', 'Residual'}, 'Location', 'best');
+        title('Condition Numbers'); xlabel('Frequency'); ylabel('Condition');
+        legend({'Sensor Cov','Post Source','Residual'}, 'Location','best');
+    else
+        axis off; text(0.1,0.5,'No condition stats','FontWeight','bold');
     end
-    
-    % True vs estimated precision (first frequency)
+
+    % True vs estimated precision (f=1)
     if ~isempty(ground_truth.true_precision_matrices{1}) && ~isempty(estep_results.initial_precision_matrices{1})
-        subplot(3, 4, 3);
-        imagesc(abs(ground_truth.true_precision_matrices{1}));
-        colorbar;
-        title('True Precision |Ω|');
-        
-        subplot(3, 4, 4);
-        imagesc(abs(estep_results.initial_precision_matrices{1}));
-        colorbar;
-        title('Estimated Precision |Ω̂|');
-        
-        % Error analysis
-        subplot(3, 4, 5);
-        error_matrix = abs(ground_truth.true_precision_matrices{1} - estep_results.initial_precision_matrices{1});
-        imagesc(error_matrix);
-        colorbar;
-        title('Absolute Error |Ω - Ω̂|');
-        
-        % Scatter plot comparison
-        subplot(3, 4, 6);
-        true_vals = ground_truth.true_precision_matrices{1}(:);
-        est_vals = estep_results.initial_precision_matrices{1}(:);
-        scatter(real(true_vals), real(est_vals), 10, 'filled', 'alpha', 0.6);
-        xlabel('True Values');
-        ylabel('Estimated Values');
-        title('Value Correlation');
-        hold on;
-        plot(xlim, xlim, 'r--');
-        
-        % Calculate correlation
-        corr_val = corr(real(true_vals), real(est_vals));
-        text(0.1, 0.9, sprintf('r = %.3f', corr_val), 'Units', 'normalized');
+        subplot(3,4,3); imagesc(abs(ground_truth.true_precision_matrices{1})); colorbar; title('True |Ω|');
+        subplot(3,4,4); imagesc(abs(estep_results.initial_precision_matrices{1})); colorbar; title('Estimated |Ω̂|');
+
+        subplot(3,4,5);
+        errM = abs(ground_truth.true_precision_matrices{1} - estep_results.initial_precision_matrices{1});
+        imagesc(errM); colorbar; title('|Ω - Ω̂|');
+
+        subplot(3,4,6);
+        tv = ground_truth.true_precision_matrices{1}(:);
+        ev = estep_results.initial_precision_matrices{1}(:);
+        scatter(real(tv), real(ev), 10, 'filled', 'MarkerFaceAlpha', 0.6);
+        hold on; xl = xlim; plot(xl, xl, 'r--');
+        xlabel('True'); ylabel('Estimated'); title('Value Correlation');
+        try
+            c = corr(real(tv), real(ev), 'rows','complete'); txt = sprintf('r = %.3f', c);
+        catch, txt = 'r = NaN'; end
+        text(0.1, 0.9, txt, 'Units', 'normalized');
     end
-    
-    % Transfer function analysis
-    subplot(3, 4, 7);
+
+    % DSTF magnitude
+    subplot(3,4,7);
     if ~isempty(estep_results.transfer_functions{1})
-        imagesc(abs(estep_results.transfer_functions{1}));
-        colorbar;
-        title('DSTF |T_{jv}|');
-        xlabel('Sensors');
-        ylabel('Sources');
+        imagesc(abs(estep_results.transfer_functions{1})); colorbar; title('|T_{jv}|');
+        xlabel('Sensors'); ylabel('Sources');
     end
-    
+
     % Residual covariance eigenvalues
-    subplot(3, 4, 8);
+    subplot(3,4,8);
     if ~isempty(estep_results.residual_covariances{1})
-        eigs_res = sort(real(eig(estep_results.residual_covariances{1})), 'descend');
-        semilogy(eigs_res, 'o-');
-        title('Residual Covariance Eigenvalues');
-        xlabel('Index');
-        ylabel('Eigenvalue');
+        ev = sort(real(eig(estep_results.residual_covariances{1})), 'descend');
+        semilogy(ev, 'o-'); title('Residual Covariance Eigenvalues'); xlabel('Index'); ylabel('Value');
     end
-    
-    % Sparsity pattern analysis
-    subplot(3, 4, 9);
-    if ~isempty(ground_truth.true_precision_matrices{1})
-        threshold = 0.01 * max(abs(ground_truth.true_precision_matrices{1}(:)));
-        true_pattern = abs(ground_truth.true_precision_matrices{1}) > threshold;
-        est_pattern = abs(estep_results.initial_precision_matrices{1}) > threshold;
-        
-        % Create combined pattern visualization
-        combined = zeros(size(true_pattern));
-        combined(true_pattern & est_pattern) = 3;  % Both (yellow)
-        combined(true_pattern & ~est_pattern) = 1; % True only (red)
-        combined(~true_pattern & est_pattern) = 2; % Est only (green)
-        
-        imagesc(combined);
-        colormap(gca, [1 1 1; 1 0 0; 0 1 0; 1 1 0]); % White, Red, Green, Yellow
+
+    % Sparsity match (f=1)
+    subplot(3,4,9);
+    if ~isempty(ground_truth.true_precision_matrices{1}) && ~isempty(estep_results.initial_precision_matrices{1})
+        thr = 0.01 * max(abs(ground_truth.true_precision_matrices{1}(:)));
+        tp = abs(ground_truth.true_precision_matrices{1}) > thr;
+        ep = abs(estep_results.initial_precision_matrices{1}) > thr;
+        M  = tp + 2*ep; % 1:true-only, 2:est-only, 3:both
+        imagesc(M); colormap(gca, [1 1 1; 1 0 0; 0 1 0; 1 1 0]);
         title('Sparsity Pattern Match');
     end
-    
-    % Frequency consistency
-    subplot(3, 4, 10);
+
+    % Frequency consistency of one entry
+    subplot(3,4,10);
     if F > 1
-        sample_entry = zeros(F, 1);
+        v = zeros(F,1);
         for f = 1:F
             if ~isempty(estep_results.initial_precision_matrices{f})
-                sample_entry(f) = real(estep_results.initial_precision_matrices{f}(2, 3));
+                v(f) = real(estep_results.initial_precision_matrices{f}(2,3));
             end
         end
-        plot(1:F, sample_entry, 'o-', 'LineWidth', 2);
-        title('Precision Entry vs Frequency');
-        xlabel('Frequency Index');
-        ylabel('Ω̂(2,3)');
+        plot(1:F, v, 'o-','LineWidth',2); title('Ω̂(2,3) vs Frequency'); xlabel('f'); ylabel('Value');
     end
-    
-    % Eigenvalue comparison
-    subplot(3, 4, 11);
+
+    % Eigenvalue comparison (f=1)
+    subplot(3,4,11);
     if ~isempty(ground_truth.true_precision_matrices{1}) && ~isempty(estep_results.initial_precision_matrices{1})
-        true_eigs = sort(real(eig(ground_truth.true_precision_matrices{1})), 'descend');
-        est_eigs = sort(real(eig(estep_results.initial_precision_matrices{1})), 'descend');
-        
-        semilogy(true_eigs, 'b-o', 'DisplayName', 'True');
-        hold on;
-        semilogy(est_eigs, 'r--s', 'DisplayName', 'Estimated');
-        legend;
-        title('Eigenvalue Comparison');
-        xlabel('Index');
-        ylabel('Eigenvalue');
+        e1 = sort(real(eig(ground_truth.true_precision_matrices{1})),'descend');
+        e2 = sort(real(eig(estep_results.initial_precision_matrices{1})),'descend');
+        semilogy(e1, 'b-o','DisplayName','True'); hold on;
+        semilogy(e2, 'r--s','DisplayName','Estimated'); legend; title('Precision Eigenvalues');
+        xlabel('Index'); ylabel('Value');
     end
-    
+
     % Success summary
-    subplot(3, 4, 12);
-    success_rate = estep_results.computation_stats.successful_frequencies / F;
-    pie([success_rate, 1-success_rate], {'Success', 'Failed'});
+    subplot(3,4,12);
+    success_rate = estep_results.computation_stats.successful_frequencies / max(1,F);
+    pie([success_rate, 1-success_rate], {'Success','Failed'});
     title(sprintf('Success: %.0f%%', success_rate*100));
-    
+
     sgtitle(sprintf('E-step Results: %d sensors, %d sources, %d frequencies', ...
                    demo_params.n_sensors, demo_params.n_sources, demo_params.n_frequencies));
 end
 
 function precision_analysis = analyze_precision_quality(estep_results, ground_truth)
-    % Analyze quality of precision matrix estimation
-    
-    F = length(estep_results.initial_precision_matrices);
+% Basic structural/metric quality analysis for the initial precision matrices
+    F = numel(estep_results.initial_precision_matrices);
     precision_analysis = struct();
-    
-    recovery_rates = zeros(F, 1);
-    sparsity_preservations = zeros(F, 1);
-    correlations = zeros(F, 1);
-    
+
+    rec  = zeros(F,1);
+    spars = zeros(F,1);
+    corrv = zeros(F,1);
+
     for f = 1:F
-        if ~isempty(estep_results.initial_precision_matrices{f}) && ~isempty(ground_truth.true_precision_matrices{f})
-            true_prec = ground_truth.true_precision_matrices{f};
-            est_prec = estep_results.initial_precision_matrices{f};
-            
-            % Sparsity analysis
-            threshold = 0.01 * max(abs(true_prec(:)));
-            true_pattern = abs(true_prec) > threshold;
-            est_pattern = abs(est_prec) > threshold;
-            
-            % Recovery rate (what fraction of true edges were detected)
-            true_edges = sum(true_pattern(:));
+        Om = estep_results.initial_precision_matrices{f};
+        Tr = ground_truth.true_precision_matrices{f};
+        if ~isempty(Om) && ~isempty(Tr)
+            thr = 0.01 * max(abs(Tr(:)));
+            tp  = abs(Tr) > thr; ep = abs(Om) > thr;
+
+            true_edges = sum(tp(:));
             if true_edges > 0
-                recovery_rates(f) = sum(true_pattern(:) & est_pattern(:)) / true_edges;
+                rec(f) = sum(tp(:) & ep(:)) / true_edges; % recovery rate
             end
-            
-            % Sparsity preservation (what fraction of total edges match)
-            total_elements = numel(true_pattern);
-            sparsity_preservations(f) = sum(true_pattern(:) == est_pattern(:)) / total_elements;
-            
-            % Value correlation
-            correlations(f) = corr(real(true_prec(:)), real(est_prec(:)));
+            spars(f) = sum(tp(:) == ep(:)) / numel(tp);   % sparsity match
+            try
+                c = corr(real(Tr(:)), real(Om(:)), 'rows','complete');
+            catch
+                c = NaN;
+            end
+            corrv(f) = c;
         end
     end
-    
-    precision_analysis.recovery_rates = recovery_rates;
-    precision_analysis.sparsity_preservations = sparsity_preservations;
-    precision_analysis.correlations = correlations;
-    precision_analysis.avg_recovery_rate = mean(recovery_rates(recovery_rates > 0));
-    precision_analysis.sparsity_preservation = mean(sparsity_preservations(sparsity_preservations > 0));
-    precision_analysis.avg_correlation = mean(correlations(correlations > 0));
+
+    precision_analysis.recovery_rates        = rec;
+    precision_analysis.sparsity_preservations= spars;
+    precision_analysis.correlations          = corrv;
+    precision_analysis.avg_recovery_rate     = mean(rec(rec>0));
+    precision_analysis.sparsity_preservation = mean(spars(spars>0));
+    precision_analysis.avg_correlation       = mean(corrv(isfinite(corrv)));
 end
 
 function sensitivity_results = analyze_parameter_sensitivity(input_data, reg_factors, noise_levels)
-    % Analyze sensitivity to regularization and noise parameters
-    
+% Evaluate sensitivity w.r.t regularization and noise parameters
     sensitivity_results = struct();
-    
-    % Test regularization sensitivity
-    reg_quality = zeros(length(reg_factors), 3); % [success_rate, avg_condition, avg_det]
-    
-    for i = 1:length(reg_factors)
-        estep_params = struct('regularization_factor', reg_factors(i), 'verbose', false);
-        results = module2_estep_main(input_data, estep_params);
-        
+
+    % --- Regularization sweep ---
+    R = numel(reg_factors);
+    reg_quality = zeros(R, 3); % [success_rate, logcond(Ω), logdet(Ω)]
+    for i = 1:R
+        results = module2_estep_main(input_data, struct('regularization_factor', reg_factors(i), 'verbose', false));
         if results.success
-            reg_quality(i, 1) = results.computation_stats.successful_frequencies / length(input_data.empirical_covariances);
-            
+            reg_quality(i,1) = results.computation_stats.successful_frequencies / numel(input_data.empirical_covariances);
             if ~isempty(results.initial_precision_matrices{1})
-                reg_quality(i, 2) = cond(results.initial_precision_matrices{1});
-                reg_quality(i, 3) = det(results.initial_precision_matrices{1});
+                Omega = (results.initial_precision_matrices{1}+results.initial_precision_matrices{1}')/2;
+                ev = real(eig(Omega)); ev(ev<=0) = eps;
+                reg_quality(i,2) = log(max(ev)) - log(min(ev)); % log condition
+                reg_quality(i,3) = safe_logdet_chol(Omega);     % robust logdet
             end
+        else
+            reg_quality(i,:) = [0, NaN, NaN];
         end
     end
-    
     sensitivity_results.regularization_factors = reg_factors;
     sensitivity_results.regularization_quality = reg_quality;
-    
-    % Find optimal regularization (best success rate with reasonable condition number)
-    valid_indices = reg_quality(:, 1) > 0.8 & reg_quality(:, 2) < 1e10;
-    if any(valid_indices)
-        [~, best_idx] = min(reg_quality(valid_indices, 2));
-        valid_regs = reg_factors(valid_indices);
-        sensitivity_results.optimal_regularization = valid_regs(best_idx);
-    else
-        sensitivity_results.optimal_regularization = reg_factors(2); % Default fallback
-    end
-    
-    % Test noise level sensitivity
-    noise_quality = zeros(length(noise_levels), 2); % [success_rate, avg_accuracy]
-    
-    for i = 1:length(noise_levels)
-        input_data_noise = input_data;
-        input_data_noise.noise_covariance = eye(size(input_data.noise_covariance)) * noise_levels(i);
-        
-        estep_params = struct('regularization_factor', sensitivity_results.optimal_regularization, 'verbose', false);
-        results = module2_estep_main(input_data_noise, estep_params);
-        
+
+    % Pick "optimal" reg: highest success rate; tie-break by smallest logcond
+    best = find(reg_quality(:,1) == max(reg_quality(:,1)));
+    [~,k] = min(reg_quality(best,2)); sensitivity_results.optimal_regularization = reg_factors(best(k));
+
+    % --- Noise sweep ---
+    N = numel(noise_levels);
+    noise_quality = zeros(N, 2); % [success_rate, quality_score]
+    for i = 1:N
+        inp = input_data;
+        p   = size(input_data.noise_covariance,1);
+        inp.noise_covariance = eye(p) * noise_levels(i);
+        results = module2_estep_main(inp, struct('regularization_factor', sensitivity_results.optimal_regularization, 'verbose', false));
         if results.success
-            noise_quality(i, 1) = results.computation_stats.successful_frequencies / length(input_data.empirical_covariances);
-            
-            % Simple accuracy measure (trace similarity to low-noise case)
+            noise_quality(i,1) = results.computation_stats.successful_frequencies / numel(inp.empirical_covariances);
             if ~isempty(results.initial_precision_matrices{1})
-                noise_quality(i, 2) = 1 / (1 + norm(results.initial_precision_matrices{1}, 'fro'));
+                Om = (results.initial_precision_matrices{1}+results.initial_precision_matrices{1}')/2;
+                ev = real(eig(Om)); ev(ev<=0) = eps;
+                % quality proxy: inverse of log-condition (bounded to [0,1] roughly)
+                q = 1./(1 + (log(max(ev)) - log(min(ev))));
+                noise_quality(i,2) = q;
             end
         end
     end
-    
     sensitivity_results.noise_levels = noise_levels;
     sensitivity_results.noise_quality = noise_quality;
 end
 
-function create_sensitivity_visualization(sensitivity_results)
-    % Create visualization for parameter sensitivity analysis
-    
-    figure('Name', 'Parameter Sensitivity Analysis', 'Position', [150, 100, 1200, 600]);
-    
-    % Regularization sensitivity
-    subplot(2, 3, 1);
-    semilogx(sensitivity_results.regularization_factors, sensitivity_results.regularization_quality(:, 1) * 100, 'o-');
-    title('Success Rate vs Regularization');
-    xlabel('Regularization Factor');
-    ylabel('Success Rate (%)');
-    grid on;
-    
-    subplot(2, 3, 2);
-    loglog(sensitivity_results.regularization_factors, sensitivity_results.regularization_quality(:, 2), 's-');
-    title('Condition Number vs Regularization');
-    xlabel('Regularization Factor');
-    ylabel('Condition Number');
-    grid on;
-    
-    subplot(2, 3, 3);
-    semilogx(sensitivity_results.regularization_factors, sensitivity_results.regularization_quality(:, 3), '^-');
-    title('Determinant vs Regularization');
-    xlabel('Regularization Factor');
-    ylabel('Determinant');
-    grid on;
-    
-    % Noise sensitivity
-    subplot(2, 3, 4);
-    semilogx(sensitivity_results.noise_levels, sensitivity_results.noise_quality(:, 1) * 100, 'o-');
-    title('Success Rate vs Noise Level');
-    xlabel('Noise Variance');
-    ylabel('Success Rate (%)');
-    grid on;
-    
-    subplot(2, 3, 5);
-    semilogx(sensitivity_results.noise_levels, sensitivity_results.noise_quality(:, 2), 's-');
-    title('Quality vs Noise Level');
-    xlabel('Noise Variance');
-    ylabel('Quality Score');
-    grid on;
-    
-    subplot(2, 3, 6);
-    % Optimal parameter region
-    [X, Y] = meshgrid(log10(sensitivity_results.regularization_factors), log10(sensitivity_results.noise_levels));
-    Z = ones(size(X)) * 0.5; % Placeholder for combined quality metric
-    contourf(X, Y, Z);
-    colorbar;
-    title('Parameter Space Quality');
-    xlabel('log₁₀(Regularization)');
-    ylabel('log₁₀(Noise)');
+function create_sensitivity_visualization(S)
+% Visual summaries for parameter sensitivity (skips if headless)
+    if ~can_make_plots(), return; end
+
+    figure('Name','Parameter Sensitivity Analysis','Position',[150,100,1200,600]);
+
+    % Regularization
+    subplot(2,3,1);
+    semilogx(S.regularization_factors, S.regularization_quality(:,1)*100, 'o-');
+    title('Success Rate vs Regularization'); xlabel('Reg'); ylabel('Success (%)'); grid on;
+
+    subplot(2,3,2);
+    semilogx(S.regularization_factors, exp(S.regularization_quality(:,2)), 's-');
+    set(gca,'YScale','log'); title('Condition Number vs Regularization'); xlabel('Reg'); ylabel('Cond'); grid on;
+
+    subplot(2,3,3);
+    semilogx(S.regularization_factors, S.regularization_quality(:,3), '^-');
+    title('logdet(Ω) vs Regularization'); xlabel('Reg'); ylabel('logdet'); grid on;
+
+    % Noise
+    subplot(2,3,4);
+    semilogx(S.noise_levels, S.noise_quality(:,1)*100, 'o-');
+    title('Success Rate vs Noise'); xlabel('Noise Var'); ylabel('Success (%)'); grid on;
+
+    subplot(2,3,5);
+    semilogx(S.noise_levels, S.noise_quality(:,2), 's-');
+    title('Quality vs Noise'); xlabel('Noise Var'); ylabel('Quality Score'); grid on;
+
+    subplot(2,3,6);
+    % Placeholder for combined landscape (optional)
+    axis off; text(0.1,0.5,'Parameter landscape omitted','FontWeight','bold');
 end
 
 function math_verification = verify_mathematical_properties()
-    % Verify mathematical properties with controlled test cases
-    
+% Verify corrected math: complementary identity, contraction, uncertainty reduction
     math_verification = struct();
-    
-    % Create controlled test scenario with smaller dimensions for numerical stability
-    p = 8; n = 12;  % 减小维数以提高数值稳定性
+
+    % Small controlled setup for stability
+    p = 8; n = 12;
     L = randn(p, n);
     Sigma_jj = eye(n) * 0.5;
     Sigma_xi = eye(p) * 0.1;
-    
-    % Test DSTF and RTF properties with proper computation pipeline
+
     try
-        % Step 1: Compute DSTF with regularization
-        options_dstf = struct('regularization_factor', 1e-8, 'verbose', false);
-        T_jv = module2_dstf_computation(L, Sigma_jj, Sigma_xi, options_dstf);
-        
-        % Step 2: Compute RTF properly
-        T_xi_v = module2_residual_transfer_function(T_jv, L);
-        
-        % Test idempotent property: T_ξv² = T_ξv
-        T_xi_v_squared = T_xi_v * T_xi_v;
-        idempotent_error = norm(T_xi_v_squared - T_xi_v, 'fro') / (norm(T_xi_v, 'fro') + eps);
-        
-        math_verification.idempotent.error = idempotent_error;
-        math_verification.idempotent.passed = idempotent_error < 1e-10;
-        
-        % Test complementary projection: T_ξv + L*T_jv = I
-        L_T_jv = L * T_jv;
-        identity_sum = T_xi_v + L_T_jv;
+        % DSTF
+        T_jv = module2_dstf_computation(L, Sigma_jj, Sigma_xi, struct('regularization_factor',1e-8,'verbose',false));
+        % RTF (standard path)
+        T_xi_v = module2_residual_transfer_function(T_jv, L, 'validate_properties', false, 'verbose', false);
+
+        % 1) Complementary identity: T_xi_v + L*T_jv ≈ I
         I_p = eye(p);
-        complementary_error = norm(identity_sum - I_p, 'fro') / norm(I_p, 'fro');
-        
-        math_verification.complementary.error = complementary_error;
-        math_verification.complementary.passed = complementary_error < 1e-10;
-        
-        % Test uncertainty reduction property
-        options_psc = struct('regularization_factor', 1e-8, 'verbose', false);
-        Sigma_post = module2_posterior_source_covariance(Sigma_jj, L, Sigma_xi, options_psc);
-        uncertainty_reduction_matrix = Sigma_jj - Sigma_post;
-        eigenvals_reduction = eig(uncertainty_reduction_matrix);
-        
-        math_verification.uncertainty_reduction.min_eigenval = min(real(eigenvals_reduction));
-        math_verification.uncertainty_reduction.passed = all(real(eigenvals_reduction) >= -1e-10);
-        math_verification.uncertainty_reduction.trace_reduction = trace(uncertainty_reduction_matrix) / trace(Sigma_jj);
-        
-        % Store test matrices for visualization
+        comp_err = rel_fro(T_xi_v + L*T_jv - I_p, I_p);
+        math_verification.complementary.error  = comp_err;
+        math_verification.complementary.passed = comp_err < 1e-10;
+
+        % 2) Contraction (whitened): eig( S^{-1/2} T S^{1/2} ) ∈ [0,1]
+        [Rc,flag] = chol((Sigma_xi+Sigma_xi')/2);
+        if flag ~= 0, error('Sigma_xi must be PD for whitening'); end
+        M = (Rc \ T_xi_v) * Rc'; M = (M+M')/2;
+        eM = eig(M);
+        math_verification.contraction.min_eval = min(real(eM));
+        math_verification.contraction.max_eval = max(real(eM));
+        math_verification.contraction.passed   = (math_verification.contraction.max_eval <= 1+1e-10) ...
+                                               && (math_verification.contraction.min_eval >= -1e-10);
+
+        % 3) Uncertainty reduction: Sigma_post ≼ Sigma_prior
+        Sigma_post = module2_posterior_source_covariance(Sigma_jj, L, Sigma_xi, ...
+                        struct('regularization_factor',1e-8,'verbose',false));
+        D = (Sigma_jj + Sigma_jj')/2 - (Sigma_post + Sigma_post')/2;
+        ev = eig(D);
+        math_verification.uncertainty_reduction.min_eigenval = min(real(ev));
+        math_verification.uncertainty_reduction.passed = all(real(ev) >= -1e-10);
+        math_verification.uncertainty_reduction.trace_reduction = trace(D) / max(1,trace(Sigma_jj));
+
+        % store matrices for plots
         math_verification.test_matrices.T_xi_v = T_xi_v;
-        math_verification.test_matrices.T_xi_v_squared = T_xi_v_squared;
-        math_verification.test_matrices.identity_sum = identity_sum;
-        math_verification.test_matrices.uncertainty_reduction = uncertainty_reduction_matrix;
-        
+        math_verification.test_matrices.identity_sum = T_xi_v + L*T_jv;
+        math_verification.test_matrices.uncertainty_reduction = D;
+
     catch ME
-        % Handle numerical errors gracefully
-        fprintf('Warning: Mathematical verification encountered numerical issues: %s\n', ME.message);
-        math_verification.idempotent.error = NaN;
-        math_verification.idempotent.passed = false;
-        math_verification.complementary.error = NaN;
-        math_verification.complementary.passed = false;
-        math_verification.uncertainty_reduction.passed = false;
+        fprintf('Warning: Math verification issue: %s\n', ME.message);
+        math_verification.complementary = struct('error',NaN,'passed',false);
+        math_verification.contraction   = struct('min_eval',NaN,'max_eval',NaN,'passed',false);
+        math_verification.uncertainty_reduction = struct('min_eigenval',NaN,'passed',false,'trace_reduction',NaN);
         math_verification.error_encountered = ME.message;
     end
 end
 
-function create_math_property_visualization(math_verification)
-    % Create visualization for mathematical property verification
-    
-    figure('Name', 'Mathematical Property Verification', 'Position', [250, 100, 1200, 800]);
-    
-    % Idempotent property visualization
-    subplot(2, 4, 1);
-    imagesc(real(math_verification.test_matrices.T_xi_v));
-    colorbar;
-    title('T_{\xi v} (Real)');
-    
-    subplot(2, 4, 2);
-    imagesc(real(math_verification.test_matrices.T_xi_v_squared));
-    colorbar;
-    title('T_{\xi v}^2 (Real)');
-    
-    subplot(2, 4, 3);
-    error_matrix = math_verification.test_matrices.T_xi_v_squared - math_verification.test_matrices.T_xi_v;
-    imagesc(real(error_matrix));
-    colorbar;
-    title(sprintf('T_ξv² - T_ξv (err: %.2e)', math_verification.idempotent.error));
-    
-    % Complementary projection visualization
-    subplot(2, 4, 4);
-    imagesc(real(math_verification.test_matrices.identity_sum));
-    colorbar;
-    title(sprintf('T_ξv + LT_jv (err: %.2e)', math_verification.complementary.error));
-    
-    % Uncertainty reduction analysis
-    subplot(2, 4, 5);
-    imagesc(real(math_verification.test_matrices.uncertainty_reduction));
-    colorbar;
-    title('Uncertainty Reduction Matrix');
-    
-    subplot(2, 4, 6);
-    eigenvals = eig(math_verification.test_matrices.uncertainty_reduction);
-    bar(real(eigenvals));
-    title('Uncertainty Reduction Eigenvalues');
-    xlabel('Index');
-    ylabel('Eigenvalue');
-    
-    % Property summary
-    subplot(2, 4, 7);
-    properties = {'Idempotent', 'Complementary', 'Uncertainty Red.'};
-    passed = [math_verification.idempotent.passed, ...
-              math_verification.complementary.passed, ...
-              math_verification.uncertainty_reduction.passed];
-    
-    bar(passed);
-    set(gca, 'XTickLabel', properties);
-    title('Property Verification');
-    ylabel('Passed (1) / Failed (0)');
-    ylim([0, 1.2]);
-    
-    % Error summary
-    subplot(2, 4, 8);
-    errors = [math_verification.idempotent.error, ...
-              math_verification.complementary.error, ...
-              abs(math_verification.uncertainty_reduction.min_eigenval)];
-    
-    semilogy(errors, 'o-');
-    set(gca, 'XTickLabel', properties);
-    title('Error Magnitudes');
-    ylabel('log(Error)');
+function create_math_property_visualization(V)
+% Visualize corrected properties (skips if headless)
+    if ~can_make_plots(), return; end
+
+    figure('Name','Mathematical Property Verification','Position',[250,100,1200,700]);
+
+    % Complementary identity
+    subplot(2,3,1);
+    imagesc(real(V.test_matrices.identity_sum)); colorbar;
+    title(sprintf('T_{\\xi v} + L T_{jv} (err=%.2e)', V.complementary.error));
+
+    % Residual transform (real part)
+    subplot(2,3,2);
+    imagesc(real(V.test_matrices.T_xi_v)); colorbar; title('T_{\\xi v} (Real)');
+
+    % Uncertainty reduction matrix
+    subplot(2,3,3);
+    imagesc(real(V.test_matrices.uncertainty_reduction)); colorbar;
+    title('Uncertainty Reduction (Prior - Post)');
+
+    % Spectrum placeholder for contraction (values printed in title)
+    subplot(2,3,4); axis off;
+    text(0.1,0.6, sprintf('Contraction: min=%.2e, max=%.2e', V.contraction.min_eval, V.contraction.max_eval), 'FontSize',12);
+
+    % Eigenvalues of uncertainty reduction
+    subplot(2,3,5);
+    ev = eig(V.test_matrices.uncertainty_reduction);
+    bar(real(ev)); title('Uncertainty Reduction Eigenvalues'); xlabel('Index'); ylabel('Eigenvalue');
+
+    % Pass/Fail summary
+    subplot(2,3,6); props = {'Complementary','Contraction','Uncertainty Red.'};
+    passed = [V.complementary.passed, V.contraction.passed, V.uncertainty_reduction.passed];
+    bar(passed); set(gca,'XTickLabel',props); ylim([0,1.2]); ylabel('Pass (1) / Fail (0)'); title('Property Summary');
 end
 
 function performance_data = analyze_performance_scaling(problem_sizes)
-    % Analyze computational performance across different problem sizes
-    
+% Measure runtime/memory across problem sizes (best-effort memory stats)
     performance_data = struct();
-    performance_data.problem_sizes = problem_sizes;
+    performance_data.problem_sizes   = problem_sizes;
     performance_data.computation_times = zeros(size(problem_sizes));
-    performance_data.success_flags = false(size(problem_sizes));
-    performance_data.memory_usage = zeros(size(problem_sizes));
-    
-    for i = 1:length(problem_sizes)
+    performance_data.success_flags   = false(size(problem_sizes));
+    performance_data.memory_usage    = zeros(size(problem_sizes));
+
+    for i = 1:numel(problem_sizes)
         p = problem_sizes(i);
-        n = round(p * 1.2);  % Sources proportional to sensors
-        
+        n = round(p * 1.2);
         fprintf('  Testing problem size: %d sensors, %d sources... ', p, n);
-        
+
         try
-            % Generate test data using Module7
-            [true_prec, true_cov, emp_cov, sim_params] = ...
-                module7_simulation_improved_complex(...
-                    'n_nodes', p, ...
-                    'n_freq', 3, ...
-                    'n_samples', 100, ...
-                    'graph_type', 'random', ...
-                    'edge_density', 0.2);
-            
-            % Create input data
+            [~, emp_true_cov, emp_cov, sim_params] = ...
+                module7_simulation_improved_complex('n_nodes', p, 'n_freq', 3, ...
+                                                    'n_samples', 100, 'graph_type','random', ...
+                                                    'edge_density', 0.2); %#ok<ASGLU>
+
             input_data = struct();
             input_data.leadfield_matrix = randn(p, n);
             input_data.empirical_covariances = emp_cov;
-            input_data.source_prior_covariances = repmat({eye(n)*0.4}, length(emp_cov), 1);
-            input_data.frequencies = 1:length(emp_cov);
+            input_data.source_prior_covariances = repmat({eye(n)*0.4}, numel(emp_cov), 1);
+            input_data.frequencies = 1:numel(emp_cov);
             input_data.noise_covariance = eye(p) * 0.1;
-            
-            % Measure computation time and memory
-            tic;
-            mem_before = feature('memstats');
-            
+
+            % Timing & memory (best effort, platform dependent)
+            try, mem_before = get_mem_used_mb(); catch, mem_before = NaN; end
+            t0 = tic;
             results = module2_estep_main(input_data, struct('verbose', false));
-            
-            elapsed_time = toc;
-            mem_after = feature('memstats');
-            
-            performance_data.computation_times(i) = elapsed_time;
-            performance_data.success_flags(i) = results.success;
-            performance_data.memory_usage(i) = (mem_after.PeakMemUsed - mem_before.PeakMemUsed) / 1e6; % MB
-            
-            fprintf('%.3f sec, %.1f MB\n', elapsed_time, performance_data.memory_usage(i));
-            
+            elapsed = toc(t0);
+            try, mem_after = get_mem_used_mb(); catch, mem_after = NaN; end
+
+            performance_data.computation_times(i) = elapsed;
+            performance_data.success_flags(i)     = results.success;
+            performance_data.memory_usage(i)      = mem_after - mem_before;
+
+            fprintf('%.3f sec, %s MB\n', elapsed, num2str(performance_data.memory_usage(i)));
+
         catch ME
             fprintf('FAILED (%s)\n', ME.message);
             performance_data.computation_times(i) = NaN;
-            performance_data.success_flags(i) = false;
-            performance_data.memory_usage(i) = NaN;
+            performance_data.success_flags(i)     = false;
+            performance_data.memory_usage(i)      = NaN;
         end
     end
-    
-    % Extract successful runs
-    performance_data.successful_sizes = problem_sizes(performance_data.success_flags);
-    performance_data.successful_times = performance_data.computation_times(performance_data.success_flags);
+
+    performance_data.successful_sizes  = problem_sizes(performance_data.success_flags);
+    performance_data.successful_times  = performance_data.computation_times(performance_data.success_flags);
     performance_data.successful_memory = performance_data.memory_usage(performance_data.success_flags);
 end
 
-function create_performance_visualization(performance_data)
-    % Create visualization for performance analysis
-    
-    figure('Name', 'Performance Analysis', 'Position', [350, 100, 1200, 600]);
-    
-    % Computation time scaling
-    subplot(2, 3, 1);
-    loglog(performance_data.successful_sizes, performance_data.successful_times, 'o-', 'LineWidth', 2);
-    title('Computation Time Scaling');
-    xlabel('Problem Size (sensors)');
-    ylabel('Time (seconds)');
-    grid on;
-    
-    % Memory usage scaling
-    subplot(2, 3, 2);
-    loglog(performance_data.successful_sizes, performance_data.successful_memory, 's-', 'LineWidth', 2);
-    title('Memory Usage Scaling');
-    xlabel('Problem Size (sensors)');
-    ylabel('Memory (MB)');
-    grid on;
-    
-    % Success rate
-    subplot(2, 3, 3);
-    bar(performance_data.problem_sizes, performance_data.success_flags);
-    title('Success Rate vs Problem Size');
-    xlabel('Problem Size (sensors)');
-    ylabel('Success (1) / Failure (0)');
-    
-    % Time per element
-    subplot(2, 3, 4);
-    elements = performance_data.successful_sizes.^2;  % Roughly quadratic in matrix elements
-    time_per_element = performance_data.successful_times ./ elements * 1e6; % microseconds per element
-    semilogx(performance_data.successful_sizes, time_per_element, '^-');
-    title('Time per Matrix Element');
-    xlabel('Problem Size (sensors)');
-    ylabel('Time per Element (μs)');
-    
-    % Efficiency comparison
-    subplot(2, 3, 5);
-    if length(performance_data.successful_sizes) > 1
-        efficiency = performance_data.successful_times(1) ./ performance_data.successful_times;
-        ideal_efficiency = performance_data.successful_sizes(1).^2 ./ performance_data.successful_sizes.^2;
-        
-        semilogx(performance_data.successful_sizes, efficiency, 'o-', 'DisplayName', 'Actual');
-        hold on;
-        semilogx(performance_data.successful_sizes, ideal_efficiency, '--', 'DisplayName', 'Ideal O(n²)');
-        legend;
-        title('Computational Efficiency');
-        xlabel('Problem Size (sensors)');
-        ylabel('Relative Efficiency');
+function create_performance_visualization(P)
+% Visualize performance scaling (skips if headless)
+    if ~can_make_plots(), return; end
+    figure('Name','Performance Analysis','Position',[350,100,1200,600]);
+
+    % Time scaling
+    subplot(2,3,1);
+    if ~isempty(P.successful_sizes)
+        loglog(P.successful_sizes, P.successful_times, 'o-','LineWidth',2);
+        title('Computation Time Scaling'); xlabel('Sensors'); ylabel('Time (s)'); grid on;
+    else
+        axis off; text(0.1,0.5,'No successful runs','FontWeight','bold');
     end
-    
-    % Problem size recommendation
-    subplot(2, 3, 6);
-    max_successful = max(performance_data.successful_sizes);
-    recommended_sizes = performance_data.successful_sizes(performance_data.successful_times < 10); % Under 10 seconds
-    
-    bar([max(recommended_sizes), max_successful], [1, 0.5]);
-    set(gca, 'XTickLabel', {'Recommended', 'Maximum Tested'});
-    title('Problem Size Guidelines');
-    ylabel('Suitability');
-    text(1, 1.1, sprintf('%d sensors', max(recommended_sizes)), 'HorizontalAlignment', 'center');
-    text(2, 0.6, sprintf('%d sensors', max_successful), 'HorizontalAlignment', 'center');
+
+    % Memory scaling
+    subplot(2,3,2);
+    if ~isempty(P.successful_sizes)
+        loglog(P.successful_sizes, abs(P.successful_memory), 's-','LineWidth',2);
+        title('Memory Usage Scaling'); xlabel('Sensors'); ylabel('Memory (MB)'); grid on;
+    else
+        axis off;
+    end
+
+    % Success vs size
+    subplot(2,3,3);
+    bar(P.problem_sizes, P.success_flags);
+    title('Success by Size'); xlabel('Sensors'); ylabel('Success (1/0)');
+
+    % Time per element
+    subplot(2,3,4);
+    if ~isempty(P.successful_sizes)
+        elems = P.successful_sizes.^2;
+        tpe = P.successful_times ./ elems * 1e6; % μs per element
+        semilogx(P.successful_sizes, tpe, '^-'); title('Time per Matrix Element');
+        xlabel('Sensors'); ylabel('μs/element');
+    else
+        axis off;
+    end
+
+    % Efficiency
+    subplot(2,3,5);
+    if numel(P.successful_sizes) > 1
+        eff = P.successful_times(1) ./ P.successful_times;
+        ideal = (P.successful_sizes(1).^2) ./ (P.successful_sizes.^2);
+        semilogx(P.successful_sizes, eff, 'o-','DisplayName','Actual'); hold on;
+        semilogx(P.successful_sizes, ideal, '--','DisplayName','Ideal O(n^2)'); legend;
+        title('Computational Efficiency'); xlabel('Sensors'); ylabel('Rel Efficiency');
+    else
+        axis off;
+    end
+
+    % Size guideline (illustrative)
+    subplot(2,3,6);
+    if ~isempty(P.successful_sizes)
+        under10 = P.successful_sizes(P.successful_times < 10);
+        rec_size = max(under10(:), [], 'omitnan');
+        max_size = max(P.successful_sizes);
+        bar([max(rec_size,0), max_size], [1, 0.5]);
+        set(gca, 'XTickLabel', {'Recommended','Maximum Tested'});
+        title('Problem Size Guidelines'); ylabel('Suitability');
+        text(1, 1.05, sprintf('%d sensors', max(rec_size,0)), 'HorizontalAlignment','center');
+        text(2, 0.55, sprintf('%d sensors', max_size), 'HorizontalAlignment','center');
+    else
+        axis off; text(0.1,0.5,'No guideline available','FontWeight','bold');
+    end
 end
 
-function scaling_analysis = analyze_computational_scaling(performance_data)
-    % Analyze computational scaling behavior
-    
-    if length(performance_data.successful_sizes) < 3
-        scaling_analysis = struct('exponent', NaN, 'interpretation', 'Insufficient data');
+function scaling_analysis = analyze_computational_scaling(P)
+% Fit power law time ~ a * size^b (log-log regression)
+    if numel(P.successful_sizes) < 3
+        scaling_analysis = struct('exponent', NaN, 'interpretation', 'Insufficient data', 'r_squared', NaN);
         return;
     end
-    
-    % Fit power law: time = a * size^b
-    log_sizes = log(performance_data.successful_sizes);
-    log_times = log(performance_data.successful_times);
-    
-    coeffs = polyfit(log_sizes, log_times, 1);
-    scaling_exponent = coeffs(1);
-    
+    xs = log(P.successful_sizes(:)); ys = log(P.successful_times(:));
+    C = polyfit(xs, ys, 1); b = C(1);
     scaling_analysis = struct();
-    scaling_analysis.exponent = scaling_exponent;
-    scaling_analysis.fit_coefficients = coeffs;
-    scaling_analysis.r_squared = corr(log_sizes(:), log_times(:))^2;
-    
-    % Interpret scaling behavior
-    if scaling_exponent < 1.5
-        scaling_analysis.interpretation = 'Better than quadratic scaling (excellent)';
-    elseif scaling_exponent < 2.5
-        scaling_analysis.interpretation = 'Approximately quadratic scaling (good)';
-    elseif scaling_exponent < 3.5
-        scaling_analysis.interpretation = 'Between quadratic and cubic scaling (acceptable)';
-    else
-        scaling_analysis.interpretation = 'Worse than cubic scaling (concerning)';
+    scaling_analysis.exponent = b;
+    scaling_analysis.fit_coefficients = C;
+    scaling_analysis.r_squared = corr(xs, ys)^2;
+
+    if b < 1.5,     txt = 'Better than quadratic scaling (excellent)';
+    elseif b < 2.5, txt = 'Approximately quadratic scaling (good)';
+    elseif b < 3.5, txt = 'Between quadratic and cubic scaling (acceptable)';
+    else            txt = 'Worse than cubic scaling (concerning)';
     end
+    scaling_analysis.interpretation = txt;
 end
 
 function comparison_analysis = compare_with_ground_truth(estep_results, ground_truth)
-    % Compare E-step results with Module7 ground truth
-    
-    comparison_analysis = struct();
-    F = length(estep_results.initial_precision_matrices);
-    
-    edge_accuracies = zeros(F, 1);
-    value_correlations = zeros(F, 1);
-    sparsity_matches = zeros(F, 1);
-    
+% Compare estimated vs true precision across frequencies
+    F = numel(estep_results.initial_precision_matrices);
+    edge_accuracies = zeros(F,1);
+    value_correlations = zeros(F,1);
+    sparsity_matches = zeros(F,1);
+
     for f = 1:F
-        if ~isempty(estep_results.initial_precision_matrices{f}) && ~isempty(ground_truth.true_precision_matrices{f})
-            true_prec = ground_truth.true_precision_matrices{f};
-            est_prec = estep_results.initial_precision_matrices{f};
-            
-            % Edge detection accuracy
-            threshold = 0.01 * max(abs(true_prec(:)));
-            true_edges = abs(true_prec) > threshold;
-            est_edges = abs(est_prec) > threshold;
-            
-            % Sensitivity and specificity for edge detection
-            true_positives = sum(true_edges(:) & est_edges(:));
-            false_positives = sum(~true_edges(:) & est_edges(:));
-            false_negatives = sum(true_edges(:) & ~est_edges(:));
-            true_negatives = sum(~true_edges(:) & ~est_edges(:));
-            
-            if (true_positives + false_negatives) > 0
-                sensitivity = true_positives / (true_positives + false_negatives);
-            else
-                sensitivity = 1;
+        Om = estep_results.initial_precision_matrices{f};
+        Tr = ground_truth.true_precision_matrices{f};
+        if ~isempty(Om) && ~isempty(Tr)
+            thr = 0.01 * max(abs(Tr(:)));
+            tp = abs(Tr) > thr; ep = abs(Om) > thr;
+
+            tp_count = sum(tp(:));
+            tn_count = sum(~tp(:));
+            tp_pos   = sum(tp(:) & ep(:));
+            fp_pos   = sum(~tp(:) & ep(:));
+            fn_pos   = sum(tp(:) & ~ep(:));
+            tn_pos   = sum(~tp(:) & ~ep(:));
+
+            if (tp_count) > 0, sens = tp_pos / (tp_count); else, sens = 1; end
+            if (tn_count) > 0, spec = tn_pos / (tn_count); else, spec = 1; end
+
+            edge_accuracies(f) = (sens + spec)/2; % balanced accuracy
+
+            try
+                value_correlations(f) = corr(real(Tr(:)), real(Om(:)), 'rows','complete');
+            catch
+                value_correlations(f) = NaN;
             end
-            
-            if (true_negatives + false_positives) > 0
-                specificity = true_negatives / (true_negatives + false_positives);
-            else
-                specificity = 1;
-            end
-            
-            edge_accuracies(f) = (sensitivity + specificity) / 2;  % Balanced accuracy
-            
-            % Value correlation
-            value_correlations(f) = corr(real(true_prec(:)), real(est_prec(:)));
-            
-            % Sparsity pattern match
-            sparsity_matches(f) = sum(true_edges(:) == est_edges(:)) / numel(true_edges);
+
+            sparsity_matches(f) = sum(tp(:) == ep(:)) / numel(tp);
         end
     end
-    
-    comparison_analysis.edge_detection_accuracy = mean(edge_accuracies(edge_accuracies > 0));
-    comparison_analysis.value_correlation = mean(value_correlations(value_correlations > 0));
-    comparison_analysis.sparsity_match = mean(sparsity_matches(sparsity_matches > 0));
-    
-    % Overall quality score
-    comparison_analysis.overall_quality = mean([
+
+    comparison_analysis = struct();
+    comparison_analysis.edge_detection_accuracy = mean(edge_accuracies(edge_accuracies>0));
+    comparison_analysis.value_correlation       = mean(value_correlations(isfinite(value_correlations)));
+    comparison_analysis.sparsity_match          = mean(sparsity_matches(sparsity_matches>0));
+
+    comparison_analysis.overall_quality = mean([ ...
         comparison_analysis.edge_detection_accuracy, ...
         abs(comparison_analysis.value_correlation), ...
-        comparison_analysis.sparsity_match
-    ]);
-    
-    % Detailed results per frequency
-    comparison_analysis.per_frequency.edge_accuracies = edge_accuracies;
-    comparison_analysis.per_frequency.value_correlations = value_correlations;
-    comparison_analysis.per_frequency.sparsity_matches = sparsity_matches;
+        comparison_analysis.sparsity_match]);
+
+    comparison_analysis.per_frequency.edge_accuracies   = edge_accuracies;
+    comparison_analysis.per_frequency.value_correlations= value_correlations;
+    comparison_analysis.per_frequency.sparsity_matches  = sparsity_matches;
 end
 
-function create_ground_truth_visualization(estep_results, ground_truth, comparison_analysis)
-    % Create visualization comparing results with ground truth
-    
-    figure('Name', 'Ground Truth Comparison', 'Position', [450, 100, 1400, 800]);
-    
-    F = length(estep_results.initial_precision_matrices);
-    
-    % Accuracy metrics across frequencies
-    subplot(2, 4, 1);
-    plot(1:F, comparison_analysis.per_frequency.edge_accuracies, 'o-', 'LineWidth', 2);
-    title('Edge Detection Accuracy');
-    xlabel('Frequency');
-    ylabel('Accuracy');
-    ylim([0, 1]);
-    
-    subplot(2, 4, 2);
-    plot(1:F, comparison_analysis.per_frequency.value_correlations, 's-', 'LineWidth', 2);
-    title('Value Correlation');
-    xlabel('Frequency');
-    ylabel('Correlation');
-    ylim([-1, 1]);
-    
-    subplot(2, 4, 3);
-    plot(1:F, comparison_analysis.per_frequency.sparsity_matches, '^-', 'LineWidth', 2);
-    title('Sparsity Pattern Match');
-    xlabel('Frequency');
-    ylabel('Match Rate');
-    ylim([0, 1]);
-    
-    % Overall quality radar plot (if we had more metrics)
-    subplot(2, 4, 4);
-    metrics = [comparison_analysis.edge_detection_accuracy, ...
-               abs(comparison_analysis.value_correlation), ...
-               comparison_analysis.sparsity_match];
-    metric_names = {'Edge Accuracy', 'Value Corr', 'Sparsity Match'};
-    
-    bar(metrics);
-    set(gca, 'XTickLabel', metric_names);
-    title('Overall Quality Metrics');
-    ylabel('Score (0-1)');
-    ylim([0, 1]);
-    
-    % Detailed comparison for first frequency
+function create_ground_truth_visualization(estep_results, ground_truth, C)
+% Visualize comparison to ground truth (skips if headless)
+    if ~can_make_plots(), return; end
+
+    figure('Name','Ground Truth Comparison','Position',[450,100,1400,800]);
+    F = numel(estep_results.initial_precision_matrices);
+
+    % Metrics across frequencies
+    subplot(2,4,1);
+    plot(1:F, C.per_frequency.edge_accuracies, 'o-','LineWidth',2);
+    title('Edge Detection Accuracy'); xlabel('Frequency'); ylabel('Accuracy'); ylim([0,1]);
+
+    subplot(2,4,2);
+    plot(1:F, C.per_frequency.value_correlations, 's-','LineWidth',2);
+    title('Value Correlation'); xlabel('Frequency'); ylabel('Correlation'); ylim([-1,1]);
+
+    subplot(2,4,3);
+    plot(1:F, C.per_frequency.sparsity_matches, '^-','LineWidth',2);
+    title('Sparsity Pattern Match'); xlabel('Frequency'); ylabel('Match'); ylim([0,1]);
+
+    subplot(2,4,4);
+    bar([C.edge_detection_accuracy, abs(C.value_correlation), C.sparsity_match]);
+    set(gca,'XTickLabel',{'Edge Acc','Value Corr','Sparsity'}); ylim([0,1]); title('Overall Metrics');
+
+    % Detailed for first frequency
     if ~isempty(ground_truth.true_precision_matrices{1}) && ~isempty(estep_results.initial_precision_matrices{1})
-        true_prec = ground_truth.true_precision_matrices{1};
-        est_prec = estep_results.initial_precision_matrices{1};
-        
-        subplot(2, 4, 5);
-        imagesc(abs(true_prec));
-        colorbar;
-        title('True Precision |Ω|');
-        
-        subplot(2, 4, 6);
-        imagesc(abs(est_prec));
-        colorbar;
-        title('Estimated Precision |Ω̂|');
-        
-        % ROC-like analysis for edge detection
-        subplot(2, 4, 7);
-        threshold_range = linspace(0, max(abs(est_prec(:))), 100);
-        true_threshold = 0.01 * max(abs(true_prec(:)));
-        true_edges = abs(true_prec) > true_threshold;
-        
-        sensitivity = zeros(size(threshold_range));
-        specificity = zeros(size(threshold_range));
-        
-        for i = 1:length(threshold_range)
-            est_edges = abs(est_prec) > threshold_range(i);
-            
-            tp = sum(true_edges(:) & est_edges(:));
-            fp = sum(~true_edges(:) & est_edges(:));
-            fn = sum(true_edges(:) & ~est_edges(:));
-            tn = sum(~true_edges(:) & ~est_edges(:));
-            
-            if (tp + fn) > 0
-                sensitivity(i) = tp / (tp + fn);
-            end
-            if (tn + fp) > 0
-                specificity(i) = tn / (tn + fp);
-            end
+        Tr = ground_truth.true_precision_matrices{1};
+        Om = estep_results.initial_precision_matrices{1};
+
+        subplot(2,4,5); imagesc(abs(Tr)); colorbar; title('True |Ω|');
+        subplot(2,4,6); imagesc(abs(Om)); colorbar; title('Estimated |Ω̂|');
+
+        % ROC-like curve (threshold sweep on estimated matrix)
+        subplot(2,4,7);
+        thr_true = 0.01 * max(abs(Tr(:)));
+        tp = abs(Tr) > thr_true;
+        thrs = linspace(0, max(abs(Om(:))), 100);
+        sens = zeros(size(thrs)); spec = zeros(size(thrs));
+        for i = 1:numel(thrs)
+            ep = abs(Om) > thrs(i);
+            tp_pos = sum(tp(:) & ep(:));
+            fp_pos = sum(~tp(:) & ep(:));
+            fn_pos = sum(tp(:) & ~ep(:));
+            tn_pos = sum(~tp(:) & ~ep(:));
+            sens(i) = tp_pos / max(1,(tp_pos+fn_pos));
+            spec(i) = tn_pos / max(1,(tn_pos+fp_pos));
         end
-        
-        plot(1 - specificity, sensitivity, 'LineWidth', 2);
-        xlabel('False Positive Rate');
-        ylabel('True Positive Rate');
-        title('ROC Curve for Edge Detection');
-        
-        % Value scatter plot
-        subplot(2, 4, 8);
-        scatter(real(true_prec(:)), real(est_prec(:)), 10, 'filled', 'alpha', 0.6);
-        xlabel('True Values');
-        ylabel('Estimated Values');
-        title(sprintf('Value Correlation: %.3f', comparison_analysis.value_correlation));
-        hold on;
-        plot(xlim, xlim, 'r--');
+        plot(1-spec, sens, 'LineWidth',2); xlabel('FPR'); ylabel('TPR'); title('ROC Curve');
+
+        % Value scatter
+        subplot(2,4,8);
+        tv = Tr(:); ev = Om(:);
+        scatter(real(tv), real(ev), 10, 'filled', 'MarkerFaceAlpha', 0.6);
+        hold on; xl = xlim; plot(xl, xl, 'r--');
+        xlabel('True'); ylabel('Estimated'); title(sprintf('Value Corr: %.3f', C.value_correlation));
     end
-    
-    sgtitle(sprintf('Ground Truth Comparison - Overall Quality: %.2f', comparison_analysis.overall_quality));
+
+    sgtitle(sprintf('Ground Truth Comparison - Overall Quality: %.2f', C.overall_quality));
 end
 
-function generate_usage_recommendations(demo_results)
-    % Generate usage recommendations based on demo results
-    
+function generate_usage_recommendations(D)
+% Print practical guidance derived from demo results
     fprintf('\nUsage Recommendations:\n');
-    
-    if demo_results.demo2.success
-        fprintf('  - Optimal regularization factor: %.0e\n', demo_results.demo2.sensitivity_results.optimal_regularization);
-        fprintf('  - Module handles numerical challenges well with proper regularization\n');
+    if safe_flag(D,'demo2')
+        fprintf('  - Optimal regularization factor: %.0e\n', D.demo2.sensitivity_results.optimal_regularization);
+        fprintf('  - Apply mild ridge (ε≈1e-6~1e-4) if conditioning degrades.\n');
     end
-    
-    if demo_results.demo3.success
-        fprintf('  - Mathematical properties verified - algorithm is numerically sound\n');
+    if safe_flag(D,'demo3')
+        fprintf('  - Mathematical checks passed (complementary + contraction + uncertainty).\n');
     end
-    
-    if demo_results.demo4.success && isfield(demo_results.demo4, 'scaling_analysis')
-        fprintf('  - Computational complexity: %s\n', demo_results.demo4.scaling_analysis.interpretation);
-        if ~isempty(demo_results.demo4.performance_data.successful_sizes)
-            max_recommended = max(demo_results.demo4.performance_data.successful_sizes);
-            fprintf('  - Suitable for problems up to ~%d sensors on standard hardware\n', max_recommended);
+    if safe_flag(D,'demo4') && isfield(D.demo4,'scaling_analysis')
+        fprintf('  - Computational complexity: %s\n', D.demo4.scaling_analysis.interpretation);
+        if isfield(D.demo4,'performance_data') && ~isempty(D.demo4.performance_data.successful_sizes)
+            fprintf('  - Suitable up to ~%d sensors on standard hardware.\n', ...
+                    max(D.demo4.performance_data.successful_sizes));
         end
     end
-    
-    if demo_results.demo5.success
-        fprintf('  - Ground truth comparison shows good recovery performance\n');
-        fprintf('  - Edge detection accuracy: %.1f%% - suitable for network analysis\n', ...
-                demo_results.demo5.comparison_analysis.edge_detection_accuracy * 100);
+    if safe_flag(D,'demo5')
+        fprintf('  - Ground-truth comparison is satisfactory for network analysis (edges/values/sparsity).\n');
     end
-    
-    fprintf('  - Use Module7 simulation for algorithm validation and testing\n');
-    fprintf('  - Monitor condition numbers and apply regularization when needed\n');
+    fprintf('  - Monitor conditioning of sensor/residual covariances; use regularization when needed.\n');
 end
 
-function generate_troubleshooting_guide(demo_results)
-    % Generate troubleshooting guide for failed demos
-    
+function generate_troubleshooting_guide(D)
+% Print troubleshooting guidance for failed demos
     fprintf('\nTroubleshooting Guide:\n');
-    
-    if ~demo_results.demo1.success
-        fprintf('  - Basic functionality failed: Check Module7 simulation and leadfield matrix\n');
-        fprintf('  - Verify input data dimensions and matrix properties\n');
+    if ~safe_flag(D,'demo1')
+        fprintf('  - Check Module7 data generation and leadfield dimensions.\n');
     end
-    
-    if ~demo_results.demo3.success
-        fprintf('  - Mathematical property violations: Increase regularization factor\n');
-        fprintf('  - Check for numerical instabilities in matrix computations\n');
+    if ~safe_flag(D,'demo3')
+        fprintf('  - If math properties fail, increase regularization and verify covariance Hermitianity.\n');
     end
-    
-    if ~demo_results.demo4.success
-        fprintf('  - Performance issues: Consider reducing problem size\n');
-        fprintf('  - Monitor memory usage for large problems\n');
+    if ~safe_flag(D,'demo4')
+        fprintf('  - Performance issues: reduce problem size or enable parallel BLAS if available.\n');
     end
-    
-    if ~demo_results.demo5.success
-        fprintf('  - Poor ground truth recovery: Check SNR and edge density parameters\n');
-        fprintf('  - Consider adjusting source prior covariances\n');
+    if ~safe_flag(D,'demo5')
+        fprintf('  - Poor ground truth recovery: adjust SNR/edge density or source priors.\n');
     end
-    
-    fprintf('  - Always check generated visualizations for diagnostic information\n');
+    fprintf('  - Inspect figures for hints (if available).\n');
 end
 
-function str = logical_to_string(logical_value)
-    % Convert logical value to string
-    if logical_value
-        str = 'YES';
-    else
-        str = 'NO';
-    end
+function str = logical_to_string(v)
+    if v, str = 'YES'; else, str = 'NO'; end
 end
 
-function str = success_symbol(success_flag)
-    % Return success/failure symbol
-    if success_flag
-        str = '✓';
-    else
-        str = '✗';
-    end
+function str = success_symbol(flag)
+    if flag, str = '✓'; else, str = '✗'; end
 end
 
-function str = pass_fail_string(passed)
-    % Return PASS/FAIL string
-    if passed
-        str = 'PASS';
-    else
-        str = 'FAIL';
+function str = pass_fail_string(flag)
+    if flag, str = 'PASS'; else, str = 'FAIL'; end
+end
+
+function ok = safe_flag(S, fieldname)
+    ok = isfield(S, fieldname) && isfield(S.(fieldname),'success') && S.(fieldname).success;
+end
+
+%% ---------- Small Utilities ----------
+function tf = can_make_plots()
+    tf = usejava('jvm') && feature('ShowFigureWindows');
+end
+
+function e = rel_fro(A, B)
+% Relative Frobenius norm ||A||_F / ||B||_F (absolute if B omitted)
+    if nargin < 2 || isempty(B), e = norm(A,'fro'); else, e = norm(A,'fro') / max(1, norm(B,'fro')); end
+end
+
+function v = safe_logdet_chol(A)
+% Robust log(det(A)) using Cholesky with small jitter
+    A = (A + A')/2; p = size(A,1);
+    base = 1e-12 * max(1, trace(A)/max(1,p));
+    for k = 0:6
+        [R,flag] = chol(A + (base*10^k)*eye(p,class(A)));
+        if flag == 0, v = 2*sum(log(abs(diag(R)))); return; end
+    end
+    ev = real(eig(A)); ev(ev<=0) = eps; v = sum(log(ev));
+end
+
+function mb = get_mem_used_mb()
+% Best-effort memory usage (platform dependent). Falls back to NaN.
+    mb = NaN;
+    try
+        ms = memory; mb = ms.MemUsedMATLAB/1e6;
+    catch
+        try
+            s = feature('memstats'); mb = s.PeakMemUsed/1e6;
+        catch
+            % leave NaN
+        end
     end
 end
