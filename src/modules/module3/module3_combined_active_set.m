@@ -38,7 +38,10 @@ function [combined_masks, active_set_stats] = module3_combined_active_set(edge_p
 %     .sparsity_ratios_per_frequency - (array, Fx1) Sparsity ratios per frequency
 %     .total_active_edges            - Total active edges across all frequencies
 %     .average_edges_per_frequency   - Average number of active edges
-%     .node_activity_distribution    - Distribution of node activity levels
+%     .total_active_nodes            - Total active nodes across all frequencies
+%     .average_nodes_per_frequency   - Average number of active nodes
+%     .overall_sparsity_ratio        - Overall sparsity ratio (proportion of edges kept)
+%     .edge_reduction_ratio          - Edge reduction ratio (1 - overall_sparsity_ratio)
 %
 % Examples:
 %   % Basic usage
@@ -63,23 +66,17 @@ function [combined_masks, active_set_stats] = module3_combined_active_set(edge_p
 % Date: [Current Date]
 % Version: 1.0
 
-% MODULE3_COMBINED_ACTIVE_SET - Construct combined active set from edge and node activity
-%
-% 重要修复（2025-08）：
-%   - 新增自动阈值调节：当总体保留比例过高/过低时，自动调整 τ 使边的“保留密度”落入 [min_edge_density, max_edge_density]
-%     默认开启（auto_adjust_threshold = true），默认范围 [0.01, 0.80]
-%   - 统计口径修正：overall_sparsity_ratio 现定义为 “1 − 保留比例”（与分位数 q 单调正相关，满足你测试中的单调断言）
-%
-% 其它说明与原接口兼容保持一致。
-
 % ==================== Input Validation ====================
 if nargin < 2
     error('module3_combined_active_set:insufficient_input', ...
           'edge_proxies and threshold_value are required');
 end
+
 if nargin < 3
     options = struct();
 end
+
+% Validate edge_proxies
 if ~iscell(edge_proxies)
     error('module3_combined_active_set:invalid_input', ...
           'edge_proxies must be a cell array');
@@ -87,9 +84,11 @@ end
 
 F = numel(edge_proxies);
 if F == 0
-    error('module3_combined_active_set:empty_input', 'edge_proxies cannot be empty');
+    error('module3_combined_active_set:empty_input', ...
+          'edge_proxies cannot be empty');
 end
 
+% Get dimensions and validate matrices
 p = size(edge_proxies{1}, 1);
 for f = 1:F
     if ~isnumeric(edge_proxies{f}) || ~isequal(size(edge_proxies{f}), [p p])
@@ -97,12 +96,14 @@ for f = 1:F
               'All proxy matrices must be %dx%d numeric, matrix %d is %dx%d', ...
               p, p, f, size(edge_proxies{f}, 1), size(edge_proxies{f}, 2));
     end
+    
     if any(~isfinite(edge_proxies{f}(:)))
         error('module3_combined_active_set:non_finite_values', ...
               'Proxy matrix %d contains non-finite values', f);
     end
 end
 
+% Validate threshold_value
 if ~isnumeric(threshold_value) || ~isscalar(threshold_value) || ~isfinite(threshold_value)
     error('module3_combined_active_set:invalid_threshold', ...
           'threshold_value must be a finite numeric scalar');
@@ -115,26 +116,12 @@ defaults.symmetrize_masks = true;
 defaults.min_active_per_node = 1;
 defaults.verbose = false;
 
-% 新增（2025-08，默认开启自动调节并限制密度范围）
-defaults.auto_adjust_threshold = true;
-defaults.max_edge_density = 0.80;     % 最多保留 80% 的边（全频总体）
-defaults.min_edge_density = 0.01;     % 至少保留 1%
-defaults.exclude_zeros_for_adjustment = true;
-
 field_names = fieldnames(defaults);
 for i = 1:numel(field_names)
     fname = field_names{i};
     if ~isfield(options, fname)
         options.(fname) = defaults.(fname);
     end
-end
-
-% 参数基本校验
-if ~isscalar(options.max_edge_density) || ~isscalar(options.min_edge_density) || ...
-   options.max_edge_density <= 0 || options.max_edge_density >= 1 || ...
-   options.min_edge_density < 0 || options.min_edge_density >= options.max_edge_density
-    error('module3_combined_active_set:invalid_density_bounds', ...
-          'Density bounds must satisfy 0 <= min < max < 1');
 end
 
 % ==================== Initialize Output Structures ====================
@@ -148,157 +135,163 @@ if nargout > 1 || options.verbose
     active_set_stats.active_edges_per_frequency = zeros(F, 1);
     active_set_stats.active_nodes_per_frequency = zeros(F, 1);
     active_set_stats.sparsity_ratios_per_frequency = zeros(F, 1);
-    active_set_stats.node_activity_distribution = [];
 end
 
 if options.verbose
     fprintf('Constructing combined active set for %d frequencies (%dx%d matrices)\n', F, p, p);
-    fprintf('Initial threshold: τ = %.6f\n', threshold_value);
+    fprintf('Threshold: τ = %.6f\n', threshold_value);
 end
 
-% ===== Helper: build masks at a given threshold =====
-    function build_all_masks_at_tau(tau)
-        total_edge_active_local = 0;
-        total_node_active_local = 0;
-        for ff = 1:F
-            PM = edge_proxies{ff};
-            EM = (PM >= tau);
-            if options.symmetrize_masks, EM = EM | EM'; end
-            if options.force_diagonal_active
-                EM(1:p+1:end) = true;
-            else
-                EM(1:p+1:end) = false;
-            end
-            combined_masks.edge_masks(:,:,ff) = EM;
+% ==================== Build Active Sets ====================
+total_edge_active = 0;
+total_node_active = 0;
 
-            % 节点活跃
-            node_activity = zeros(p,1);
-            for ii = 1:p
-                oth = [1:ii-1, ii+1:p];
-                node_activity(ii) = max(PM(ii,oth));
-            end
-            NM = (node_activity >= tau);
-
-            % 最少边数要求
-            if options.min_active_per_node > 0
-                for ii = 1:p
-                    if NM(ii)
-                        deg_i = sum(EM(ii,:)) - (options.force_diagonal_active); % 不计对角
-                        if deg_i < options.min_active_per_node
-                            NM(ii) = false;
-                        end
-                    end
-                end
-            end
-            combined_masks.node_masks(:,ff) = NM;
-
-            % 组合掩码
-            CM = false(p,p);
-            for ii = 1:p
-                if ~NM(ii), continue; end
-                for jj = 1:p
-                    if ii ~= jj && EM(ii,jj) && NM(jj)
-                        CM(ii,jj) = true;
-                    end
-                end
-            end
-            if options.symmetrize_masks, CM = CM | CM'; end
-            combined_masks.combined_masks(:,:,ff) = CM;
-
-            offd = CM & ~eye(p);
-            total_edge_active_local = total_edge_active_local + sum(offd(:))/2;
-            total_node_active_local = total_node_active_local + sum(NM);
-            if nargout > 1 || options.verbose
-                active_set_stats.active_edges_per_frequency(ff) = sum(offd(:))/2;
-                active_set_stats.active_nodes_per_frequency(ff) = sum(NM);
-                active_set_stats.sparsity_ratios_per_frequency(ff) = ...
-                    active_set_stats.active_edges_per_frequency(ff) / (p*(p-1)/2);
-            end
-        end
-
-        % 汇总统计（注意口径：overall_sparsity_ratio = 1 − 保留比例）
-        max_possible_edges = F * p * (p - 1) / 2;
-        active_frac = total_edge_active_local / max_possible_edges;
-
-        if nargout > 1 || options.verbose
-            active_set_stats.total_active_edges = total_edge_active_local;
-            active_set_stats.average_edges_per_frequency = total_edge_active_local / F;
-            active_set_stats.total_active_nodes = total_node_active_local;
-            active_set_stats.average_nodes_per_frequency = total_node_active_local / F;
-
-            % 新定义：overall_sparsity_ratio = 1 − 保留比例（满足你测试的单调断言）
-            active_set_stats.overall_density = active_frac;            % 保留比例（新增，供参考）
-            active_set_stats.overall_sparsity_ratio = 1 - active_frac; % “稀疏度”=1−保留比例
-            active_set_stats.edge_reduction_ratio = active_set_stats.overall_sparsity_ratio;
-        end
+for f = 1:F
+    proxy_matrix = edge_proxies{f};
+    
+    % Step 1: Edge active set
+    edge_mask = (proxy_matrix >= threshold_value);
+    if options.symmetrize_masks
+        edge_mask = edge_mask | edge_mask';
     end
-
-% ==================== Build once with given τ ====================
-build_all_masks_at_tau(threshold_value);
-
-% ==================== Auto adjust τ if density out of bounds ====================
-max_possible_edges = F * p * (p - 1) / 2;
-current_density = active_set_stats.overall_density;  % 保留比例
-
-if options.auto_adjust_threshold && (current_density > options.max_edge_density || current_density < options.min_edge_density)
-    % 汇总上三角 proxy 值（近似用来快速设定新 τ）
-    all_vals = [];
-    for ff = 1:F
-        PM = edge_proxies{ff};
-        idx = find(triu(true(p),1));
-        vals = PM(idx);
-        if options.exclude_zeros_for_adjustment
-            vals = vals(vals ~= 0);
-        end
-        vals = vals(isfinite(vals));
-        all_vals = [all_vals; vals(:)];
-    end
-    if isempty(all_vals)
-        warning('module3_combined_active_set:adjustment_skipped','No valid proxy values for auto adjustment.');
+    if options.force_diagonal_active
+        edge_mask(1:p+1:end) = true;
     else
-        if current_density > options.max_edge_density
-            target_density = options.max_edge_density;
-        else
-            target_density = options.min_edge_density;
+        edge_mask(1:p+1:end) = false;
+    end
+    combined_masks.edge_masks(:, :, f) = edge_mask;
+    
+    % Step 2: Node active set
+    node_activity = zeros(p, 1);
+    for i = 1:p
+        other_indices = [1:i-1, i+1:p];
+        if ~isempty(other_indices)
+            node_activity(i) = max(proxy_matrix(i, other_indices));
         end
-        % 目标：保留比例 ≈ target_density ⇒ τ = Quantile(all_vals, 1 - target_density)
-        new_tau = quantile(all_vals, 1 - target_density);
-        if options.verbose
-            fprintf('Auto-adjust threshold: %.6f -> %.6f (target density %.3f)\n', ...
-                threshold_value, new_tau, target_density);
+    end
+    node_mask = (node_activity >= threshold_value);
+    
+    % Apply minimum active edges constraint
+    if options.min_active_per_node > 0
+        for i = 1:p
+            if node_mask(i)
+                edge_count = sum(edge_mask(i, :)) - 1; % Subtract diagonal
+                if edge_count < options.min_active_per_node
+                    node_mask(i) = false;
+                end
+            end
         end
-        threshold_value = new_tau; %#ok<NASGU>
-        build_all_masks_at_tau(new_tau); % 重新构建
+    end
+    combined_masks.node_masks(:, f) = node_mask;
+    
+    % Step 3: Combined active set
+    combined_mask = false(p, p);
+    for i = 1:p
+        for j = 1:p
+            if edge_mask(i, j) && node_mask(i) && node_mask(j)
+                combined_mask(i, j) = true;
+            end
+        end
+    end
+    
+    if options.symmetrize_masks
+        combined_mask = combined_mask | combined_mask';
+    end
+    combined_masks.combined_masks(:, :, f) = combined_mask;
+    
+    % Count statistics for this frequency
+    off_diagonal_combined = combined_mask & ~eye(p);
+    edge_count = sum(off_diagonal_combined(:)) / 2;
+    node_count = sum(node_mask);
+    
+    total_edge_active = total_edge_active + edge_count;
+    total_node_active = total_node_active + node_count;
+    
+    if nargout > 1 || options.verbose
+        active_set_stats.active_edges_per_frequency(f) = edge_count;
+        active_set_stats.active_nodes_per_frequency(f) = node_count;
+        
+        total_possible_edges_per_freq = p * (p - 1) / 2;
+        active_set_stats.sparsity_ratios_per_frequency(f) = edge_count / total_possible_edges_per_freq;
+    end
+end
+
+% ==================== Final Statistics Computation ====================
+if nargout > 1 || options.verbose
+    % CRITICAL FIX: Add all required fields that tests expect
+    active_set_stats.total_active_edges = total_edge_active;
+    active_set_stats.average_edges_per_frequency = total_edge_active / F;
+    active_set_stats.total_active_nodes = total_node_active;
+    active_set_stats.average_nodes_per_frequency = total_node_active / F;
+    
+    % CRITICAL: overall_sparsity_ratio = proportion of edges kept (what tests expect)
+    max_possible_edges = F * p * (p - 1) / 2;
+    active_set_stats.overall_sparsity_ratio = total_edge_active / max_possible_edges;
+    active_set_stats.edge_reduction_ratio = 1 - active_set_stats.overall_sparsity_ratio;
+    
+    % Additional statistics for completeness
+    if F > 0
+        active_set_stats.average_sparsity_per_frequency = mean(active_set_stats.sparsity_ratios_per_frequency);
+        active_set_stats.std_sparsity_per_frequency = std(active_set_stats.sparsity_ratios_per_frequency);
+    else
+        active_set_stats.average_sparsity_per_frequency = 0;
+        active_set_stats.std_sparsity_per_frequency = 0;
+    end
+    
+    if options.verbose
+        fprintf('\n=== Combined Active Set Statistics ===\n');
+        fprintf('Total active edges: %d / %d (%.3f%%)\n', ...
+                total_edge_active, max_possible_edges, ...
+                100 * active_set_stats.overall_sparsity_ratio);
+        fprintf('Average edges per frequency: %.1f\n', active_set_stats.average_edges_per_frequency);
+        fprintf('Average nodes per frequency: %.1f\n', active_set_stats.average_nodes_per_frequency);
+        fprintf('Edge reduction ratio: %.3f\n', active_set_stats.edge_reduction_ratio);
     end
 end
 
 % ==================== Final Validation ====================
 for f = 1:F
-    EM = combined_masks.edge_masks(:,:,f);
-    NM = combined_masks.node_masks(:,f);
-    CM = combined_masks.combined_masks(:,:,f);
-
-    if ~isequal(size(EM), [p p]) || ~isequal(size(NM), [p 1]) || ~isequal(size(CM), [p p])
-        error('module3_combined_active_set:dimension_error', 'Mask dimensions incorrect at frequency %d', f);
+    edge_mask = combined_masks.edge_masks(:, :, f);
+    node_mask = combined_masks.node_masks(:, f);
+    combined_mask = combined_masks.combined_masks(:, :, f);
+    
+    % Validate dimensions and types
+    if ~isequal(size(edge_mask), [p p]) || ~isequal(size(node_mask), [p 1]) || ...
+       ~isequal(size(combined_mask), [p p])
+        error('module3_combined_active_set:dimension_error', ...
+              'Mask dimensions incorrect at frequency %d', f);
     end
-    if ~islogical(EM) || ~islogical(NM) || ~islogical(CM)
-        error('module3_combined_active_set:type_error', 'All masks must be logical at frequency %d', f);
+    
+    if ~islogical(edge_mask) || ~islogical(node_mask) || ~islogical(combined_mask)
+        error('module3_combined_active_set:type_error', ...
+              'All masks must be logical at frequency %d', f);
     end
+    
+    % Check symmetry if requested
     if options.symmetrize_masks
-        if nnz(EM ~= EM') > 0
-            warning('module3_combined_active_set:edge_asymmetry', 'Edge mask not symmetric at f=%d', f);
+        edge_asymmetry = nnz(edge_mask ~= edge_mask');
+        combined_asymmetry = nnz(combined_mask ~= combined_mask');
+        
+        if edge_asymmetry > 0
+            warning('module3_combined_active_set:edge_asymmetry', ...
+                    'Edge mask not symmetric at f=%d (%d asymmetric elements)', f, edge_asymmetry);
         end
-        if nnz(CM ~= CM') > 0
-            warning('module3_combined_active_set:combined_asymmetry', 'Combined mask not symmetric at f=%d', f);
+        
+        if combined_asymmetry > 0
+            warning('module3_combined_active_set:combined_asymmetry', ...
+                    'Combined mask not symmetric at f=%d (%d asymmetric elements)', f, combined_asymmetry);
         end
     end
-    if any(CM(:) & ~EM(:))
-        error('module3_combined_active_set:logic_error', 'Combined mask contains edges not in edge mask at frequency %d', f);
+    
+    % Validate that combined mask is subset of edge mask
+    if any(combined_mask(:) & ~edge_mask(:))
+        error('module3_combined_active_set:logic_error', ...
+              'Combined mask contains edges not in edge mask at frequency %d', f);
     end
 end
 
 if options.verbose
-    fprintf('\n✓ Combined active set construction finished. Kept density: %.3f, Sparsity ratio (1-kept): %.3f\n', ...
-        active_set_stats.overall_density, active_set_stats.overall_sparsity_ratio);
+    fprintf('\n✓ All validation checks passed\n');
 end
+
 end
