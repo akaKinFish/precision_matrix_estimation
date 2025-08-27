@@ -1,5 +1,4 @@
 function gradient_results = module4_gradient(input_data, gradient_params)
-
 % MODULE4_GRADIENT - Main interface for Module 4 gradient computation
 %
 % Syntax:
