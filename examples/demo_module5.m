@@ -1,405 +1,460 @@
-% DEMO_MODULE5 - Demonstration of Module 5 Proximal Updates
+% DEMO_MODULE5_INTEGRATED - Integrated demonstration of Modules 1-5 pipeline
 %
-% This script demonstrates the usage of Module 5 for sparse precision
-% matrix estimation using proximal gradient methods. Shows both basic
-% usage and advanced features.
+% Pipeline: Module 7 (data) -> Module 1 (whitening) -> Module 4 (grad) -> Module 5 (prox)
 %
 % Author: [Your Name]
 % Date: [Current Date]
-% Version: 1.0
+% Version: 1.1
 
-clear; clc;
+clear; clc; close all;
 
 fprintf('=========================================\n');
-fprintf('Module 5 Proximal Updates Demo\n');
+fprintf('Module 5 Integrated Pipeline Demo\n');
 fprintf('=========================================\n');
 
-%% Step 1: Problem Setup
-fprintf('\nStep 1: Creating synthetic test problem...\n');
+rng(42); % reproducibility
 
-% Problem dimensions
-p = 6;   % Number of nodes
-F = 4;   % Number of frequencies
+%% Step 1: Generate Test Data using Module 7
+fprintf('\nStep 1: Generating test data using Module 7...\n');
 
-fprintf('  Problem size: %d nodes, %d frequencies\n', p, F);
-
-% Generate synthetic data
-rng(42);  % For reproducibility
-
-% Create true sparse precision matrices with complex entries
-Gamma_true = cell(F, 1);
-sparsity = 0.4;  % 40% of off-diagonal elements are zero
-
-for f = 1:F
-    % Generate sparse precision matrix
-    Omega = randn(p) + 1i * randn(p);
-    Omega = (Omega + Omega') / 2;
-
-    % Apply sparsity
-    mask = rand(p, p) > sparsity;
-    mask = mask | mask';
-    mask(1:p+1:end) = true;
-
-    Omega = Omega .* mask;
-
-    % Ensure positive definiteness
-    min_eig = min(real(eig(Omega)));
-    if min_eig <= 0
-        Omega = Omega + (abs(min_eig) + 0.5) * eye(p);
-    end
-
-    Gamma_true{f} = Omega;
-end
-
-
-% Generate corresponding covariances
-Sigma_true = cell(F, 1);
-for f = 1:F
-    Sigma_true{f} = inv(Gamma_true{f});
-end
-
-fprintf('  Generated %d sparse precision matrices\n', F);
-fprintf('  Average sparsity: %.1f%%\n', mean(cellfun(@(x) 100*sum(sum(abs(x)<1e-10))/numel(x), Gamma_true)));
-
-%% Step 2: Setup Smoothing and Weights
-fprintf('\nStep 2: Setting up smoothing kernel and weight matrix...\n');
-
-% Create smoothing kernel (adjacent frequency coupling)
-K_smooth = zeros(F, F);
-for f = 1:F-1
-    K_smooth(f, f+1) = 0.3;
-    K_smooth(f+1, f) = 0.3;
-end
-
-% Add some next-nearest neighbor coupling
-for f = 1:F-2
-    K_smooth(f, f+2) = 0.1;
-    K_smooth(f+2, f) = 0.1;
-end
-
-fprintf('  Smoothing kernel: %d non-zero entries\n', nnz(K_smooth));
-
-% Create weight matrix for ||·||_{W^Γ} norm
-W_matrix = eye(p);
-% Add structure: penalize certain edges more
-for i = 1:p-1
-    W_matrix(i, i+1) = 2.0;  % Penalize adjacent node connections
-    W_matrix(i+1, i) = 2.0;
-end
-W_matrix = W_matrix / max(eig(W_matrix)) * 0.8;  % Normalize
-
-fprintf('  Weight matrix condition number: %.2f\n', cond(W_matrix));
-
-%% Step 3: Create Active Set Masks
-fprintf('\nStep 3: Creating active set masks...\n');
-
-% Simulate active set selection (normally comes from Module 3)
-active_masks = cell(F, 1);
-for f = 1:F
-    % Start with mostly active set (90% of elements active)
-    mask = rand(p, p) > 0.1;
-    mask = mask | mask';  % Ensure symmetry
-    mask(1:p+1:end) = true;  % Diagonal always active
-    active_masks{f} = mask;
-end
-
-total_active = sum(cellfun(@(x) sum(sum(triu(x,1))), active_masks));
-total_possible = F * p * (p-1) / 2;
-fprintf('  Total active edges: %d / %d (%.1f%%)\n', total_active, total_possible, 100*total_active/total_possible);
-
-%% Step 4: Initialize Precision Estimates
-fprintf('\nStep 4: Initializing precision estimates...\n');
-
-% Initialize using ridge-regularized inverse covariances (as recommended)
-Gamma_init = cell(F, 1);
-for f = 1:F
-    S = Sigma_true{f};
-    S = (S + S') / 2;  % Ensure Hermitian
-    eps_ridge = 1e-8 * trace(S) / p;
-    S_reg = S + eps_ridge * eye(p);
-    G0 = S_reg \ eye(p);
-    G0 = (G0 + G0') / 2;  % Force Hermitian
-    G0(1:p+1:end) = real(diag(G0));  % Real diagonal
-    Gamma_init{f} = G0;
-end
-
-% Check initialization quality
-init_errors = zeros(F, 1);
-for f = 1:F
-    init_errors(f) = norm(Gamma_init{f} - Gamma_true{f}, 'fro') / norm(Gamma_true{f}, 'fro');
-end
-fprintf('  Initialization error range: [%.3f, %.3f]\n', min(init_errors), max(init_errors));
-
-%% Step 5: Package Input Data
-fprintf('\nStep 5: Preparing input data structure...\n');
-
-input_data = struct();
-input_data.whitened_covariances = Sigma_true;
-input_data.initial_precision = Gamma_init;
-input_data.smoothing_kernel = K_smooth;
-input_data.weight_matrix = W_matrix;
-input_data.active_set_masks = active_masks;
-
-fprintf('  Input data structure ready\n');
-
-%% Step 6: Basic Proximal Gradient Optimization
-fprintf('\nStep 6: Running basic proximal gradient optimization...\n');
-
-% Set parameters for basic run
-params_basic = struct();
-params_basic.lambda1 = [];  % Auto-compute via Gershgorin
-params_basic.lambda2 = 0.01;
-params_basic.max_iter = 100;
-params_basic.eps_x = 1e-3;
-params_basic.eps_f = 1e-4;
-params_basic.verbose = true;
-
-% Run optimization
-tic;
-[Gamma_basic, results_basic] = module5_proximal_main(input_data, params_basic);
-basic_time = toc;
-
-fprintf('\n  Basic optimization completed in %.2f seconds\n', basic_time);
-if results_basic.convergence_info.converged
-    convergence_str = 'YES';
-else
-    convergence_str = 'NO';
-end
-fprintf('  Convergence: %s (%s)\n', convergence_str, results_basic.convergence_info.convergence_reason);
-fprintf('  Final objective: %.6e\n', results_basic.convergence_info.final_objective);
-fprintf('  Iterations: %d\n', results_basic.convergence_info.iterations);
-
-%% Step 7: Evaluate Solution Quality
-fprintf('\nStep 7: Evaluating solution quality...\n');
-
-% Compute recovery errors
-recovery_errors = zeros(F, 1);
-final_sparsity = zeros(F, 1);
-
-for f = 1:F
-    % Recovery error
-    recovery_errors(f) = norm(Gamma_basic{f} - Gamma_true{f}, 'fro') / ...
-                        norm(Gamma_true{f}, 'fro');
-    
-    % Sparsity achieved
-    off_diag_mask = ~eye(p);
-    elements = Gamma_basic{f}(off_diag_mask);
-    final_sparsity(f) = sum(abs(elements) < 1e-6) / length(elements);
-end
-
-fprintf('  Recovery errors: [%.3f, %.3f] (mean: %.3f)\n', ...
-        min(recovery_errors), max(recovery_errors), mean(recovery_errors));
-fprintf('  Final sparsity: [%.2f%%, %.2f%%] (mean: %.1f%%)\n', ...
-        100*min(final_sparsity), 100*max(final_sparsity), 100*mean(final_sparsity));
-
-% Check mathematical properties
-all_psd = true;
-all_hermitian = true;
-max_hermitian_error = 0;
-
-for f = 1:F
-    [isPSD, ~] = module5_psd_check(Gamma_basic{f});
-    hermitian_error = norm(Gamma_basic{f} - Gamma_basic{f}', 'fro');
-    
-    all_psd = all_psd && isPSD;
-    all_hermitian = all_hermitian && (hermitian_error < 1e-10);
-    max_hermitian_error = max(max_hermitian_error, hermitian_error);
-end
-
-if all_psd
-    psd_str = 'YES';
-else
-    psd_str = 'NO';
-end
-fprintf('  All matrices PSD: %s\n', psd_str);
-
-if all_hermitian
-    hermitian_str = 'YES';
-else
-    hermitian_str = 'NO';
-end
-fprintf('  All matrices Hermitian: %s (max error: %.2e)\n', hermitian_str, max_hermitian_error);
-
-%% Step 8: Advanced Features Demo
-fprintf('\nStep 8: Demonstrating advanced features...\n');
-
-% Test different lambda2 values to show sparsity control
-lambda2_values = [1e-3, 5e-3, 1e-2, 2e-2];
-sparsity_results = zeros(size(lambda2_values));
-
-fprintf('  Testing sparsity control with different λ₂ values:\n');
-
-for i = 1:length(lambda2_values)
-    params_sparse = params_basic;
-    params_sparse.lambda2 = lambda2_values(i);
-    params_sparse.verbose = false;
-    params_sparse.max_iter = 50;  % Reduced for demo
-    
-    [Gamma_sparse, ~] = module5_proximal_main(input_data, params_sparse);
-    
-    % Compute achieved sparsity
-    total_elements = 0;
-    zero_elements = 0;
-    for f = 1:F
-        off_diag_mask = ~eye(p);
-        elements = Gamma_sparse{f}(off_diag_mask);
-        total_elements = total_elements + length(elements);
-        zero_elements = zero_elements + sum(abs(elements) < 1e-6);
-    end
-    
-    sparsity_results(i) = zero_elements / total_elements;
-    fprintf('    λ₂ = %.3f → Sparsity = %.1f%%\n', lambda2_values(i), 100*sparsity_results(i));
-end
-
-%% Step 9: Parallel Performance Demo
-fprintf('\nStep 9: Parallel performance demonstration...\n');
-
-if F >= 4  % Only test parallel if we have enough frequencies
-    % Sequential timing
-    params_seq = params_basic;
-    params_seq.use_parfor = false;
-    params_seq.verbose = false;
-    params_seq.max_iter = 20;
-    
-    tic;
-    module5_proximal_main(input_data, params_seq);
-    time_sequential = toc;
-    
-    % Parallel timing (if parallel pool available)
-    try
-        if isempty(gcp('nocreate'))
-            fprintf('  Creating parallel pool...\n');
-            parpool('local', 2);
-        end
-        
-        params_par = params_seq;
-        params_par.use_parfor = true;
-        
-        tic;
-        module5_proximal_main(input_data, params_par);
-        time_parallel = toc;
-        
-        speedup = time_sequential / time_parallel;
-        fprintf('  Sequential time: %.3f seconds\n', time_sequential);
-        fprintf('  Parallel time:   %.3f seconds\n', time_parallel);
-        fprintf('  Speedup factor:  %.2fx\n', speedup);
-        
-    catch ME
-        fprintf('  Parallel test skipped: %s\n', ME.message);
-    end
-else
-    fprintf('  Skipping parallel demo (need F >= 4)\n');
-end
-
-%% Step 10: Visualization
-fprintf('\nStep 10: Creating visualizations...\n');
+p = 6;   % nodes
+F = 4;   % frequencies
+n_samples = 150;
 
 try
-    figure('Position', [100, 100, 1200, 800]);
-    
-    % Plot 1: Convergence history
-    subplot(2, 3, 1);
-    semilogy(results_basic.objective_history);
-    title('Objective Convergence');
-    xlabel('Iteration');
-    ylabel('Objective Value');
-    grid on;
-    
-    % Plot 2: Gradient norm history
-    subplot(2, 3, 2);
-    semilogy(results_basic.gradient_norm_history);
-    title('Gradient Norm');
-    xlabel('Iteration');
-    ylabel('Gradient Norm');
-    grid on;
-    
-    % Plot 3: Step size history
-    subplot(2, 3, 3);
-    plot(results_basic.step_size_history);
-    title('Step Size History');
-    xlabel('Iteration');
-    ylabel('Step Size');
-    grid on;
-    
-    % Plot 4: Recovery error comparison
-    subplot(2, 3, 4);
-    stem(1:F, recovery_errors, 'filled');
-    title('Recovery Errors by Frequency');
-    xlabel('Frequency Index');
-    ylabel('Relative Error');
-    ylim([0, max(recovery_errors) * 1.1]);
-    grid on;
-    
-    % Plot 5: Sparsity vs Lambda2
-    subplot(2, 3, 5);
-    semilogx(lambda2_values, 100*sparsity_results, 'o-', 'LineWidth', 2, 'MarkerSize', 8);
-    title('Sparsity Control');
-    xlabel('λ₂ (L1 penalty)');
-    ylabel('Sparsity (%)');
-    grid on;
-    
-    % Plot 6: True vs Estimated structure (first frequency)
-    subplot(2, 3, 6);
-    true_pattern = abs(Gamma_true{1}) > 1e-10;
-    estimated_pattern = abs(Gamma_basic{1}) > 1e-6;
-    
-    % Create comparison matrix: 0=both zero, 1=true only, 2=estimated only, 3=both nonzero
-    comparison = zeros(p, p);
-    comparison(true_pattern & ~estimated_pattern) = 1;  % True positive missed
-    comparison(~true_pattern & estimated_pattern) = 2;  % False positive
-    comparison(true_pattern & estimated_pattern) = 3;   % True positive detected
-    
-    imagesc(comparison);
-    colormap([1 1 1; 1 0.5 0.5; 0.5 0.5 1; 0 0.8 0]);  % White, light red, light blue, green
-    title('Structure Comparison (Freq 1)');
-    xlabel('Node j');
-    ylabel('Node i');
-    colorbar('Ticks', [0, 1, 2, 3], 'TickLabels', {'Both Zero', 'Missed', 'False+', 'Correct'});
-    
-    sgtitle('Module 5 Proximal Updates Results');
-    
-    fprintf('  Visualization created successfully\n');
-    
+    [Gamma_true, Sigma_true, Sigma_emp, sim_results] = ...
+        module7_simulation_improved_complex('n_nodes', p, 'n_freq', F, ...
+        'n_samples', n_samples, 'graph_type', 'random', ...
+        'edge_density', 0.3, 'complex_strength', 0.7, ...
+        'random_seed', 42);
+    fprintf('  ✓ Using module7_simulation_improved_complex\n');
+catch
+    try
+        [Gamma_true, Sigma_true, Sigma_emp, sim_results] = ...
+            module7_simulation_improved('n_nodes', p, 'n_freq', F, ...
+            'n_samples', n_samples, 'graph_type', 'random', ...
+            'edge_density', 0.3, 'random_seed', 42);
+        fprintf('  ✓ Using module7_simulation_improved\n');
+    catch
+        [Gamma_true, Sigma_true, Sigma_emp, sim_results] = ...
+            module7_simulation('n_nodes', p, 'n_freq', F, ...
+            'n_samples', n_samples, 'graph_type', 'random', ...
+            'edge_density', 0.3, 'random_seed', 42);
+        fprintf('  ✓ Using module7_simulation\n');
+    end
+end
+
+fprintf('  Problem size: %d nodes, %d frequencies\n', p, F);
+fprintf('  Generated %d sparse precision matrices\n', F);
+
+% True sparsity (upper-tri off-diagonal)
+true_sparsity_total = 0; true_elements_total = 0;
+for f = 1:F
+    elements = Gamma_true{f}(triu(true(p),1));
+    true_sparsity_total = true_sparsity_total + nnz(abs(elements) < 1e-10);
+    true_elements_total = true_elements_total + numel(elements);
+end
+fprintf('  Average sparsity: %.1f%%\n', 100 * true_sparsity_total / true_elements_total);
+
+%% Step 2: Module 1 - Covariance Whitening
+fprintf('\nStep 2: Applying Module 1 covariance whitening...\n');
+whitening_operators = cell(F,1);
+for f = 1:F
+    S = Sigma_emp{f};
+    d = sqrt(1 ./ max(abs(diag(S)),1e-12));  % target diag 1
+    whitening_operators{f} = diag(d);
+end
+
+% Try class/function; fallback to manual
+try
+    [Sigma_whitened, ~] = CovarianceWhitening.whiten( ...
+        Sigma_emp, whitening_operators, ...
+        'target_diagonal', 1.0, 'force_hermitian', true, ...
+        'check_psd', true, 'verbose', false);
+    fprintf('  ✓ Using CovarianceWhitening class\n');
+catch
+    try
+        [Sigma_whitened, ~] = covariance_whitening( ...
+            Sigma_emp, whitening_operators, ...
+            'target_diagonal', 1.0, 'force_hermitian', true, ...
+            'verbose', false);
+        fprintf('  ✓ Using covariance_whitening function\n');
+    catch
+        Sigma_whitened = cell(F,1);
+        for f = 1:F
+            D = whitening_operators{f};
+            S_white = D * Sigma_emp{f} * D';
+            S_white = (S_white + S_white')/2;
+            % normalize small diag drift
+            dfix = real(diag(S_white));
+            D2 = diag(1 ./ sqrt(max(dfix,1e-12)));
+            Sigma_whitened{f} = (D2*S_white*D2');
+        end
+        fprintf('  ✓ Manual whitening completed\n');
+    end
+end
+
+% Quality
+whitening_errors = zeros(F,1);
+for f = 1:F
+    whitening_errors(f) = norm(real(diag(Sigma_whitened{f})) - 1);
+end
+fprintf('  Whitening quality: max diagonal error = %.3e\n', max(whitening_errors));
+
+%% Step 3: Module 2 - E-step (optional init)
+fprintf('\nStep 3: Running Module 2 E-step computation...\n');
+use_estep_initialization = false;
+try
+    n_sources = p*2;
+    L = randn(p,n_sources)/sqrt(n_sources);
+    module2_input = struct();
+    module2_input.leadfield_matrix = L;
+    module2_input.empirical_covariances = Sigma_whitened;
+    module2_input.source_prior_covariances = repmat({0.3*eye(n_sources)},F,1);
+    module2_input.frequencies = linspace(8,12,F);
+    module2_input.noise_covariance = 0.05*eye(p);
+    estep_params = struct('verbose', false, 'regularization_factor', 1e-6);
+    estep_results = module2_estep_main(module2_input, estep_params);
+
+    if estep_results.success
+        fprintf('  ✓ E-step computation successful\n');
+        Gamma_init = estep_results.initial_precision_matrices;
+        for f = 1:F
+            if isempty(Gamma_init{f})
+                S = (Sigma_whitened{f}+Sigma_whitened{f}')/2;
+                rr = 1e-8*trace(S)/p; Sreg = S + rr*eye(p);
+                G0 = (Sreg\eye(p)); G0 = (G0+G0')/2; G0(1:p+1:end)=real(diag(G0));
+                Gamma_init{f} = G0;
+            end
+        end
+        use_estep_initialization = true;
+    else
+        fprintf('  ⚠ E-step computation failed, using fallback init\n');
+    end
+catch ME
+    fprintf('  ⚠ Module 2 E-step failed: %s\n', ME.message);
+end
+
+if ~use_estep_initialization
+    Gamma_init = cell(F,1);
+    for f = 1:F
+        S = (Sigma_whitened{f}+Sigma_whitened{f}')/2;
+        rr = 1e-8*trace(S)/p; Sreg = S + rr*eye(p);
+        G0 = (Sreg\eye(p)); G0 = (G0+G0')/2; G0(1:p+1:end)=real(diag(G0));
+        % safety shift
+        mineig = min(real(eig(G0)));
+        if mineig <= 0, G0 = G0 + (abs(mineig)+1e-6)*eye(p); end
+        Gamma_init{f} = G0;
+    end
+end
+
+init_err = zeros(F,1);
+for f = 1:F
+    init_err(f) = norm(Gamma_init{f}-Gamma_true{f},'fro')/norm(Gamma_true{f},'fro');
+end
+fprintf('  Initialization error range: [%.3f, %.3f]\n', min(init_err), max(init_err));
+
+%% Step 4: Smoothing kernel & weight matrix
+fprintf('\nStep 4: Setting up smoothing kernel and weight matrix...\n');
+
+K_smooth = zeros(F,F);
+for f = 1:F-1, K_smooth(f,f+1)=0.3; K_smooth(f+1,f)=0.3; end
+for f = 1:F-2, K_smooth(f,f+2)=0.1; K_smooth(f+2,f)=0.1; end
+fprintf('  Smoothing kernel: %d non-zero entries\n', nnz(K_smooth));
+
+% PSD weight matrix (correlation-like)
+base_corr = 0.2;
+W_matrix = base_corr*ones(p) + (1.5-base_corr)*eye(p);
+if isfield(sim_results,'graph_structure')
+    Gs = sim_results.graph_structure;
+    Wp = zeros(p);
+    for i=1:p
+        for j=i+1:p
+            Wp(i,j) = (Gs(i,j) ~= 0) * (-0.1) + (Gs(i,j)==0) * (0.1);
+            Wp(j,i) = Wp(i,j);
+        end
+    end
+    maxneg = abs(min(real(eig(Wp))));
+    alpha = 0.3 / max(maxneg,1e-10);
+    W_matrix = W_matrix + alpha*Wp;
+end
+if min(real(eig(W_matrix))) <= 1e-12
+    error('Weight matrix construction failed - not PSD!');
+end
+fprintf('  Weight matrix condition number: %.2f\n', cond(W_matrix));
+
+%% Step 5: Module 3 - Active set
+fprintf('\nStep 5: Running Module 3 active set selection...\n');
+use_active_set = false;
+try
+    m3in = struct();
+    m3in.whitened_covariances = Sigma_whitened;
+    m3in.initial_precision_matrices = Gamma_init;
+    m3in.frequencies = linspace(8,12,F);
+    m3p = struct('proxy_method','correlation','quantile_level',0.15, ...
+                 'force_diagonal_active',true,'verbose',false);
+    m3res = module3_active_set_main(m3in,m3p);
+    if m3res.success
+        active_masks = cell(F,1);
+        for f=1:F, active_masks{f} = m3res.combined_active_mask(:,:,f); end
+        use_active_set = true;
+        total_active = sum(cellfun(@(x) sum(sum(triu(x,1))), active_masks));
+        total_possible = F*p*(p-1)/2;
+        fprintf('  ✓ Active edges: %d / %d (%.1f%%)\n', ...
+            total_active, total_possible, 100*total_active/total_possible);
+    else
+        fprintf('  ⚠ Active set selection failed\n');
+    end
+catch ME
+    fprintf('  ⚠ Module 3 failed: %s\n', ME.message);
+end
+if ~use_active_set
+    active_masks = cell(F,1);
+    for f=1:F
+        M = rand(p)>0.15; M = M|M'; M(1:p+1:end)=true;
+        active_masks{f}=M;
+    end
+    total_active = sum(cellfun(@(x) sum(sum(triu(x,1))), active_masks));
+    total_possible = F*p*(p-1)/2;
+    fprintf('  Fallback active edges: %d / %d (%.1f%%)\n', ...
+        total_active, total_possible, 100*total_active/total_possible);
+end
+
+%% Step 6: Module 4 gradient test (robust fields)
+fprintf('\nStep 6: Testing Module 4 gradient computation...\n');
+try
+    m4in = struct('precision_matrices',Gamma_init, ...
+                  'whitened_covariances',Sigma_whitened, ...
+                  'smoothing_kernel',K_smooth, ...
+                  'weight_matrix',W_matrix);
+    m4p  = struct('lambda1',0.01,'penalize_diagonal',false,'use_graph_laplacian',true,'verbose',false);
+    gout = module4_objective_gradient_main(m4in,m4p);
+    Gcells = pick_gradients(gout);
+    gnorms = cellfun(@(G) norm(G,'fro'), Gcells);
+    fprintf('  ✓ Module 4 gradient norms: %s\n', mat2str(gnorms,3));
+catch ME
+    fprintf('  ⚠ Module 4 gradient computation failed: %s\n', ME.message);
+    fprintf('  Continuing with Module 5...\n');
+end
+
+%% Step 7: Package input for Module 5
+fprintf('\nStep 7: Preparing Module 5 input data structure...\n');
+input_data = struct();
+input_data.whitened_covariances = Sigma_whitened;
+input_data.initial_precision    = Gamma_init;
+input_data.smoothing_kernel     = K_smooth;
+input_data.weight_matrix        = W_matrix;
+input_data.active_set_masks     = active_masks;
+fprintf('  Input data structure ready\n');
+
+%% Step 8: Run Module 5
+fprintf('\nStep 8: Running Module 5 proximal gradient optimization...\n');
+params = struct();
+params.lambda1  = [];     % auto
+params.lambda2  = 0.02;   % show visible sparsity in demo
+params.max_iter = 100;
+params.eps_x    = 1e-3;
+params.eps_f    = 1e-4;
+params.verbose  = true;
+params.use_parfor = false;
+
+tic;
+[Gamma_opt, res] = module5_proximal_main(input_data, params);
+t_opt = toc;
+
+fprintf('\n  Module 5 optimization: %s\n', tern(res.convergence_info.converged,'SUCCESS','DONE'));
+fprintf('  Iterations: %d, time: %.2fs\n', res.convergence_info.iterations, t_opt);
+fprintf('  Final objective: %.6e\n', res.convergence_info.final_objective);
+
+%% Step 9: Evaluate in whitened coordinates
+fprintf('\nStep 9: Evaluating end-to-end pipeline performance...\n');
+
+% Build the effective whitening transform T_f so that S_white = T S T'
+T_whiten = whitening_operators;
+for f = 1:F
+    S_tmp = T_whiten{f} * Sigma_emp{f} * T_whiten{f}';
+    S_tmp = (S_tmp + S_tmp')/2;
+    d2 = real(diag(S_tmp));
+    D2 = diag(1./sqrt(max(d2,1e-12)));
+    T_whiten{f} = D2 * T_whiten{f};
+end
+
+% Transform true Gamma to whitened coordinates: T^{-T} * Gamma * T^{-1}
+Gamma_true_white = cell(F,1);
+for f=1:F
+    Tf = T_whiten{f}; invT = inv(Tf);
+    Gamma_true_white{f} = invT' * Gamma_true{f} * invT;
+end
+
+recovery_errors = zeros(F,1);
+achieved_sparsity = zeros(F,1);
+for f=1:F
+    recovery_errors(f) = norm(Gamma_opt{f}-Gamma_true_white{f},'fro')/ ...
+                         norm(Gamma_true_white{f},'fro');
+    offd = Gamma_opt{f}(triu(true(p),1));
+    achieved_sparsity(f) = nnz(abs(offd)<1e-6) / numel(offd);
+end
+fprintf('  Recovery mean error: %.3f  (min=%.3f, max=%.3f)\n', ...
+    mean(recovery_errors), min(recovery_errors), max(recovery_errors));
+fprintf('  Achieved sparsity: mean %.1f%%\n', 100*mean(achieved_sparsity));
+
+% PD & Hermitian checks
+all_pd = true; all_herm = true; maxH = 0;
+for f=1:F
+    [isPD,~] = module5_psd_check(Gamma_opt{f}); % 接口不变，仅注释统一为 PD
+    all_pd = all_pd && isPD;
+    Herr = norm(Gamma_opt{f}-Gamma_opt{f}','fro'); maxH = max(maxH,Herr);
+    all_herm = all_herm && (Herr<1e-12);
+end
+fprintf('  All matrices PD: %s, Hermitian: %s (max err=%.2e)\n', ...
+    tern(all_pd,'YES','NO'), tern(all_herm,'YES','NO'), maxH);
+
+%% Step 10: Sparsity sweep over lambda2
+fprintf('\nStep 10: Demonstrating sparsity control across λ₂ values...\n');
+lambda2_values = [1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 2e-2, 5e-2];
+sp_out = zeros(size(lambda2_values));
+err_out = zeros(size(lambda2_values));
+obj_out = zeros(size(lambda2_values));
+
+for i=1:numel(lambda2_values)
+    p2 = params; p2.lambda2 = lambda2_values(i); p2.verbose=false; p2.max_iter=50;
+    [G2, r2] = module5_proximal_main(input_data, p2);
+    tot_off = 0; tot_zero = 0; tot_err2 = 0;
+    for f=1:F
+        el = G2{f}(triu(true(p),1));
+        tot_off  = tot_off + numel(el);
+        tot_zero = tot_zero + nnz(abs(el)<1e-6);
+        tot_err2 = tot_err2 + norm(G2{f}-Gamma_true_white{f},'fro')^2;
+    end
+    sp_out(i)  = tot_zero / tot_off;
+    err_out(i) = sqrt(tot_err2/F);
+    obj_out(i) = r2.convergence_info.final_objective;
+    fprintf('  λ₂=%6.1e → sparsity=%5.1f%%, error=%.3f\n', lambda2_values(i), 100*sp_out(i), err_out(i));
+end
+
+%% Step 11: Cross-module validation (random/hub/chain)
+fprintf('\nStep 11: Cross-module validation testing...\n');
+validation_configs = {
+    {'graph_type','random','edge_density',0.20}
+    {'graph_type','hub',   'edge_density',0.30}
+    {'graph_type','chain', 'edge_density',0.25}
+};
+val_success = false(numel(validation_configs),1);
+
+for k=1:numel(validation_configs)
+    cfg = validation_configs{k};
+    try
+        [~,~,Sigma_emp_val,~] = module7_simulation_improved_complex( ...
+            'n_nodes',p,'n_freq',F,'n_samples',n_samples, cfg{:}, 'random_seed',100*k);
+
+        % quick whitening: diagonal scaling to unit variance
+        Sigma_white_val = cell(F,1);
+        for f=1:F
+            S = Sigma_emp_val{f};
+            d = sqrt(1 ./ max(abs(diag(S)),1e-12));
+            D = diag(d);
+            S2 = (D*S*D'); Sigma_white_val{f} = (S2+S2')/2;
+        end
+
+        in2 = input_data; in2.whitened_covariances = Sigma_white_val;
+        p2  = params; p2.max_iter = 30; p2.verbose=false;
+        [~,~] = module5_proximal_main(in2, p2);
+        val_success(k) = true;
+        fprintf('  %s graph: SUCCESS\n', cfg{2});
+    catch ME
+        fprintf('  %s graph: FAILED (%s)\n', cfg{2}, ME.message);
+    end
+end
+
+%% Step 12: Visualization
+fprintf('\nStep 12: Creating comprehensive visualization...\n');
+try
+    figure('Position',[100,100,1400,1000]);
+
+    % Sparsity vs lambda2
+    subplot(2,3,1);
+    semilogx(lambda2_values, 100*sp_out, 'o-','LineWidth',2);
+    xlabel('\lambda_2 (log scale)'); ylabel('Sparsity Achieved (%)');
+    title('Sparsity Control'); grid on;
+
+    % Recovery error vs lambda2
+    subplot(2,3,2);
+    semilogx(lambda2_values, err_out, 's-','LineWidth',2);
+    xlabel('\lambda_2 (log scale)'); ylabel('Recovery Error');
+    title('Recovery vs Sparsity Trade-off'); grid on;
+
+    % Convergence history
+    subplot(2,3,3);
+    if isfield(res,'objective_history') && ~isempty(res.objective_history)
+        plot(res.objective_history,'LineWidth',2);
+        xlabel('Iteration'); ylabel('Objective Value'); title('Convergence History'); grid on;
+    else
+        text(0.5,0.5,'Objective history not available','HorizontalAlignment','center');
+        title('Convergence History (N/A)'); axis off;
+    end
+
+    % True vs estimated (freq 1)
+    subplot(2,3,4);
+    imagesc(abs(Gamma_true_white{1})); colorbar; title('True Structure (|Γ_1|)');
+    xlabel('Node j'); ylabel('Node i');
+
+    subplot(2,3,5);
+    imagesc(abs(Gamma_opt{1})); colorbar; title('Estimated Structure (|Γ̂_1|)');
+    xlabel('Node j'); ylabel('Node i');
+
+    % Cross-validation success bars
+    subplot(2,3,6);
+    names = {'Random','Hub','Chain'};
+    vals = double(val_success);
+    bar(vals,'FaceColor',[0.2 0.6 0.9]); ylim([0 1.2]); grid on;
+    set(gca,'XTick',1:numel(names),'XTickLabel',names); ylabel('Success (0/1)');
+    title('Cross-Validation Results');
+
+    sgtitle('Module 5 Integrated Pipeline Results');
+    fprintf('  Comprehensive visualization created\n');
 catch ME
     fprintf('  Visualization failed: %s\n', ME.message);
 end
 
-%% Step 11: Summary and Recommendations
-fprintf('\nStep 11: Summary and recommendations\n');
+%% Step 13: Baseline comparison (ridge)
+fprintf('\nStep 13: Module performance comparison...\n');
+ridge_err = zeros(F,1);
+for f=1:F
+    rr = 0.01*trace(Sigma_whitened{f})/p;
+    G_r = (Sigma_whitened{f} + rr*eye(p)) \ eye(p);
+    ridge_err(f) = norm(G_r - Gamma_true_white{f},'fro') / norm(Gamma_true_white{f},'fro');
+end
+fprintf('  Ridge baseline mean error: %.3f\n', mean(ridge_err));
+fprintf('  Our pipeline mean error:   %.3f\n', mean(recovery_errors));
+fprintf('  Improvement factor (Ridge/Our): %.2fx\n', mean(ridge_err)/mean(recovery_errors));
 
-fprintf('\n=== Module 5 Demo Summary ===\n');
-fprintf('✓ Successfully optimized %d precision matrices\n', F);
-fprintf('✓ Achieved %.1f%% average sparsity with λ₂=%.3f\n', 100*mean(final_sparsity), params_basic.lambda2);
-fprintf('✓ Mean recovery error: %.3f\n', mean(recovery_errors));
-fprintf('✓ Converged in %d iterations (%.2f seconds)\n', results_basic.convergence_info.iterations, basic_time);
-fprintf('✓ All final matrices are PSD and Hermitian\n');
+%% Step 14: Summary
+fprintf('\nStep 14: Summary and recommendations\n');
+fprintf('\n=== Integrated Pipeline Demo Summary ===\n');
+fprintf('✓ Data: %dx%d (Module 7)\n', p, F);
+fprintf('✓ Whitening max diag error: %.2e\n', max(whitening_errors));
+fprintf('✓ Module 5: %d iters, %.2fs, PD=%s, Hermitian=%s\n', ...
+    res.convergence_info.iterations, t_opt, tern(all_pd,'YES','NO'), tern(all_herm,'YES','NO'));
+fprintf('✓ Sparsity (λ₂=%.3g): %.1f%%\n', params.lambda2, 100*mean(achieved_sparsity));
+fprintf('✓ Recovery mean error (whitened coords): %.3f\n', mean(recovery_errors));
+fprintf('\nBest practices:\n');
+fprintf('• Always evaluate in the whitened coordinate system.\n');
+fprintf('• Use auto λ₁/α; tune λ₂∈[1e-4,5e-2] to control sparsity.\n');
+fprintf('• Ensure weight matrix W is PD (e.g., correlation-like + safe perturbation).\n');
+fprintf('• Active-set can speed up & stabilize on sparse problems.\n');
+fprintf('\n=== Integrated Demo Complete ===\n');
 
-fprintf('\nKey insights:\n');
-fprintf('• Automatic parameter selection (λ₁, α) worked well\n');
-fprintf('• Sparsity increases monotonically with λ₂\n');
-fprintf('• Complex soft thresholding preserves phase information\n');
-fprintf('• Backtracking maintained positive definiteness\n');
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Local helpers
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+function s = tern(cond,a,b), if cond, s=a; else, s=b; end, end
 
-fprintf('\nRecommended usage patterns:\n');
-fprintf('• Use automatic parameter selection: set λ₁=[] and α₀=[]\n');
-fprintf('• Start with λ₂ ∈ [1e-3, 1e-2] and adjust based on desired sparsity\n');
-fprintf('• Enable verbose mode for monitoring: params.verbose = true\n');
-fprintf('• Use parallel processing for F > 8: params.use_parfor = true\n');
-fprintf('• Monitor convergence via results.objective_history\n');
-
-fprintf('\nNext steps:\n');
-fprintf('• Integrate with complete pipeline (Modules 1-4 → 5 → 8)\n');
-fprintf('• Test on real data with validation metrics\n');
-fprintf('• Tune λ₁, λ₂ based on domain knowledge\n');
-fprintf('• Consider active set updates for very sparse problems\n');
-
-fprintf('\n=== Module 5 Demo Complete ===\n');
-
-%% Optional: Save results
-save_results = false;  % Set to true to save results
-
-if save_results
-    save('module5_demo_results.mat', 'Gamma_true', 'Gamma_basic', 'results_basic', ...
-         'recovery_errors', 'sparsity_results', 'params_basic');
-    fprintf('\nResults saved to module5_demo_results.mat\n');
+function Gcells = pick_gradients(gout)
+% Robustly extract gradient cell array from Module 4 output
+if isfield(gout,'gradients'), Gcells = gout.gradients; return; end
+if isfield(gout,'smooth_gradients'), Gcells = gout.smooth_gradients; return; end
+if isfield(gout,'gradient_components') && isfield(gout.gradient_components,'smoothing_gradients')
+    Gcells = gout.gradient_components.smoothing_gradients; return;
+end
+error('Module 4: gradients not found in output struct.');
 end
