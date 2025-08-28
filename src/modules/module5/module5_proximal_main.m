@@ -26,6 +26,7 @@ K_smooth    = input_data.smoothing_kernel;
 W_matrix    = input_data.weight_matrix;
 A_masks     = input_data.active_set_masks;
 
+
 F = numel(Sigma_tilde);
 p = size(Sigma_tilde{1},1);
 if ~isequal(size(K_smooth),[F,F])

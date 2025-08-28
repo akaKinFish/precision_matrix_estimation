@@ -147,7 +147,13 @@ if ~use_estep_initialization
         Gamma_init{f} = G0;
     end
 end
-
+for f = 1:F
+    if isempty(Gamma_init{f}) || any(~isfinite(Gamma_init{f}(:)))
+        Gamma_init{f} = eye(p);
+    end
+    Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2;          % Hermitian
+    Gamma_init{f}(1:p+1:end) = real(diag(Gamma_init{f}));        % real diag
+end
 init_err = zeros(F,1);
 for f = 1:F
     init_err(f) = norm(Gamma_init{f}-Gamma_true{f},'fro')/norm(Gamma_true{f},'fro');
