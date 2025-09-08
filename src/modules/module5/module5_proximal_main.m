@@ -120,6 +120,7 @@ aux.weight_matrix    = W_matrix;
 aux.lambda1          = proximal_params.lambda1;
 aux.lambda2          = proximal_params.lambda2;
 
+
 objective_history(1) = module5_objective(Gamma_current, Sigma_tilde, aux, proximal_params);
 
 % 并行门限
@@ -331,7 +332,10 @@ function G_list = local_compute_gradients(Gamma_cells, Sigma_cells, K, W, lambda
     inp.smoothing_kernel     = K;
     inp.weight_matrix        = W;
 
-    par = struct('lambda1', lambda1, 'verbose', false);
+    par = struct('lambda1', lambda1, ...
+             'verbose', false, ...
+             'weight_mode', 'hadamard', ...
+             'use_graph_laplacian', true);  % or proximal_params.use_graph_laplacian
     out = module4_objective_gradient_main(inp, par);
     G_list = out.smooth_gradients; % 兼容接口
 end

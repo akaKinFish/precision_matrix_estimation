@@ -1,19 +1,30 @@
 function [smoothing_gradients, computation_stats] = module4_smoothing_gradient(precision_matrices, kernel_matrix, weight_matrix, params)
-% MODULE4_SMOOTHING_GRADIENT - Cross-frequency smoothing gradient (revised)
+% MODULE4_SMOOTHING_GRADIENT - Cross-frequency smoothing gradient
 %
-% S = (λ1/2) * Σ_{ω,ω'} k_{ω,ω'} ||Γ_ω - Γ_{ω'}||^2_{W}
-% ∇_{Γ_ω}S = 2λ1 Σ_{ω'} k_{ω,ω'} W(Γ_ω - Γ_{ω'})
-% Laplacian form (equivalent):
-%   ∇_{Γ_ω}S = 2λ1 W Σ_{ω'} L_{ω,ω'} Γ_{ω'}, where L = D - K.
+% Supports two weight semantics:
+%   weight_mode = 'matrix'  :  ∇_Γw S = 2λ1 * W * ( Σ_{w'} L_{w,w'} Γ_{w'} )         (Laplacian)
+%                              or 2λ1 Σ k_{w,w'} W (Γw - Γw')                         (pairwise)
+%   weight_mode = 'hadamard':  ∇_Γw S = 2λ1 * (W.^2) .* ( Σ_{w'} L_{w,w'} Γ_{w'} )    (Laplacian)
+%                              or 2λ1 Σ k_{w,w'} (W.^2) .* (Γw - Γw')                 (pairwise)
 %
-% New option:
-%   .kernel_zero_tol (double) default 1e-12   % drop tiny kernel entries
+% Inputs
+%   precision_matrices : cell{F,1}, each p×p
+%   kernel_matrix      : F×F, frequency coupling K
+%   weight_matrix      : p×p, W (no PSD requirement in hadamard mode)
+%   params (struct)    :
+%       .lambda1 (>=0)                 default 0.01
+%       .use_graph_laplacian (bool)    default true
+%       .weight_mode ('matrix'|'hadamard') default 'matrix'
+%       .force_hermitian (bool)        default true
+%       .symmetrization_tolerance      default 1e-10
+%       .verbose (bool)                default false
+%       .kernel_zero_tol               default 1e-12  (drop tiny K entries)
 %
-% Other params (same defaults as before):
-%   .lambda1 (>=0), .use_graph_laplacian (true), .force_hermitian (true),
-%   .symmetrization_tolerance (1e-10), .verbose (false)
+% Outputs
+%   smoothing_gradients : cell{F,1}, each p×p
+%   computation_stats   : struct with timings, method flags, etc.
 
-% -------- Input checks --------
+% ---------- Input checks ----------
 if nargin < 3
     error('module4_smoothing_gradient:insufficient_input', ...
           'precision_matrices, kernel_matrix, and weight_matrix are required');
@@ -25,153 +36,146 @@ if ~iscell(precision_matrices) || isempty(precision_matrices)
 end
 
 F = numel(precision_matrices);
-p = size(precision_matrices{1}, 1);
+p = size(precision_matrices{1},1);
 
-for f = 1:F
-    if ~isnumeric(precision_matrices{f}) || ~isequal(size(precision_matrices{f}), [p, p])
-        error('module4_smoothing_gradient:precision_dimension_mismatch', ...
-              'precision_matrices{%d} must be %dx%d', f, p, p);
-    end
-end
-if ~isnumeric(kernel_matrix) || ~isequal(size(kernel_matrix), [F, F])
+if ~isnumeric(kernel_matrix) || ~ismatrix(kernel_matrix) || any(size(kernel_matrix)~=[F F])
     error('module4_smoothing_gradient:invalid_kernel_matrix', ...
-          'kernel_matrix must be %dx%d numeric matrix', F, F);
+          'kernel_matrix must be %dx%d', F, F);
 end
-if ~isnumeric(weight_matrix) || ~isequal(size(weight_matrix), [p, p])
+if ~isnumeric(weight_matrix) || ~ismatrix(weight_matrix) || any(size(weight_matrix)~=[p p])
     error('module4_smoothing_gradient:invalid_weight_matrix', ...
-          'weight_matrix must be %dx%d numeric matrix', p, p);
+          'weight_matrix must be %dx%d', p, p);
 end
 
-% -------- Defaults --------
-defaults = struct();
-defaults.lambda1 = 0.01;
-defaults.use_graph_laplacian = true;
-defaults.force_hermitian = true;
-defaults.symmetrization_tolerance = 1e-10;
-defaults.verbose = false;
-defaults.kernel_zero_tol = 1e-12;  % NEW
+% ---------- Defaults ----------
+defaults.lambda1                 = 0.01;
+defaults.use_graph_laplacian     = true;
+defaults.weight_mode             = 'matrix';   % 'matrix' | 'hadamard'
+defaults.force_hermitian         = true;
+defaults.symmetrization_tolerance= 1e-10;
+defaults.verbose                 = false;
+defaults.kernel_zero_tol         = 1e-12;
 
 fn = fieldnames(defaults);
 for i = 1:numel(fn)
     f = fn{i};
-    if ~isfield(params, f), params.(f) = defaults.(f); end
-end
-if params.lambda1 < 0
-    error('module4_smoothing_gradient:invalid_lambda1', ...
-          'lambda1 must be non-negative, got %.6f', params.lambda1);
+    if ~isfield(params,f) || isempty(params.(f)), params.(f) = defaults.(f); end
 end
 
-% -------- Init --------
-smoothing_gradients = cell(F, 1);
+% ---------- Init stats ----------
+t_total = tic;
 computation_stats = struct();
-computation_stats.computation_time = 0;
-computation_stats.method_used = ternary(params.use_graph_laplacian,'laplacian','direct');
-computation_stats.hermitian_violations = zeros(F,1); % relative error
-computation_stats.sparsity_exploited = false;
+computation_stats.method_used = ternary(params.use_graph_laplacian,'laplacian','pairwise');
+computation_stats.weight_mode = lower(params.weight_mode);
+computation_stats.hermitian_violations = zeros(F,1);
 computation_stats.laplacian_eigenvalues = [];
 
-t_total = tic;
+% ---------- Preprocess K and W ----------
+K = (kernel_matrix + kernel_matrix')/2;
+K(1:F+1:end) = 0;
+K(abs(K) < params.kernel_zero_tol) = 0;
 
-% λ1 == 0 -> zeros
+W = (weight_matrix + weight_matrix')/2;   % ensure Hermitian numerically
+W2 = [];                                  % only used in hadamard
+
+% ---------- Early exit if λ1=0 ----------
+smoothing_gradients = cell(F,1);
 if params.lambda1 == 0
-    for f = 1:F, smoothing_gradients{f} = zeros(p,p); end
+    for w=1:F, smoothing_gradients{w} = zeros(p,p); end
     computation_stats.computation_time = toc(t_total);
-    if params.verbose, fprintf('  Smoothing: λ₁=0, returning zero gradients\n'); end
     return;
 end
 
-% -------- Preprocess K and W --------
-K = kernel_matrix;
-K = (K + K')/2;
-K(1:F+1:end) = 0;                                  % zero diagonal
-K(abs(K) < params.kernel_zero_tol) = 0;            % drop tiny entries
-
-sparsity_ratio = nnz(K) / numel(K);
-computation_stats.sparsity_exploited = sparsity_ratio < 0.5;
-
-W = weight_matrix;
-W = (W + W')/2;
-
-% -------- Branch --------
+% ---------- Compute gradient ----------
 if params.use_graph_laplacian
-    [smoothing_gradients, lap_stats] = compute_smoothing_laplacian_method(precision_matrices, K, W, params);
-    computation_stats.laplacian_eigenvalues = lap_stats.laplacian_eigenvalues;
+    % Laplacian path
+    d = sum(K,2);
+    L = diag(d) - K;
+
+    % Optional spectrum (cheap for small F)
+    try
+        computation_stats.laplacian_eigenvalues = eig(L);
+    catch
+        computation_stats.laplacian_eigenvalues = [];
+    end
+
+    switch lower(params.weight_mode)
+        case 'matrix'
+            for w = 1:F
+                combo = zeros(p,p);
+                for wp = 1:F
+                    Lval = L(w,wp);
+                    if Lval ~= 0
+                        combo = combo + Lval * precision_matrices{wp};
+                    end
+                end
+                smoothing_gradients{w} = 2 * params.lambda1 * (W * combo);
+            end
+
+        case 'hadamard'
+            if isempty(W2), W2 = W.^2; end
+            for w = 1:F
+                combo = zeros(p,p);
+                for wp = 1:F
+                    Lval = L(w,wp);
+                    if Lval ~= 0
+                        combo = combo + Lval * precision_matrices{wp};
+                    end
+                end
+                smoothing_gradients{w} = 2 * params.lambda1 * (W2 .* combo);
+            end
+
+        otherwise
+            error('module4_smoothing_gradient:invalid_weight_mode','%s', params.weight_mode);
+    end
+
 else
-    [smoothing_gradients] = compute_smoothing_direct_method(precision_matrices, K, W, params);
+    % Pairwise path (kept for compatibility)
+    switch lower(params.weight_mode)
+        case 'matrix'
+            for w = 1:F
+                Acc = zeros(p,p);
+                for wp = 1:F
+                    kwp = K(w,wp);
+                    if kwp ~= 0
+                        Acc = Acc + kwp * (precision_matrices{w} - precision_matrices{wp});
+                    end
+                end
+                smoothing_gradients{w} = 2 * params.lambda1 * (W * Acc);
+            end
+
+        case 'hadamard'
+            if isempty(W2), W2 = W.^2; end
+            for w = 1:F
+                Acc = zeros(p,p);
+                for wp = 1:F
+                    kwp = K(w,wp);
+                    if kwp ~= 0
+                        Acc = Acc + kwp * (precision_matrices{w} - precision_matrices{wp});
+                    end
+                end
+                smoothing_gradients{w} = 2 * params.lambda1 * (W2 .* Acc);
+            end
+
+        otherwise
+            error('module4_smoothing_gradient:invalid_weight_mode','%s', params.weight_mode);
+    end
 end
 
-% -------- Hermitian projection & relative error --------
+% ---------- Hermitian projection (for numerical symmetry) ----------
 if params.force_hermitian
-    for f = 1:F
-        G = smoothing_gradients{f};
+    for w = 1:F
+        G = smoothing_gradients{w};
         Gherm = (G + G')/2;
-        rel_err = norm(G - Gherm,'fro') / max(1, norm(G,'fro'));
-        computation_stats.hermitian_violations(f) = rel_err;
-        smoothing_gradients{f} = Gherm;
+        computation_stats.hermitian_violations(w) = norm(G - Gherm,'fro') / max(1, norm(G,'fro'));
+        smoothing_gradients{w} = Gherm;
     end
 end
 
 computation_stats.computation_time = toc(t_total);
 end
 
-% -------- Helpers --------
-function [gradients] = compute_smoothing_direct_method(Gammas, K, W, params)
-F = numel(Gammas);
-p = size(Gammas{1},1);
-gradients = cell(F,1);
-
-if params.verbose, fprintf('using direct method...\n'); end
-
-for w = 1:F
-    Gw = zeros(p,p);
-    for wp = 1:F
-        kwp = K(w,wp);
-        if kwp ~= 0
-            D = Gammas{w} - Gammas{wp};
-            Gw = Gw + kwp * (W * D);
-        end
-    end
-    gradients{w} = 2 * params.lambda1 * Gw;
-end
-end
-
-function [gradients, stats] = compute_smoothing_laplacian_method(Gammas, K, W, params)
-F = numel(Gammas);
-p = size(Gammas{1},1);
-gradients = cell(F,1);
-stats = struct();
-
-if params.verbose, fprintf('using Laplacian method...\n'); end
-
-% L = D - K
-d = sum(K,2);
-L = diag(d) - K;
-
-% spectrum (optional; cheap at small F)
-try
-    stats.laplacian_eigenvalues = eig(L);
-catch
-    stats.laplacian_eigenvalues = [];
-end
-
-% Precompute WG = W*Γ
-WG = cell(F,1);
-for w = 1:F
-    WG{w} = W * Gammas{w};
-end
-
-for w = 1:F
-    combo = zeros(p,p);
-    for wp = 1:F
-        Lval = L(w,wp);
-        if Lval ~= 0
-            combo = combo + Lval * Gammas{wp};
-        end
-    end
-    gradients{w} = 2 * params.lambda1 * (W * combo);
-end
-end
-
+% ---- small ternary helper ----
 function y = ternary(cond, a, b)
 if cond, y = a; else, y = b; end
 end

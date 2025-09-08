@@ -56,8 +56,15 @@ core_input.weight_matrix = pick_and_check_matrix(input_data, ...
 
 % 5) active_set_masks（可选）
 core_input.active_set_masks = pick_and_normalize_masks_optional(input_data, ...
-    {'active_set_masks','combined_active_masks','combined_active_mask','edge_active_masks','edge_active_mask'}, ...
+    {'active_set_mask','combined_active_masks','combined_active_mask','edge_active_masks','edge_active_mask'}, ...
     F, p);
+
+if ~isfield(proximal_params,'weight_mode') || isempty(proximal_params.weight_mode)
+    proximal_params.weight_mode = 'matrix';  % or 'hadamard' if you want to default to mask
+end
+if ~isfield(proximal_params,'use_graph_laplacian') || isempty(proximal_params.use_graph_laplacian)
+    proximal_params.use_graph_laplacian = true;
+end
 
 % ---- 路由到 main ----
 [Gamma_final, proximal_results] = module5_proximal_main(core_input, proximal_params);
@@ -166,10 +173,19 @@ end
 if isempty(M)
     error(err_id,'Missing %s (tried: %s)', human_name, strjoin(names, ', '));
 end
-if ~isnumeric(M) || ~ismatrix(M) || any(size(M)~=[dim dim])
+
+% Accept numeric, logical, and sparse; then normalize type/format
+if ~(isnumeric(M) || islogical(M))
+    error(err_id,'%s must be a numeric or logical matrix.', human_name);
+end
+if ~ismatrix(M) || any(size(M)~=[dim dim])
     error(err_id,'%s must be %dx%d, got %dx%d.', human_name, dim, dim, size(M,1), size(M,2));
 end
+% Normalize to full double to avoid downstream surprises
+if issparse(M), M = full(M); end
+if ~isa(M,'double'), M = double(M); end
 end
+
 
 function F = infer_F_from_struct(S)
 F = [];

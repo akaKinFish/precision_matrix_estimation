@@ -150,6 +150,45 @@ end
 
 % Validate weight matrix
 Wg = input_data.weight_matrix;
+
+weight_mode = 'matrix';
+if isfield(gradient_params,'weight_mode') && ~isempty(gradient_params.weight_mode)
+    weight_mode = lower(gradient_params.weight_mode);
+end
+
+if ~isnumeric(Wg) || ~isequal(size(Wg), [p, p])
+    error('module4_objective_gradient_main:invalid_weight_matrix', ...
+          'weight_matrix must be a %dx%d numeric matrix', p, p);
+end
+
+% 保证实对称（两种模式都做）
+if norm(Wg - Wg', 'fro') > 1e-12
+    warning('module4_objective_gradient_main:weight_not_hermitian', ...
+            'weight_matrix is not Hermitian (error: %.2e)', norm(Wg - Wg', 'fro'));
+    Wg = (Wg + Wg') / 2;
+end
+
+switch weight_mode
+    case 'matrix'
+        % 旧语义：要求 PSD
+        min_eig_W = min(real(eig(Wg)));
+        if min_eig_W < -1e-12
+            error('module4_objective_gradient_main:weight_not_psd', ...
+                  'weight_matrix is not positive semi-definite (min eigenvalue: %.2e)', min_eig_W);
+        end
+    case 'hadamard'
+        % 新语义：W 是逐元素 mask；可非 PSD，但通常要求非负
+        if any(~isfinite(Wg(:))) || ~isreal(Wg)
+            error('module4_objective_gradient_main:weight_mask_invalid', ...
+                  'Hadamard weight/mask must be real finite.');
+        end
+        % 可选：自动清零对角（如你要"不惩罚对角"）
+        % Wg(1:p+1:end) = 0;
+    otherwise
+        error('module4_objective_gradient_main:invalid_weight_mode', ...
+              'weight_mode must be matrix|hadamard.');
+end
+
 if ~isnumeric(Wg) || ~isequal(size(Wg), [p, p])
     error('module4_objective_gradient_main:invalid_weight_matrix', ...
           'weight_matrix must be a %dx%d numeric matrix', p, p);
@@ -162,11 +201,7 @@ if norm(Wg - Wg', 'fro') > 1e-12
     Wg = (Wg + Wg') / 2;  % Force Hermitian
 end
 
-min_eig_W = min(real(eig(Wg)));
-if min_eig_W < -1e-12
-    error('module4_objective_gradient_main:weight_not_psd', ...
-          'weight_matrix is not positive semi-definite (min eigenvalue: %.2e)', min_eig_W);
-end
+
 
 % ==================== Parameter Setup ====================
 defaults = struct();
@@ -177,6 +212,8 @@ defaults.chol_tolerance = 1e-12;
 defaults.symmetrization_tolerance = 1e-10;
 defaults.force_hermitian = true;
 defaults.verbose = false;
+defaults.weight_mode = 'matrix';  % 'matrix' | 'hadamard' 
+
 
 field_names = fieldnames(defaults);
 for i = 1:numel(field_names)
@@ -263,7 +300,20 @@ try
     if gradient_params.verbose, fprintf('Computing smoothing gradients... '); end
     smoothing_tic = tic;
     
-    [smoothing_grads, smoothing_stats] = module4_smoothing_gradient(Gammas, K, Wg, gradient_params);
+    % [smoothing_grads, smoothing_stats] = module4_smoothing_gradient(Gammas, K, Wg, gradient_params);
+    % [smoothing_grads, smoothing_stats] = module4_smoothing_gradient( ...
+    % Gammas, K, Wg, struct('lambda1', gradient_params.lambda1, ...
+    %                       'use_graph_laplacian', gradient_params.use_graph_laplacian, ...
+    %                       'weight_mode', weight_mode));
+    [smoothing_grads, smoothing_stats] = module4_smoothing_gradient( ...
+    Gammas, K, Wg, struct( ...
+        'lambda1', gradient_params.lambda1, ...
+        'use_graph_laplacian', gradient_params.use_graph_laplacian, ...
+        'force_hermitian', false, ...         % 该函数内部最后会做一次
+        'symmetrization_tolerance', gradient_params.symmetrization_tolerance, ...
+        'kernel_zero_tol', 1e-12, ...
+        'weight_mode', gradient_params.weight_mode ...
+    ));
     gradient_results.gradient_components.smoothing_gradients = smoothing_grads;
     
     stats.computation_times(3) = toc(smoothing_tic);
