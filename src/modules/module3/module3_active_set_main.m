@@ -88,12 +88,12 @@ if ~isstruct(input_data)
           'input_data must be a structure');
 end
 
-if ~isfield(input_data, 'whitened_covariances') || isempty(input_data.whitened_covariances)
+if ~isfield(input_data, 'whitened_covariances') || isempty(input_data(1).whitened_covariances)
     error('module3_active_set_main:missing_covariances', ...
           'whitened_covariances field is required');
 end
 
-if ~isfield(input_data, 'frequencies') || isempty(input_data.frequencies)
+if ~isfield(input_data, 'frequencies') || isempty(input_data(1).frequencies)
     error('module3_active_set_main:missing_frequencies', ...
           'frequencies field is required');
 end

@@ -1,7 +1,98 @@
 function [true_precision, true_covariance, emp_covariance, params] = module7_simulation_improved_complex(varargin)
-% MODULE7_SIMULATION_IMPROVED_COMPLEX - Complex Hermitian simulator with optional EEG leadfield
+% MODULE7_SIMULATION_IMPROVED_COMPLEX
+% Complex Hermitian multi-frequency simulator with optional EEG leadfield (Scheme A ready)
 %
-% (内容略，同上一版；为节省篇幅仅保留关键实现。若你需要我再贴一次完整头部注释，也可以。)
+% PURPOSE
+%   Generate a frequency-resolved complex-Hermitian source precision process Ω_f and its
+%   sensor-domain observations via an EEG leadfield L, then return empirical covariances.
+%   This module is designed to feed Scheme A pipelines where E-step needs a consistent L.
+%
+% MODEL
+%   Source domain (n sources):
+%       Ω_f  ≻ 0,   Σ_xx,f = Ω_f^{-1}   (complex Hermitian)
+%   Sensor domain (p sensors) with EEG forward model:
+%       Σ_vv,f(true) = L Σ_xx,f L^H
+%       Σ_xi,xi,f    = sensor noise covariance (by SNR or variance)
+%       Σ_vv,f(obs)  = Σ_vv,f(true) + Σ_xi,xi,f
+%   Empirical covariance:
+%       \hatΣ_vv,f ~ Wishart(Σ_vv,f(obs), T)
+%
+% KEY FEATURES
+%   - Graph-driven Ω_f construction with:
+%       * base edges (random/chain/hub) + variable edges over frequency
+%       * smooth basis along frequency (DC, linear, sin/cos harmonics)
+%       * guaranteed Hermitian SPD by Ω_f = L_c(f) L_c(f)^H + εI
+%   - Optional EEG leadfield generation:
+%       * leadfield_type = 'simple'           : fast toy physics
+%       * leadfield_type = 'spherical3layer'  : simplified 3-layer sphere forward
+%       * electrode_layout = '1020-19' | 'auto-uniform'
+%       * source_space     = 'cortical' | 'volumetric'
+%   - Sensor noise by SNR or variance; returns Σ_xi,xi per-frequency and representative Σ_xi,xi.
+%   - Reproducible randomization via 'random_seed'.
+%
+% INPUTS (Name-Value pairs)
+%   'n_nodes'        (int, >2)      : number of sources n
+%   'n_freq'         (int, >1)      : number of frequencies F
+%   'n_samples'      (int, >0)      : samples per frequency T
+%   'graph_type'     ('random'|'chain'|'hub')
+%   'edge_density'   (0..1)         : base edge density
+%   'sparsity_variation' (0..1)     : magnitude of variable edges (freq-varying)
+%   'edge_activation_smoothness'     : smoothness in on/off evolution (default 0.8)
+%   'n_basis'        (int, >0)      : number of basis functions for coefficients
+%   'sigma_coef'     (double, >0)   : coefficient scale
+%   'complex_strength' (>=0, <=2)   : relative imag strength in complex coeffs
+%   'epsilon_reg'    (>0)           : diagonal dominance margin
+%   'random_seed'    (int|[])       : RNG seed
+%   'coefficient_complex_fraction' (0..1) : prob of using complex coefficients
+%
+%   % Leadfield controls:
+%   'generate_leadfield' (logical)  : whether to generate L (default false)
+%   'n_sensors'          (int, >0)  : number of sensors p (default 19 if not set)
+%   'leadfield_type'     ('simple'|'spherical3layer')   % <<< ONLY THESE ARE VALID
+%   'electrode_layout'   ('1020-19'|'auto-uniform')
+%   'source_space'       ('cortical'|'volumetric')
+%   'cortical_radius_ratio' (0..1) : cortical shell radius factor (default 0.82)
+%   'source_perturbation_std'      : optional source jitter on shell
+%   'leadfield_jitter_std'         : optional multiplicative jitter in forward
+%
+%   % Head geometry (3-layer sphere) — used if leadfield_type='spherical3layer'
+%   'head_radius'       (>0)       : scalp radius (m)
+%   'conductivities'    [σ1 σ2 σ3] : layer conductivities (default [0.33 0.0042 0.33])
+%   'layer_radii'       [r_brain r_skull r_scalp] : radii (default: internal heuristic)
+%
+%   % Sensor noise
+%   'sensor_noise_mode' ('snr'|'variance') : choose SNR-based or fixed variance
+%   'sensor_snr_db'     (double)           : SNR in dB (default 20 dB) if mode='snr'
+%   'sensor_noise_variance' (double|[])    : fixed noise variance if mode='variance'
+%
+% OUTPUTS
+%   true_precision   : cell{F} of n×n complex Hermitian SPD Ω_f
+%   true_covariance  : cell{F} of n×n complex Hermitian SPD Σ_xx,f = Ω_f^{-1}
+%   emp_covariance   : cell{F} of p×p complex Hermitian empirical sensor covariances \hatΣ_vv,f
+%   params           : struct with simulation details, including:
+%       .n_nodes, .n_freq, .n_samples, .graph_type, .edge_density, ...
+%       .leadfield_matrix         (p×n)   : EEG forward L if generated
+%       .electrode_positions      (p×3)
+%       .source_positions         (n×3)
+%       .Sigma_vv_true, .Sigma_vv_observed (cell{F}) : sensor covs (w/ and w/o noise)
+%       .Sigma_xixi_cell          (cell{F}) : per-frequency noise covariance
+%       .Sigma_xixi               (p×p)     : representative noise covariance (first freq)
+%       .base_edge_list, .variable_edge_list
+%       .sparsity_changes, .matrices_with_complex, .hermitian_count
+%
+% USAGE (typical Scheme A)
+%   [Omega_true, Sigma_true, Sigma_emp, sim_params] = module7_simulation_improved_complex( ...
+%       'n_nodes', 12, 'n_freq', 20, 'n_samples', 120, ...
+%       'generate_leadfield', true, 'n_sensors', 19, ...
+%       'leadfield_type', 'simple', 'electrode_layout', '1020-19', ...
+%       'source_space', 'cortical', 'random_seed', 42);
+%   % Then pass sim_params.leadfield_matrix and sim_params.Sigma_xixi to Module 2.
+%
+% REMARKS
+%   - The simulated Ω_f is NOT directly comparable to a sensor-domain precision unless mapped
+%     via L; downstream pipelines should keep domains consistent (e.g., residual whitening path).
+%   - This simulator emphasizes numerical stability (Hermitian enforcement, diagonal dominance).
+%   - For very small F, variable edge activations include guards to avoid degenerate all-on/off.
 
 %% ---- Parse inputs ----
 p = inputParser;
