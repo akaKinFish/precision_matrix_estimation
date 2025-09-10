@@ -1,7 +1,7 @@
 function viz_pipeline_summary(prox_res, Gamma_tilde_star, Sjj_tilde, K, A_masks, Omega_src, Omega_true)
 % VIZ_PIPELINE_SUMMARY - Post-run visualization & quick diagnostics
 % Inputs:
-%   prox_res         : struct from module5_proximal (objective_history, gradient_norm_history, etc.)
+%   prox_res         : struct from module5_proximal (may contain histories)
 %   Gamma_tilde_star : {F×1} final precision in whitened domain
 %   Sjj_tilde        : {F×1} whitened covariances
 %   K                : F×F smoothing kernel
@@ -13,41 +13,60 @@ F = numel(Gamma_tilde_star);
 p = size(Gamma_tilde_star{1},1);
 f_view = 1;  % default frequency to visualize
 
+% ---- safe getters ----
+obj_hist  = getf_(prox_res,'objective_history',[]);
+grad_hist = getf_(prox_res,'gradient_norm_history',[]);
+step_hist = getf_(prox_res,'step_size_history',[]);
+bt_hist   = getf_(prox_res,'backtrack_counts',[]);
+as_hist   = getf_(prox_res,'active_set_changes',[]);
+
 %% 0) Figure layout
 figure('Name','Module5 Summary','NumberTitle','off'); clf;
 
 %% 1) Convergence curves
 subplot(2,3,1);
-yyaxis left;
-semilogy(max(prox_res.objective_history - min(prox_res.objective_history), eps), '-o'); grid on;
-ylabel('Objective (shifted, log)');
-yyaxis right;
-semilogy(max(prox_res.gradient_norm_history, eps), '-s');
-ylabel('||grad||_F (log)');
-xlabel('Iteration');
-title('Convergence');
+have_obj  = ~isempty(obj_hist);
+have_grad = ~isempty(grad_hist);
+if ~(have_obj || have_grad)
+    text(0.1,0.5,'No histories found in prox\_res','FontSize',12); axis off;
+else
+    if have_obj
+        yyaxis left;
+        o = obj_hist(:); o = o - min(o); o = max(o, eps);
+        semilogy(o,'-o'); grid on; ylabel('Objective (shifted, log)');
+    end
+    if have_grad
+        yyaxis right;
+        g = max(grad_hist(:), eps);
+        semilogy(g,'-s'); ylabel('||grad||_F (log)');
+    end
+    xlabel('Iteration'); title('Convergence');
+end
 
 %% 2) Step size & backtracks
 subplot(2,3,2);
-stairs(prox_res.step_size_history, '-'); grid on; hold on;
-yyaxis right;
-if ~isempty(prox_res.backtrack_counts)
-    stem(1:numel(prox_res.backtrack_counts), prox_res.backtrack_counts, '.');
+if ~isempty(step_hist)
+    stairs(step_hist,'-'); grid on; hold on;
+    yyaxis left; ylabel('Step size');
+    yyaxis right;
+    if ~isempty(bt_hist)
+        stem(1:numel(bt_hist), bt_hist,'.');
+    else
+        stem(1,0,'.'); % placeholder
+    end
+    xlabel('Iteration'); ylabel('Backtracks');
+    title('Step size & backtracks');
+else
+    text(0.1,0.5,'No step-size history','FontSize',12); axis off;
 end
-xlabel('Iteration'); ylabel('Backtracks');
-yyaxis left; ylabel('Step size');
-title('Step size & backtracks');
 
 %% 3) Active-set dynamics
 subplot(2,3,3);
-if isfield(prox_res,'active_set_changes') && ~isempty(prox_res.active_set_changes)
-    bar(prox_res.active_set_changes);
-    title('Active-set changes / iter'); xlabel('Iteration'); ylabel('# flips');
+if ~isempty(as_hist)
+    bar(as_hist); title('Active-set changes / iter'); xlabel('Iteration'); ylabel('# flips'); grid on;
 else
-    text(0.1,0.5,'No active-set change history','FontSize',12);
-    axis off
+    text(0.1,0.5,'No active-set change history','FontSize',12); axis off;
 end
-grid on;
 
 %% 4) Fit residual in whitened domain: ||S_f * Gamma_f - I||_F / ||I||
 res = zeros(F,1);
@@ -85,7 +104,6 @@ else
     imagesc(pc); colorbar; title(sprintf('Partial coherence (whitened, f=%d)', f_view));
 end
 axis square; xlabel('j'); ylabel('i');
-
 drawnow;
 
 %% 7) If ground-truth exists: precision/recall & F1 (off-diagonal support)
@@ -131,4 +149,8 @@ if isnumeric(X) && ismatrix(X) && size(X,1)==size(X,2)
     F = F_hint; C = repmat({X}, F, 1); return;
 end
 error('coerce_cov_cell_local:unsupported','Expect cell{F,1} | p×p×F | single p×p.');
+end
+
+function v = getf_(S, name, dv)
+if isstruct(S) && isfield(S, name) && ~isempty(S.(name)), v = S.(name); else, v = dv; end
 end

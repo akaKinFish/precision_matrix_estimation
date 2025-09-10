@@ -65,7 +65,21 @@ end
 if ~isfield(proximal_params,'use_graph_laplacian') || isempty(proximal_params.use_graph_laplacian)
     proximal_params.use_graph_laplacian = true;
 end
+% --- existing core_input fields ---
+core_input.whitened_covariances = input_data.whitened_covariances;
+core_input.initial_precision    = input_data.initial_precision;
+core_input.smoothing_kernel     = input_data.smoothing_kernel;
+core_input.weight_matrix        = input_data.weight_matrix;
 
+% --- (NEW) pass-through for live-plot GT alignment ---
+if isfield(input_data, 'whitening_matrices') && ~isempty(input_data.whitening_matrices)
+    core_input.whitening_matrices = input_data.whitening_matrices;  % {F×1}
+end
+
+% optional: active_set_mask etc...
+if isfield(input_data,'active_set_mask')
+    core_input.active_set_mask = input_data.active_set_mask;
+end
 % ---- 路由到 main ----
 [Gamma_final, proximal_results] = module5_proximal_main(core_input, proximal_params);
 

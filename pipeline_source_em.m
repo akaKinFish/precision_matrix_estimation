@@ -2,7 +2,7 @@
 % Build estep_in as a *scalar struct* with per-frequency matrices stored as {F×1} cells.
 
 %% 0) Simulation (Module 7)
-n  = 128;  p  = 18;  F  = 16;  T  = 4096;
+n  = 10;  p  = 3;  F  = 3;  T  = 4096;
 
 [Omega_true, Sigma_true, emp_covariance, sim] = module7_simulation_improved_complex( ...
     'n_nodes', n, 'n_sensors', p, 'n_freq', F, 'n_samples', T, ...
@@ -31,13 +31,13 @@ assert(all(cellfun(@(A) isequal(size(A),[p p]), estep_in.empirical_covariances))
 assert(isa(estep_in.source_prior_covariances,'cell') && numel(estep_in.source_prior_covariances)==F);
 assert(all(cellfun(@(S) isequal(size(S),[n n]), estep_in.source_prior_covariances)));
 
-%% 2) E-step (Module 2 + wrapper)
+%% 2) E-step (Module 2 + wrapper)  —— 数值保障：开启 PSD & 统一加载
 estep_out = module2_estep(estep_in, struct( ...
     'ensure_hermitian', true, ...
     'ensure_real_diag', true, ...
-    'ensure_psd',       false, ...
+    'ensure_psd',       true, ...      % <--- enable PSD
     'psd_tol',          1e-10, ...
-    'diag_loading',     0 ...
+    'diag_loading',     1e-10 ...      % <--- small loading at one place
 ));
 Sjj_hat = estep_out.source_second_moments;   % {F×1}, n×n
 
@@ -52,7 +52,6 @@ D_src     = pre.D;            % {F×1}, n×n
 Sjj_tilde = pre.Sigma_tilde;  % {F×1}, n×n
 
 %% 4) Active set (Module 3)
-
 input_data_m3 = struct();
 input_data_m3.whitened_covariances = Sjj_tilde;  % 16x1 cell
 input_data_m3.frequencies          = 1:F;        % 1xF double
@@ -66,48 +65,98 @@ act = module3_active_set(input_data_m3, struct( ...
 A_masks = arrayfun(@(f) logical(act.combined_active_mask(:,:,f)), 1:F, 'uni', 0);
 
 %% 5) Hyperparameters (Module 6)
-K = make_frequency_kernel(F, 3.0);
+K = make_frequency_kernel(F, 3.0);    % single source of truth
 W = make_uniform_weight(n);
-input_data_m6 = struct();
-input_data_m6.whitened_covariances = Sjj_tilde;  % 16x1 cell
-input_data_m6.kernel_matrix          = K;        % 1xF double
-input_data_m6.weight_matrix          = W;        
-input_data_m6.active_set_mask          = {A_masks{:}};        
 
+input_data_m6 = struct();
+input_data_m6.whitened_covariances = Sjj_tilde;
+input_data_m6.kernel_matrix        = K;
+input_data_m6.weight_matrix        = W;
+input_data_m6.active_set_mask      = {A_masks{:}};
 
 hp = module6_hyperparameter_config(input_data_m6, struct('use_gershgorin', true));
 
-lambda1 = hp.lambda1;  lambda2 = hp.lambda2_suggested;  alpha = hp.alpha;
+lambda1 = hp.lambda1;  
+lambda2_suggested = hp.lambda2_suggested;  
+alpha   = hp.alpha;
+
+% 默认采用建议值，可在下方覆盖并记录
+lambda2_effective = lambda2_suggested;
 
 %% 6) Proximal solver (Module 5) in whitened domain
 Gamma0 = cellfun(@(S) diag(1 ./ max(real(diag(S)), 1e-8)), Sjj_tilde, 'uni', 0);
 
 input_data_m5 = struct();
-input_data_m5.whitened_covariances = Sjj_tilde;  % 16x1 cell
-input_data_m5.initial_precision          = Gamma0;        % 1xF double
-input_data_m5.smoothing_kernel          = K;        
-input_data_m5.weight_matrix          = W;   
-input_data_m5.active_set_mask          = {A_masks{:}};        
+input_data_m5.whitened_covariances = Sjj_tilde;
+input_data_m5.initial_precision    = Gamma0;
+input_data_m5.smoothing_kernel     = K;
+input_data_m5.weight_matrix        = W;
+input_data_m5.active_set_mask      = {A_masks{:}};
+input_data_m5.whitening_matrices   = D_src;      % <--- 为 Live 可视化白化 GT
 
+% === 空间平滑配置（λ3 + 谱归一 L） ===
+% 若你已有 make_source_graph 的 L，可直接谱归一：
+%   [Lsp, Linfo] = normalize_graph_laplacian(L_raw, 'spectral');
+% 这里示例直接从 Omega_true 的节点图来源处取得 L_raw，自行替换为你的 L_raw。
+if isfield(sim, 'source_graph') && isfield(sim.source_graph, 'L')
+    L_raw = sim.source_graph.L;
+else
+    % 若仿真没暴露 L，这里提供一个简单兜底（不会用于推理，只给示例）
+    L_raw = eye(n) - (diag(sum(ones(n)-eye(n),2)) \ (ones(n)-eye(n))); % 非常粗糙，占位
+end
+[Lsp, Linfo] = normalize_graph_laplacian(L_raw, 'spectral');
+fprintf('Spatial L normalized: eig[min,max]=[%.2e, %.2e] -> [%.2e, %.2e]\n', ...
+    Linfo.min_eig_before, Linfo.max_eig_before, Linfo.min_eig_after, Linfo.max_eig_after);
 
-[Gamma_tilde_star, prox_res] = module5_proximal(input_data_m5, struct( ...
-        'lambda1',         lambda1, ...
-        'lambda2',         lambda2, ...
-        'alpha',           alpha, ...
-        'beta_backtrack',  0.5, ...
-        'max_backtrack',   30, ...
-        'max_iter',        300, ...
-        'verbose',         true, ...
-        'weight_mode',     'hadamard', ...
-        'use_graph_laplacian', true ...
-    ));
+% 启用/关闭 λ3（默认建议：0.3~1.0 * λ1）
+lambda3 = 0.3 * lambda1;
+
+% Hadamard 语义 + 实时诊断
+params5 = struct( ...
+    'lambda1', lambda1, ...
+    'lambda2', lambda2_effective, ...            % 生效值
+    'lambda2_suggested', lambda2_suggested, ...  % 记录来源
+    'alpha0',  5e-4, ...
+    'max_iter', 300, 'verbose', true, ...
+    'active_set_update_freq', 10, ...
+    'alpha_max', 2e-3, 'alpha_up', 1.05, ...
+    'alpha_down', 0.7, 'alpha_grow_patience', 2, ...
+    'obj_improve_tol', 1e-6, ...
+    'weight_mode','hadamard', 'use_graph_laplacian', true, ...
+    'diag', struct( 'enable', true, 'update_every', 1, 'metrics_every', 1, ...
+                    'print_every', 1, 'f_view', 1, 'log_csv', 'prox_trace.csv', ...
+                    'keep_fig_open', true, 'weight_mode','hadamard', ...
+                    'use_graph_laplacian', true ) );
+
+% 在线可视化（Live）
+params5.diag.live_plot = struct( ...
+    'enable', true, ...
+    'f_view', 1, ...
+    'plot_every', 5, ...
+    'value_mode', 'abs', ...
+    'ground_truth_domain', 'source' ...
+);
+
+    params5.diag.live_plot.ground_truth_precision = Omega_true; % 若 GT 在源域
+
+% 单频空间平滑开关
+if lambda3 > 0
+    params5.lambda3                     = lambda3;
+    params5.spatial_graph_matrix        = Lsp;     % 谱归一后 L
+    params5.spatial_graph_is_laplacian  = true;
+    if ~isfield(params5,'spatial_weight_mode') || isempty(params5.spatial_weight_mode)
+        params5.spatial_weight_mode = 'node';      % 'node' or 'hadamard'
+    end
+end
+
+[Gamma_tilde_star, prox_res] = module5_proximal(input_data_m5, params5);
 
 %% 7) Recolor to source scale (Module 8)
 input_data_m8 = struct();
-input_data_m8.whitened_precision_matrices = Gamma_tilde_star;  % 16x1 cell
-input_data_m8.whitening_matrices          = D_src;        % 1xF double
+input_data_m8.whitened_precision_matrices = Gamma_tilde_star;
+input_data_m8.whitening_matrices          = D_src;
 recol = module8_recoloring(input_data_m8, struct());
-Omega_src = recol.recolored_precision_matrices;   % {F×1}, n×n
+Omega_src = recol.recolored_precision_matrices;
 
 %% 8) Simple readout (optional)
 f_view = 1;
@@ -119,6 +168,11 @@ fprintf('Done. Example partial coherence at f=%d: max=%g, median=%g\n', ...
 
 viz_pipeline_summary(prox_res, Gamma_tilde_star, Sjj_tilde, K, A_masks, Omega_src, Omega_true);
 metrics = gt_compare_and_plot(Omega_true, Omega_src, struct('mode','match_sparsity', 'f_view', 1, 'show_pr', true));
+Sigma_hat_test   = ensure_sigma_collection(Sjj_hat);
+Sigma_tildeteest = ensure_sigma_collection(Sjj_tilde);
+debug_em_convergence(Sigma_hat_test,   'weight_mode','hadamard', 'use_laplacian',true);
+debug_em_convergence(Sigma_tildeteest, 'weight_mode','hadamard', 'use_laplacian',true);
+
 %% ===== Local helpers =====
 function C = coerce_cov_cell(X, F_hint)
 % Turn X into {F×1} cell of square matrices.
@@ -139,7 +193,8 @@ function K = make_frequency_kernel(F, sigma)
     if nargin < 2, sigma = 3.0; end
     [I,J] = ndgrid(1:F,1:F);
     K = exp(-((I-J).^2)/(2*sigma^2));
-    K = K ./ max(sum(K,2), eps);
+    K = (K + K')/2;              % 保证对称
+    K = K / max(sum(K,2));       % 统一尺度（不会破坏对称）
 end
 
 function W = make_uniform_weight(n)

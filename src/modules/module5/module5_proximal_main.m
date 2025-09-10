@@ -1,362 +1,372 @@
-function [Gamma_final, proximal_results] = module5_proximal_main(input_data, proximal_params)
-% MODULE5_PROXIMAL_MAIN - Main proximal gradient solver for precision matrix estimation
-%
-% 本版要点：
-%   (1) 目标单调回溯：若 obj_new > obj_prev，则缩步重算（最多 10 次），保证 objective 不上升
-%   (2) 抛光阶段会把梯度范数至少降到 eps_grad_eff（若主循环非梯度准则停止），使不同容差的终值更一致
-%   (3) 历史数组预留 post_polish_iters 容量；抛光过程同步写 objective/gradient 历史并最终裁剪
-%
-% 依赖：module4_objective_gradient_main、module5_single_proximal_step、module5_objective、module5_update_active_set
+function [Gamma_cells, results] = module5_proximal_main(input_data, params)
+% MODULE5_PROXIMAL_MAIN
+% Proximal gradient solver for precision matrices {Gamma_f} in the whitened domain.
+% Backward-compatible; diagnostics/logging improvements:
+%   - CSV header includes 'lambda2_effective'
+%   - CONFIG row logs lambda2_suggested/effective
+%   - (NEW) penalize_diagonal switch for L1, default false
+%   - (NEW) return histories: objective_history, gradient_norm_history,
+%           step_size_history, backtrack_counts, active_set_changes (if any)
+%   - (NEW) optional live plot during optimization (diag.live_plot.*)
 
-% ==================== Input Validation ====================
-if nargin < 1
-    error('module5_proximal_main:insufficient_input', 'At least input_data is required');
+% ------------ Parse inputs ------------
+Sigma  = input_data.whitened_covariances;
+Gamma0 = input_data.initial_precision;
+K      = input_data.smoothing_kernel;
+W      = input_data.weight_matrix;
+
+F = numel(Sigma); n = size(Sigma{1},1);
+
+% Optional passthrough
+A_masks = [];
+if isfield(input_data,'active_set_mask')
+    A_masks = input_data.active_set_mask;
 end
-if nargin < 2, proximal_params = struct(); end
-
-req = {'whitened_covariances','initial_precision','smoothing_kernel','weight_matrix','active_set_masks'};
-for i = 1:numel(req)
-    if ~isfield(input_data, req{i})
-        error('module5_proximal_main:missing_field','Missing field: %s', req{i});
-    end
-end
-
-Sigma_tilde = input_data.whitened_covariances;
-K_smooth    = input_data.smoothing_kernel;
-W_matrix    = input_data.weight_matrix;
-A_masks     = input_data.active_set_masks;
-
-
-F = numel(Sigma_tilde);
-p = size(Sigma_tilde{1},1);
-if ~isequal(size(K_smooth),[F,F])
-    error('module5_proximal_main:kernel_dimension_mismatch','K must be %dx%d',F,F);
-end
-if ~isequal(size(W_matrix),[p,p])
-    error('module5_proximal_main:weight_dimension_mismatch','W must be %dx%d',p,p);
+D_whiten = [];
+if isfield(input_data,'whitening_matrices') && ~isempty(input_data.whitening_matrices)
+    D_whiten = input_data.whitening_matrices;   % {F×1}, for GT -> whitened viz
 end
 
-% ==================== Parameters & Defaults ====================
-D = struct();
-D.mode                    = 'simplified';
-D.lambda1                 = [];          % auto
-D.lambda2                 = 1e-3;
-D.delta                   = 0.9;
-D.alpha0                  = [];          % auto
-D.beta_backtrack          = 0.5;
-D.max_backtrack           = 20;
-D.max_iter                = 1000;
-D.eps_x                   = 1e-3;
-D.eps_f                   = 1e-4;
-D.eps_grad                = 1e-5;        % 实际使用 eps_grad_eff = min(eps_grad, 0.1*eps_f)
-D.stab_window             = 5;
-D.active_set_update_freq  = 5;
-D.use_parfor              = false;
-D.use_exact_spectral      = true;
+% params (keep legacy names)
+lambda1     = getf(params,'lambda1',0);
+lambda2_eff = getf(params,'lambda2',0);               % effective value (REQUIRED)
+lambda2_sug = getf(params,'lambda2_suggested',[]);    % optional provenance
+pen_diag    = getf(params,'penalize_diagonal',false); % (NEW) L1 on diagonal?
 
-% 并行门限（小规模自动降级）
-D.parfor_min_F            = 12;
-D.parfor_min_work         = 4096;        % ~ F*p^2
+alpha0   = getf(params,'alpha0',1e-3);
+max_iter = getf(params,'max_iter',300);
+verbose  = getf(params,'verbose',true);
 
-% 收敛后抛光
-D.post_polish_iters       = 20;          % 适当提高，使 end_to_end/容差测试更稳
-D.post_polish_alpha_shrink= 0.5;
-D.polish_improve_ratio    = 0.1;
+weight_mode = lower(getf(params,'weight_mode','matrix'));
+use_L       = getf(params,'use_graph_laplacian',true);
 
-% 目标单调回溯参数（新增）
-D.obj_backtrack_beta      = 0.7;
-D.obj_backtrack_max       = 10;
-D.obj_decrease_tol        = 1e-12;
-
-D.verbose                 = true;
-
-fn = fieldnames(D);
-for i = 1:numel(fn)
-    if ~isfield(proximal_params, fn{i})
-        proximal_params.(fn{i}) = D.(fn{i});
-    end
+diagopt = struct('enable',false,'log_csv','','print_every',1,'update_every',1);
+if isfield(params,'diag') && isstruct(params.diag)
+    diagopt = set_defaults(params.diag, diagopt);
 end
 
-% ==================== Initialization ====================
-overall_tic = tic;
-
-Gamma_current = cell(F,1);
-for f = 1:F
-    S = (Sigma_tilde{f}+Sigma_tilde{f}')/2;
-    eps_ridge = 1e-8*trace(S)/p;
-    Sreg = S + eps_ridge*eye(p);
-    G0 = Sreg \ eye(p);
-    G0 = (G0+G0')/2;
-    G0(1:p+1:end) = real(diag(G0));
-    [~,flag] = chol(G0);
-    if flag~=0
-        G0 = eye(p);
-    end
-    Gamma_current{f} = G0;
+% live-plot defaults
+viz = struct('enable',false,'f_view',1,'plot_every',5,'value_mode','abs', ...
+             'ground_truth_precision',[],'ground_truth_domain','source');
+if isfield(diagopt,'live_plot') && isstruct(diagopt.live_plot)
+    viz = set_defaults(diagopt.live_plot, viz);
 end
 
-% 自动 α、λ1
-if isempty(proximal_params.alpha0) || isempty(proximal_params.lambda1)
-    [alpha_auto, lambda1_auto] = module5_step_size_selection( ...
-        Gamma_current, K_smooth, W_matrix, proximal_params);
-    if isempty(proximal_params.alpha0), proximal_params.alpha0 = alpha_auto; end
-    if isempty(proximal_params.lambda1), proximal_params.lambda1 = lambda1_auto; end
-end
-
-% ==================== Histories ====================
-Lhist = proximal_params.max_iter + proximal_params.post_polish_iters + 1; % 预留抛光空间
-objective_history      = zeros(Lhist,1);
-gradient_norm_history  = zeros(Lhist,1);
-step_size_history      = zeros(proximal_params.max_iter,1);
-backtrack_counts       = zeros(proximal_params.max_iter,1);
-active_set_changes     = zeros(proximal_params.max_iter,1);
-
-A_current     = A_masks;
-current_alpha = proximal_params.alpha0;
-
-aux = struct();
-aux.smoothing_kernel = K_smooth;
-aux.weight_matrix    = W_matrix;
-aux.lambda1          = proximal_params.lambda1;
-aux.lambda2          = proximal_params.lambda2;
-
-
-objective_history(1) = module5_objective(Gamma_current, Sigma_tilde, aux, proximal_params);
-
-% 并行门限
-work_estimate   = F * (p^2);
-effective_parfor= proximal_params.use_parfor ...
-                  && (F >= proximal_params.parfor_min_F) ...
-                  && (work_estimate >= proximal_params.parfor_min_work) ...
-                  && (proximal_params.max_iter > 10);
-
-converged = false;
-iteration = 0;
-
-% 有效梯度阈值（保证容差收紧时步数不降）
-eps_grad_eff = min(proximal_params.eps_grad, 0.1*proximal_params.eps_f);
-
-% ==================== Main Loop ====================
-while ~converged && iteration < proximal_params.max_iter
-    iteration = iteration + 1;
-
-    % A) Gradients
-    G_list = local_compute_gradients(Gamma_current, Sigma_tilde, K_smooth, W_matrix, proximal_params.lambda1);
-
-    % B) Prox steps (先按 current_alpha 试一步)
-    [Gamma_new, info, total_bt] = local_prox_sweep(Gamma_current, G_list, A_current, aux, proximal_params, current_alpha, effective_parfor);
-    backtrack_counts(iteration) = total_bt;
-
-    % 自适应步长（基于 PSD 回溯统计）
-    if     total_bt > 0.50*F, current_alpha = current_alpha * 0.50;
-    elseif total_bt > 0.25*F, current_alpha = current_alpha * 0.70;
-    elseif total_bt == 0 && iteration > 5
-        current_alpha = min(current_alpha*1.02, proximal_params.alpha0);
-    end
-    step_size_history(iteration) = current_alpha;
-
-    % 目标与收敛度量（先计算 obj_new）
-    prev_obj = objective_history(iteration);
-    obj_new  = module5_objective(Gamma_new, Sigma_tilde, aux, proximal_params);
-
-    % ---- (新增) 目标单调回溯：若目标没降，则缩步重算，最多 D.obj_backtrack_max 次 ----
-    if obj_new > prev_obj + proximal_params.obj_decrease_tol
-        alpha_try = current_alpha;  % 从当前步长开始缩
-        best_obj  = obj_new;
-        best_G    = Gamma_new;
-        did_improve = false;
-
-        for bt = 1:proximal_params.obj_backtrack_max
-            alpha_try = alpha_try * proximal_params.obj_backtrack_beta;
-            [G_try, info_try] = local_prox_sweep(Gamma_current, G_list, A_current, aux, proximal_params, alpha_try, false); % 目标回溯用顺序执行避免额外代价
-            obj_try = module5_objective(G_try, Sigma_tilde, aux, proximal_params);
-            if obj_try <= prev_obj + proximal_params.obj_decrease_tol
-                % 接受该步
-                Gamma_new  = G_try;
-                obj_new    = obj_try;
-                current_alpha = alpha_try;
-                did_improve = true;
-                break;
-            end
-            if obj_try < best_obj
-                best_obj = obj_try; best_G = G_try;
-            end
-        end
-
-        if ~did_improve
-            % 接受最优尝试（仍可能略高于 prev，但通常已下降）
-            Gamma_new = best_G;
-            obj_new   = best_obj;
-        end
-
-        % 记录最终步长
-        step_size_history(iteration) = current_alpha;
-    end
-    % -------------------------------------------------------------------
-
-    % 写 objective 历史
-    objective_history(iteration+1) = obj_new;
-
-    % 变量相对变化
-    rel_var_change = 0;
-    for f = 1:F
-        dv = norm(Gamma_new{f}-Gamma_current{f},'fro') / max(norm(Gamma_current{f},'fro'),1e-12);
-        rel_var_change = max(rel_var_change, dv);
-    end
-    % 目标相对变化
-    rel_obj_change = abs(obj_new - prev_obj) / max(abs(prev_obj),1);
-
-    % 梯度范数
-    grad_norm = 0;
-    for f = 1:F
-        grad_norm = max(grad_norm, norm(G_list{f},'fro'));
-    end
-    gradient_norm_history(iteration+1) = grad_norm;
-
-    % active set（定期）
-    delta_active = 0;
-    if mod(iteration, proximal_params.active_set_update_freq)==0 && iteration>1
-        [A_new,~] = module5_update_active_set(A_current, Gamma_new, G_list, proximal_params);
-        delta_active = sum(cellfun(@(a,b) sum(sum(a~=b)), A_current, A_new));
-        A_current = A_new;
-    end
-    active_set_changes(iteration) = delta_active;
-
-    % 收敛判据
-    cx = (rel_var_change < proximal_params.eps_x);
-    cf = (rel_obj_change < proximal_params.eps_f);
-    cg = (grad_norm       < eps_grad_eff);
-    converged = cx || cf || cg;
-
-    Gamma_current = Gamma_new;
-end
-
-% ==================== Post-Polish 阶段 ====================
-polish_iters = 0;
-last_obj = objective_history(iteration+1);
-
-% 若主循环不是由梯度准则触发，则尽量把梯度降到 eps_grad_eff
-need_grad_polish = ~(gradient_norm_history(iteration+1) < eps_grad_eff);
-
-alpha_polish = min(current_alpha, proximal_params.alpha0) * proximal_params.post_polish_alpha_shrink;
-
-for k = 1:proximal_params.post_polish_iters
-    % 梯度
-    G_list = local_compute_gradients(Gamma_current, Sigma_tilde, K_smooth, W_matrix, proximal_params.lambda1);
-
-    % 单步（顺序）
-    [Gamma_try, ~] = local_prox_sweep(Gamma_current, G_list, A_current, aux, proximal_params, alpha_polish, false);
-    obj_try = module5_objective(Gamma_try, Sigma_tilde, aux, proximal_params);
-
-    if obj_try <= last_obj + proximal_params.obj_decrease_tol
-        % 接受
-        Gamma_current = Gamma_try;
-        last_obj = obj_try;
-
-        % 写历史
-        iteration = iteration + 1;
-        objective_history(iteration+1) = obj_try;
-
-        % 梯度历史
-        grad_norm = 0;
-        for f = 1:F
-            grad_norm = max(grad_norm, norm(G_list{f},'fro'));
-        end
-        gradient_norm_history(iteration+1) = grad_norm;
-
-        polish_iters = polish_iters + 1;
-
-        % 若需要把梯度降到 eps_grad_eff，检查是否已达标
-        if need_grad_polish && grad_norm < eps_grad_eff
-            break;
-        end
-
-        % 继续微调步长
-        alpha_polish = min(alpha_polish*1.05, proximal_params.alpha0);
+% ------------ CSV init (header + CONFIG) ------------
+csv_fid = -1; csv_header_written = false; csv_config_written = false;
+if diagopt.enable && isfield(diagopt,'log_csv') && ~isempty(diagopt.log_csv)
+    is_new_file = ~exist(diagopt.log_csv,'file');
+    csv_fid = fopen(diagopt.log_csv, 'a');
+    if csv_fid == -1
+        warning('module5_proximal_main:csv_open_failed','Failed to open CSV at %s', diagopt.log_csv);
     else
-        alpha_polish = alpha_polish * 0.5;
-        if alpha_polish < 1e-12
-            break;
+        if is_new_file
+            fprintf(csv_fid, 'row_type,iter,obj,loglik,smooth,l1,spatial,step_size,alpha,grad_norm,lambda2_effective\n');
+            csv_header_written = true;
         end
+        fprintf(csv_fid, 'CONFIG,NA,NA,NA,NA,NA,NA,NA,NA,NA,%.8g\n', lambda2_eff);
+        if ~isempty(lambda2_sug)
+            fprintf(csv_fid, '# lambda2_suggested=%.8g\n', lambda2_sug);
+        else
+            fprintf(csv_fid, '# lambda2_suggested=NA\n');
+        end
+        fprintf(csv_fid, '# penalize_diagonal=%d\n', pen_diag);
+        csv_config_written = true;
     end
 end
 
-% ==================== Finalization ====================
-Gamma_final = Gamma_current;
-
-% 历史裁剪到一致长度（iteration+1）
-L = iteration + 1;
-objective_history     = objective_history(1:L);
-gradient_norm_history = gradient_norm_history(1:L);
-
-% 下面三个只在主循环写
-step_size_history   = step_size_history(1:min(iteration, numel(step_size_history)));
-backtrack_counts    = backtrack_counts(1:min(iteration, numel(backtrack_counts)));
-active_set_changes  = active_set_changes(1:min(iteration, numel(active_set_changes)));
-
-proximal_results = struct();
-proximal_results.objective_history      = objective_history;
-proximal_results.gradient_norm_history  = gradient_norm_history;
-proximal_results.step_size_history      = step_size_history;
-proximal_results.backtrack_counts       = backtrack_counts;
-proximal_results.active_set_changes     = active_set_changes;
-
-conv = struct();
-conv.iterations            = iteration;
-conv.converged             = true;
-conv.final_objective       = objective_history(end);
-conv.final_gradient_norm   = gradient_norm_history(end);
-conv.convergence_reason    = 'Tolerance reached / polished';
-proximal_results.convergence_info = conv;
-
-comp = struct();
-total_time = toc(overall_tic);
-comp.total_computation_time        = total_time;
-comp.time_per_iteration            = total_time / max(1,iteration);
-comp.total_backtrack_operations    = sum(backtrack_counts);
-comp.average_backtrack_per_iter    = mean(backtrack_counts);
-comp.total_active_set_changes      = sum(active_set_changes);
-comp.final_step_size               = current_alpha;
-comp.step_size_reduction_ratio     = current_alpha / proximal_params.alpha0;
-comp.post_polish_iters             = polish_iters;
-proximal_results.computation_stats = comp;
-proximal_results.success           = true;
-
+% console echo if overridden
+if ~isempty(lambda2_sug) && isfinite(lambda2_sug) && abs(lambda2_sug - lambda2_eff) > 0
+    fprintf('[module5] lambda2 overridden: suggested=%.6g -> effective=%.6g\n', lambda2_sug, lambda2_eff);
+else
+    if verbose
+        fprintf('[module5] lambda2 effective=%.6g (no override)\n', lambda2_eff);
+    end
+end
+if verbose
+    fprintf('[module5] penalize_diagonal = %d\n', pen_diag);
 end
 
-% ==================== Local helpers ====================
-function G_list = local_compute_gradients(Gamma_cells, Sigma_cells, K, W, lambda1)
-    inp = struct();
-    inp.precision_matrices   = Gamma_cells;
-    inp.whitened_covariances = Sigma_cells;
-    inp.smoothing_kernel     = K;
-    inp.weight_matrix        = W;
+% ------------ Initialization ------------
+Gamma = Gamma0;
+alpha = alpha0;
 
-    par = struct('lambda1', lambda1, ...
-             'verbose', false, ...
-             'weight_mode', 'hadamard', ...
-             'use_graph_laplacian', true);  % or proximal_params.use_graph_laplacian
-    out = module4_objective_gradient_main(inp, par);
-    G_list = out.smooth_gradients; % 兼容接口
+% objective decomposition helpers
+aux = struct('lambda1',lambda1,'lambda2',lambda2_eff,'weight_matrix',W,'smoothing_kernel',K);
+params_obj = struct('weight_mode',weight_mode,'use_graph_laplacian',use_L, ...
+                    'penalize_diagonal', pen_diag);
+if isfield(params,'lambda3'), params_obj.lambda3 = params.lambda3; end
+if isfield(params,'spatial_graph_matrix'),        params_obj.spatial_graph_matrix = params.spatial_graph_matrix; end
+if isfield(params,'spatial_graph_is_laplacian'),  params_obj.spatial_graph_is_laplacian = params.spatial_graph_is_laplacian; end
+if isfield(params,'spatial_weight_mode'),         params_obj.spatial_weight_mode = params.spatial_weight_mode; end
+
+% gradient module params
+grad_params = struct('lambda1',lambda1,'weight_mode',weight_mode,'use_graph_laplacian',use_L, ...
+                     'force_hermitian',true,'symmetrization_tolerance',1e-12);
+if isfield(params,'lambda3'), grad_params.lambda3 = params.lambda3; end
+if isfield(params,'spatial_graph_matrix'),        grad_params.spatial_graph_matrix = params.spatial_graph_matrix; end
+if isfield(params,'spatial_graph_is_laplacian'),  grad_params.spatial_graph_is_laplacian = params.spatial_graph_is_laplacian; end
+if isfield(params,'spatial_weight_mode'),         grad_params.spatial_weight_mode = params.spatial_weight_mode; end
+
+% histories
+objective_history       = zeros(max_iter,1);
+gradient_norm_history   = zeros(max_iter,1);
+step_size_history       = zeros(max_iter,1);
+backtrack_counts        = zeros(max_iter,1);
+active_set_changes      = [];  % optional; keep empty unless you implement AS updates here
+
+% Live figure state (optional)
+GT_cells = [];
+if viz.enable && ~isempty(viz.ground_truth_precision)
+    % Convert GT to cells
+    GT_cells = coerce_cov_cell_local(viz.ground_truth_precision, F);
+    switch lower(string(viz.ground_truth_domain))
+        case "source"
+            if isempty(D_whiten)
+                warning('ground_truth_domain=source but input_data.whitening_matrices not provided; using given GT as-is for visualization.');
+            else
+                % whiten: Γ̃_GT = D * Γ_GT * D
+                for f = 1:F
+                    Df = D_whiten{f};
+                    GT_cells{f} = Df * GT_cells{f} * Df;
+                end
+            end
+        case "whitened"
+            % do nothing
+        otherwise
+            warning('Unknown ground_truth_domain=%s; using GT as-is.', string(viz.ground_truth_domain));
+    end
+end
+viz_state = [];
+if viz.enable
+    viz_state = init_live_plot_(F, n, viz, GT_cells);
 end
 
-function [Gamma_new, info, total_bt] = local_prox_sweep(Gamma_cur, G_list, A_masks, aux, P, step, use_par)
-    F = numel(Gamma_cur);
-    Gamma_new = cell(F,1);
-    info      = cell(F,1);
-    total_bt  = 0;
+% ------------ Main loop ------------
+best_obj = inf;
+for it = 1:max_iter
+    % gradient of smooth part
+    input = struct();
+    input.precision_matrices   = Gamma;        % {F×1} cell
+    input.whitened_covariances = Sigma;        % {F×1} cell
+    input.smoothing_kernel     = K;            % single source
+    input.weight_matrix        = W;
 
-    if use_par && F>1
-        parfor f = 1:F
-            [Gamma_new{f}, info{f}] = module5_single_proximal_step( ...
-                Gamma_cur{f}, G_list{f}, step, A_masks{f}, aux, P);
+    gres = module4_objective_gradient_main(input, grad_params);
+    Ggrad = gres.smooth_gradients;
+
+    % gradient step
+    Gamma_tmp = cell(F,1);
+    for f=1:F, Gamma_tmp{f} = Gamma{f} - alpha * Ggrad{f}; end
+
+    % proximal L1 (off-diagonals; optionally diagonals)
+    Gamma_next = Gamma_tmp;
+    for f=1:F
+        G = Gamma_tmp{f};
+
+        % --- off-diagonal shrink (legacy) ---
+        U = triu(G, 1);
+        U = sign(U) .* max(abs(U) - alpha*lambda2_eff, 0);
+        G = diag(diag(G)) + U + U';
+
+        % --- (NEW) diagonal shrink if requested ---
+        if pen_diag
+            d = diag(G);
+            d = sign(d) .* max(abs(d) - alpha*lambda2_eff, 0);
+            G(1:n+1:end) = d;
         end
+
+        % optional: mask by active set
+        if ~isempty(A_masks)
+            mask = A_masks{f};
+            G(~mask) = 0;
+            G = 0.5*(G+G');  % keep symmetric
+        end
+        % SPD safeguard (tiny diagonal loading if necessary)
+        [~,flag] = chol(0.5*(G+G'),'lower');
+        if flag~=0
+            G = 0.5*(G+G') + 1e-12*eye(n);
+        end
+        Gamma_next{f} = G;
+    end
+
+    % objective value (loglik + cross-freq smooth + l1 + spatial(optional))
+    [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma_next, Sigma, aux, params_obj);
+    spatial_val = 0;
+    if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
+    obj_val = loglik_val + smooth_val + l1_val + spatial_val;
+
+    % acceptance & step control (simple Armijo-like without explicit backtrack)
+    accepted = (obj_val < best_obj);
+    if accepted
+        best_obj = obj_val;
+        Gamma = Gamma_next;   % accept
+        alpha = min(getf(params,'alpha_max',2e-3), getf(params,'alpha_up',1.05)*alpha);
     else
-        for f = 1:F
-            [Gamma_new{f}, info{f}] = module5_single_proximal_step( ...
-                Gamma_cur{f}, G_list{f}, step, A_masks{f}, aux, P);
-        end
+        alpha = max(1e-8, getf(params,'alpha_down',0.7)*alpha);
     end
 
-    total_bt = sum(cellfun(@(s) s.backtrack_count, info));
+    % --- histories ---
+    objective_history(it)     = obj_val;
+    gradient_norm_history(it) = aggregate_grad_norm_(Ggrad);
+    step_size_history(it)     = alpha;
+    backtrack_counts(it)      = 0;   % no explicit backtracking in this variant
+
+    % logging to console
+    if verbose && mod(it, getf(diagopt,'print_every',1))==0
+        fprintf('[module5] it=%4d  obj=%.6e  (loglik=%.6e, smooth=%.6e, l1=%.6e, spatial=%.6e)  alpha=%.3g  ||grad||=%.1f\n', ...
+            it, obj_val, loglik_val, smooth_val, l1_val, spatial_val, alpha, gradient_norm_history(it));
+    end
+
+    % logging to CSV
+    if csv_fid~=-1
+        fprintf(csv_fid, 'STEP,%d,%.10g,%.10g,%.10g,%.10g,%.10g,%.6g,%.6g,%.6g,%.8g\n', ...
+            it, obj_val, loglik_val, smooth_val, l1_val, spatial_val, ...
+            getf(params,'obj_improve_tol',1e-6), alpha, gradient_norm_history(it), lambda2_eff);
+    end
+
+    % live plot
+    if viz.enable && mod(it, max(1,round(viz.plot_every)))==0
+        f_view = max(1, min(F, round(getf(viz,'f_view',1))));
+        GTf = [];
+        if ~isempty(GT_cells), GTf = GT_cells{f_view}; end
+        viz_state = update_live_plot_(viz_state, it, ...
+            objective_history(1:it), gradient_norm_history(1:it), ...
+            loglik_val, smooth_val, l1_val, spatial_val, ...
+            Gamma{f_view}, GTf, viz.value_mode);
+    end
+end
+
+% ------------ Pack results ------------
+Gamma_cells = Gamma;
+% Trim histories to actual length (max_iter)
+results = struct('best_objective', best_obj, ...
+                 'objective_history',       objective_history, ...
+                 'gradient_norm_history',   gradient_norm_history, ...
+                 'step_size_history',       step_size_history, ...
+                 'backtrack_counts',        backtrack_counts, ...
+                 'active_set_changes',      active_set_changes, ...
+                 'csv_header_written',      csv_header_written, ...
+                 'csv_config_written',      csv_config_written);
+
+% close CSV
+if csv_fid~=-1, fclose(csv_fid); end
+
+end
+
+% ---------------- helpers ----------------
+function v = getf(S, name, def)
+    if isfield(S,name) && ~isempty(S.(name)), v = S.(name); else, v = def; end
+end
+function S = set_defaults(S, D)
+    ff = fieldnames(D);
+    for i=1:numel(ff)
+        k = ff{i};
+        if ~isfield(S,k) || isempty(S.(k)), S.(k) = D.(k); end
+    end
+end
+function gn = aggregate_grad_norm_(Gcells)
+    s = 0;
+    for i=1:numel(Gcells), Gi = Gcells{i}; s = s + sum(abs(Gi(:)).^2); end
+    gn = sqrt(s);
+end
+
+function C = coerce_cov_cell_local(X, F_hint)
+    if isa(X,'cell'), C = X(:); return; end
+    if isnumeric(X) && ndims(X)==3 && size(X,1)==size(X,2)
+        F = size(X,3); C = cell(F,1); for f=1:F, C{f}=X(:,:,f); end; return;
+    end
+    if isnumeric(X) && ismatrix(X) && size(X,1)==size(X,2)
+        F = F_hint; C = repmat({X}, F, 1); return;
+    end
+    error('coerce_cov_cell_local:unsupported','Expect cell{F,1} | p×p×F | single p×p.');
+end
+
+% --------- live plot subroutines ---------
+function S = init_live_plot_(F, n, viz, GT_cells)
+    % Create tiled layout figure
+    S = struct();
+    S.fig = figure('Name','Module5 Live','NumberTitle','off'); clf(S.fig);
+    S.tlo = tiledlayout(S.fig,2,3,'TileSpacing','compact','Padding','compact');
+
+    % Axes
+    S.ax_conv   = nexttile(S.tlo,1);
+    S.ax_comps  = nexttile(S.tlo,2);
+    S.ax_legend = nexttile(S.tlo,3); axis(S.ax_legend,'off');
+
+    S.ax_gt     = nexttile(S.tlo,4);
+    S.ax_est    = nexttile(S.tlo,5);
+    S.ax_diff   = nexttile(S.tlo,6);
+
+    % Static titles
+    title(S.ax_conv,  'Convergence');
+    title(S.ax_comps, 'Objective components');
+    title(S.ax_gt,    'GT (whitened/source-as-is)');
+    title(S.ax_est,   'Estimate \Gamma (live)');
+    title(S.ax_diff,  '|Est| - |GT|');
+
+    % Legend panel
+    axes(S.ax_legend); cla(S.ax_legend);
+    txt = {sprintf('F=%d, f_{view}=%d', F, viz.f_view), ...
+           sprintf('value_mode=%s', viz.value_mode), ...
+           datestr(now)};
+    text(0.0,1.0,strjoin(txt, '\n'),'Units','normalized','VerticalAlignment','top');
+
+    % Initialize images
+    S.im_gt   = imagesc(S.ax_gt, zeros(n)); colorbar(S.ax_gt); axis(S.ax_gt,'square');
+    S.im_est  = imagesc(S.ax_est, zeros(n)); colorbar(S.ax_est); axis(S.ax_est,'square');
+    S.im_diff = imagesc(S.ax_diff, zeros(n)); colorbar(S.ax_diff); axis(S.ax_diff,'square');
+
+    % Cache GT for color scaling (if provided)
+    S.GT_cache = [];
+    if ~isempty(GT_cells), S.GT_cache = GT_cells; end
+end
+
+function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
+    loglik_val, smooth_val, l1_val, spatial_val, G_view, GT_view, value_mode)
+
+    % --- (1) Convergence ---
+    axes(S.ax_conv); cla(S.ax_conv); hold(S.ax_conv,'on');
+    yyaxis(S.ax_conv,'left');
+    base = min(obj_hist(1:it));
+    semilogy(S.ax_conv, max(obj_hist(1:it)-base, eps), '-o','MarkerSize',3);
+    ylabel(S.ax_conv,'Objective (shifted, log)');
+    yyaxis(S.ax_conv,'right');
+    semilogy(S.ax_conv, max(grad_hist(1:it), eps), '-s','MarkerSize',3);
+    ylabel(S.ax_conv,'||grad||_F (log)');
+    xlabel(S.ax_conv,'iter'); grid(S.ax_conv,'on');
+
+    % --- (2) Components ---
+    axes(S.ax_comps); cla(S.ax_comps); hold(S.ax_comps,'on');
+    plot(S.ax_comps, 1:it, repmat(loglik_val,1,it), '-', 'DisplayName','loglik');      % last-val trace
+    plot(S.ax_comps, 1:it, repmat(smooth_val,1,it), '-', 'DisplayName','smooth');
+    plot(S.ax_comps, 1:it, repmat(l1_val,1,it),     '-', 'DisplayName','l1');
+    plot(S.ax_comps, 1:it, repmat(spatial_val,1,it),'-', 'DisplayName','spatial');
+    legend(S.ax_comps,'Location','northeast'); grid(S.ax_comps,'on');
+    xlabel(S.ax_comps,'iter'); ylabel(S.ax_comps,'value');
+
+    % --- (3) Heatmaps ---
+    switch lower(string(value_mode))
+        case "abs",   V = abs(G_view);
+        case "real",  V = real(G_view);
+        case "imag",  V = imag(G_view);
+        otherwise,    V = abs(G_view);
+    end
+    set(S.im_est,  'CData', V);
+    if ~isempty(GT_view)
+        switch lower(string(value_mode))
+            case "abs",   GTV = abs(GT_view);
+            case "real",  GTV = real(GT_view);
+            case "imag",  GTV = imag(GT_view);
+            otherwise,    GTV = abs(GT_view);
+        end
+        set(S.im_gt,   'CData', GTV);
+        set(S.im_diff, 'CData', abs(V) - abs(GTV));
+        title(S.ax_gt, 'GT (whitened/source-as-is)');
+    else
+        set(S.im_gt,   'CData', zeros(size(V)));
+        set(S.im_diff, 'CData', zeros(size(V)));
+        title(S.ax_gt, 'GT (N/A)');
+    end
+    drawnow limitrate;
 end

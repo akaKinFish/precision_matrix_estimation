@@ -1,389 +1,286 @@
 function gradient_results = module4_objective_gradient_main(input_data, gradient_params)
-% MODULE4_OBJECTIVE_GRADIENT_MAIN - Compute smooth part gradient for sparse precision estimation
+% MODULE4_OBJECTIVE_GRADIENT_MAIN
+% Compute the gradient of the smooth part of the objective for {Gamma_f}:
+%   -logdet(Gamma_f) + trace(Sigma_f * Gamma_f)
+% plus cross-frequency smoothing and (optional) single-frequency spatial smoothing.
 %
-% Syntax:
-%   gradient_results = module4_objective_gradient_main(input_data, gradient_params)
+% Inputs:
+%   input_data (struct) with required fields:
+%       .precision_matrices    (cell{F,1})  Gamma_f
+%       .whitened_covariances  (cell{F,1})  Sigma_f
+%       .smoothing_kernel      (F x F)      K
+%       .weight_matrix         (p x p)      W^Gamma
 %
-% Description:
-%   Computes the gradient of the smooth part of the objective function for 
-%   the sparse precision matrix estimation problem. Handles log-determinant,
-%   trace, and cross-frequency smoothing terms with proper Hermitian symmetry.
-%   
-%   The smooth objective is:
-%   f = Σ_ω[-log det(Γ_ω) + tr(Σ_ω Γ_ω)] + λ₁Σ_{ω,ω'} k_{ω,ω'} ||Γ_ω - Γ_{ω'}||²_{W^Γ}
-%   
-%   Gradient:
-%   G_ω = -Γ_ω⁻¹ + Σ_ω + 2λ₁Σ_{ω'} k_{ω,ω'} W^Γ(Γ_ω - Γ_{ω'})
+%   gradient_params (struct) optional fields:
+%       % existing:
+%       .lambda1                     double (>=0), cross-frequency smooth weight
+%       .weight_mode                 'matrix'|'hadamard' (default: 'matrix')
+%       .use_graph_laplacian         logical
+%       .chol_tolerance              double (default: 1e-12)
+%       .symmetrization_tolerance    double (default: 1e-12)
+%       .force_hermitian             logical (default: true)
+%       .verbose                     logical (default: false)
 %
-% Input Arguments:
-%   input_data - (struct) Required fields:
-%     .precision_matrices         - (cell array, Fx1) Current precision estimates Γ_ω
-%     .whitened_covariances      - (cell array, Fx1) Whitened covariances Σ_ω
-%     .smoothing_kernel          - (double array, FxF) Kernel matrix k_{ω,ω'}
-%     .weight_matrix             - (double array, pxp) Weight matrix W^Γ
+%       % NEW (spatial single-frequency smoothing):
+%       .lambda3                     double (>=0, default: 0 -> disabled)
+%       .spatial_graph_matrix        (p x p) adjacency/Laplacian for spatial term
+%       .spatial_graph_is_laplacian  logical (default: false)
+%       .spatial_weight_mode         'node'|'hadamard' (default: 'node')
 %
-%   gradient_params - (struct) Optional parameters:
-%     .lambda1                   - (double) Smoothing parameter (default: 0.01)
-%     .penalize_diagonal         - (logical) Include diagonal in L1 penalty (default: false)
-%     .use_graph_laplacian       - (logical) Use Laplacian method for smoothing (default: true)
-%     .chol_tolerance            - (double) Tolerance for Cholesky decomposition (default: 1e-12)
-%     .symmetrization_tolerance  - (double) Tolerance for Hermitian check (default: 1e-10)
-%     .force_hermitian           - (logical) Force Hermitian symmetry (default: true)
-%     .verbose                   - (logical) Display computation progress (default: false)
+% Outputs:
+%   gradient_results (struct)
+%       .smooth_gradients    (cell{F,1}) gradients d/dGamma_f of smooth objective
+%       .gradient_components (struct)    diagnostics:
+%           .logdet_gradients
+%           .trace_gradients
+%           .smoothing_gradients     (cross-frequency)
+%           .spatial_gradients       (NEW, present only if lambda3>0)
+%       .computation_stats  (struct)     timing, validation flags
+%       .success            (logical)
 %
-% Output Arguments:
-%   gradient_results - (struct) Contains:
-%     .smooth_gradients          - (cell array, Fx1) Gradient matrices G_ω
-%     .gradient_components       - (struct) Individual gradient components
-%       .logdet_gradients        - (cell array, Fx1) Log-determinant gradients
-%       .trace_gradients         - (cell array, Fx1) Trace gradients  
-%       .smoothing_gradients     - (cell array, Fx1) Smoothing gradients
-%     .computation_stats         - (struct) Computation statistics
-%     .hermitian_violations      - (double array, Fx1) Hermitian symmetry errors
-%     .success                   - (logical) Overall success indicator
-%
-% Examples:
-%   % Basic usage
-%   input_data.precision_matrices = gamma_estimates;
-%   input_data.whitened_covariances = sigma_whitened;  
-%   input_data.smoothing_kernel = kernel_matrix;
-%   input_data.weight_matrix = weight_matrix;
-%   results = module4_objective_gradient_main(input_data, struct());
-%   
-%   % Advanced usage with custom parameters
-%   params.lambda1 = 0.05;
-%   params.use_graph_laplacian = false;
-%   params.verbose = true;
-%   results = module4_objective_gradient_main(input_data, params);
-%
-% Mathematical Background:
-%   This function computes only the smooth (differentiable) part of the objective.
-%   The non-smooth L1 penalty is handled separately via proximal operators.
-%   
-%   For Hermitian matrices in complex domain, gradients are computed with respect
-%   to the Frobenius inner product ⟨A,B⟩ = Re(tr(A^H B)).
-%
-% See also: MODULE4_OBJECTIVE_EVALUATION, MODULE4_LOG_DET_GRADIENT,
-%           MODULE4_TRACE_GRADIENT, MODULE4_SMOOTHING_GRADIENT
-%
-% Author: [Your Name]
-% Date: [Current Date]
-% Version: 1.0
+% Notes:
+%   - Non-smooth L1 (lambda2) is handled via proximal operator in Module 5.
+%   - Gradients are symmetrized to be Hermitian-consistent.
 
-% ==================== Input Validation ====================
+% ==================== Defaults & guards ====================
 if nargin < 1
     error('module4_objective_gradient_main:insufficient_input', ...
           'At least input_data is required');
 end
+if nargin < 2, gradient_params = struct(); end
 
-if nargin < 2
-    gradient_params = struct();
-end
-
-% Validate input_data structure
-required_fields = {'precision_matrices', 'whitened_covariances', 'smoothing_kernel', 'weight_matrix'};
-for i = 1:length(required_fields)
-    if ~isfield(input_data, required_fields{i})
+% Required input fields
+req_fields = {'precision_matrices','whitened_covariances','smoothing_kernel','weight_matrix'};
+for i = 1:numel(req_fields)
+    if ~isfield(input_data, req_fields{i})
         error('module4_objective_gradient_main:missing_field', ...
-              'Required field "%s" not found in input_data', required_fields{i});
+              'Required field "%s" not found in input_data', req_fields{i});
     end
 end
 
-% Extract and validate precision matrices
+% Extract
 Gammas = input_data.precision_matrices;
 if ~iscell(Gammas) || isempty(Gammas)
     error('module4_objective_gradient_main:invalid_precision', ...
           'precision_matrices must be a non-empty cell array');
 end
+F = numel(Gammas);
+p = size(Gammas{1},1);
 
-F = length(Gammas);  % Number of frequencies
-p = size(Gammas{1}, 1);  % Number of nodes
-
-% Validate matrix dimensions and properties
+% Validate Gamma
 for f = 1:F
     if ~isnumeric(Gammas{f}) || ~ismatrix(Gammas{f})
         error('module4_objective_gradient_main:invalid_matrix_type', ...
               'precision_matrices{%d} must be a numeric matrix', f);
     end
-    
-    if ~isequal(size(Gammas{f}), [p, p])
+    if ~isequal(size(Gammas{f}), [p,p])
         error('module4_objective_gradient_main:dimension_mismatch', ...
-              'precision_matrices{%d} must be %dx%d, got %dx%d', ...
-              f, p, p, size(Gammas{f}, 1), size(Gammas{f}, 2));
+              'precision_matrices{%d} must be %dx%d', f, p, p);
     end
-    
-    % Check positive definiteness via Cholesky
-    [~, chol_flag] = chol(Gammas{f});
-    if chol_flag ~= 0
+    [~, cf] = chol((Gammas{f}+Gammas{f}')/2);
+    if cf ~= 0
         error('module4_objective_gradient_main:not_positive_definite', ...
               'precision_matrices{%d} is not positive definite', f);
     end
 end
 
-% Validate whitened covariances
+% Covariances
 Sigmas = input_data.whitened_covariances;
-if ~iscell(Sigmas) || length(Sigmas) ~= F
+if ~iscell(Sigmas) || numel(Sigmas) ~= F
     error('module4_objective_gradient_main:invalid_covariances', ...
           'whitened_covariances must be a cell array of length %d', F);
 end
-
 for f = 1:F
-    if ~isnumeric(Sigmas{f}) || ~isequal(size(Sigmas{f}), [p, p])
+    if ~isnumeric(Sigmas{f}) || ~isequal(size(Sigmas{f}), [p,p])
         error('module4_objective_gradient_main:covariance_dimension_mismatch', ...
               'whitened_covariances{%d} must be %dx%d', f, p, p);
     end
 end
 
-% Validate smoothing kernel
+% Smoothing kernel K (F x F)
 K = input_data.smoothing_kernel;
-if ~isnumeric(K) || ~isequal(size(K), [F, F])
+if ~isnumeric(K) || ~isequal(size(K), [F,F])
     error('module4_objective_gradient_main:invalid_kernel', ...
           'smoothing_kernel must be a %dx%d numeric matrix', F, F);
 end
-
-% Check kernel symmetry
-if norm(K - K', 'fro') > 1e-12
+if norm(K - K','fro') > 1e-12
     warning('module4_objective_gradient_main:kernel_not_symmetric', ...
-            'smoothing_kernel is not symmetric (error: %.2e)', norm(K - K', 'fro'));
-    K = (K + K') / 2;  % Symmetrize
+            'smoothing_kernel not symmetric; symmetrizing');
+    K = (K + K')/2;
 end
 
-% Validate weight matrix
+% Weight matrix for cross-frequency smoothing (p x p)
 Wg = input_data.weight_matrix;
 
-weight_mode = 'matrix';
-if isfield(gradient_params,'weight_mode') && ~isempty(gradient_params.weight_mode)
-    weight_mode = lower(gradient_params.weight_mode);
-end
+% ------------ Read legacy/general params ------------
+lambda1      = getf(gradient_params,'lambda1',0);         % cross-frequency
+weight_mode  = lower(getf(gradient_params,'weight_mode','matrix')); % 'matrix'|'hadamard'
+use_L        = getf(gradient_params,'use_graph_laplacian',false);
+chol_tol     = getf(gradient_params,'chol_tolerance',1e-12); %#ok<NASGU>
+sym_tol      = getf(gradient_params,'symmetrization_tolerance',1e-12);
+force_H      = getf(gradient_params,'force_hermitian',true);
+verbose      = getf(gradient_params,'verbose',false); %#ok<NASGU>
 
-if ~isnumeric(Wg) || ~isequal(size(Wg), [p, p])
+% Validate Wg under selected weight_mode
+if ~isnumeric(Wg) || ~isequal(size(Wg), [p,p])
     error('module4_objective_gradient_main:invalid_weight_matrix', ...
           'weight_matrix must be a %dx%d numeric matrix', p, p);
 end
-
-% 保证实对称（两种模式都做）
-if norm(Wg - Wg', 'fro') > 1e-12
+if norm(Wg - Wg','fro') > 1e-12
     warning('module4_objective_gradient_main:weight_not_hermitian', ...
-            'weight_matrix is not Hermitian (error: %.2e)', norm(Wg - Wg', 'fro'));
-    Wg = (Wg + Wg') / 2;
+            'weight_matrix not Hermitian; symmetrizing');
+    Wg = (Wg + Wg')/2;
 end
-
 switch weight_mode
     case 'matrix'
-        % 旧语义：要求 PSD
-        min_eig_W = min(real(eig(Wg)));
-        if min_eig_W < -1e-12
+        minEigW = min(real(eig((Wg+Wg')/2)));
+        if minEigW < -1e-12
             error('module4_objective_gradient_main:weight_not_psd', ...
-                  'weight_matrix is not positive semi-definite (min eigenvalue: %.2e)', min_eig_W);
+                  'weight_matrix not PSD (min eig %.2e)', minEigW);
         end
     case 'hadamard'
-        % 新语义：W 是逐元素 mask；可非 PSD，但通常要求非负
         if any(~isfinite(Wg(:))) || ~isreal(Wg)
             error('module4_objective_gradient_main:weight_mask_invalid', ...
-                  'Hadamard weight/mask must be real finite.');
+                  'Hadamard weight/mask must be real and finite.');
         end
-        % 可选：自动清零对角（如你要"不惩罚对角"）
-        % Wg(1:p+1:end) = 0;
     otherwise
         error('module4_objective_gradient_main:invalid_weight_mode', ...
-              'weight_mode must be matrix|hadamard.');
+              'weight_mode must be matrix|hadamard');
 end
 
-if ~isnumeric(Wg) || ~isequal(size(Wg), [p, p])
-    error('module4_objective_gradient_main:invalid_weight_matrix', ...
-          'weight_matrix must be a %dx%d numeric matrix', p, p);
-end
+% ------------ NEW spatial smoothing params ------------
+lambda3      = getf(gradient_params,'lambda3',0);
+Gsp          = getf(gradient_params,'spatial_graph_matrix',[]);
+isLap        = getf(gradient_params,'spatial_graph_is_laplacian',false);
+sp_mode      = lower(getf(gradient_params,'spatial_weight_mode','node')); % 'node'|'hadamard'
+use_spatial  = ~isempty(lambda3) && lambda3 > 0;
 
-% Check weight matrix is Hermitian PSD
-if norm(Wg - Wg', 'fro') > 1e-12
-    warning('module4_objective_gradient_main:weight_not_hermitian', ...
-            'weight_matrix is not Hermitian (error: %.2e)', norm(Wg - Wg', 'fro'));
-    Wg = (Wg + Wg') / 2;  % Force Hermitian
-end
-
-
-
-% ==================== Parameter Setup ====================
-defaults = struct();
-defaults.lambda1 = 0.01;
-defaults.penalize_diagonal = false;
-defaults.use_graph_laplacian = true;
-defaults.chol_tolerance = 1e-12;
-defaults.symmetrization_tolerance = 1e-10;
-defaults.force_hermitian = true;
-defaults.verbose = false;
-defaults.weight_mode = 'matrix';  % 'matrix' | 'hadamard' 
-
-
-field_names = fieldnames(defaults);
-for i = 1:numel(field_names)
-    fname = field_names{i};
-    if ~isfield(gradient_params, fname)
-        gradient_params.(fname) = defaults.(fname);
+if use_spatial
+    if isempty(Gsp) || ~isnumeric(Gsp) || ~isequal(size(Gsp), [p,p])
+        error('module4_objective_gradient_main:invalid_spatial_graph', ...
+              'spatial_graph_matrix must be a %dx%d numeric matrix when lambda3>0', p, p);
+    end
+    if norm(Gsp - Gsp','fro') > 1e-12
+        warning('module4_objective_gradient_main:spatial_graph_not_symmetric', ...
+                'spatial_graph_matrix not symmetric; symmetrizing');
+        Gsp = (Gsp + Gsp')/2;
     end
 end
 
-% Validate parameters
-if gradient_params.lambda1 < 0
-    error('module4_objective_gradient_main:invalid_lambda1', ...
-          'lambda1 must be non-negative, got %.6f', gradient_params.lambda1);
+% ==================== Allocate ====================
+logdet_grads    = cell(F,1);
+trace_grads     = cell(F,1);
+smooth_grads    = cell(F,1);   % cross-frequency
+spatial_grads   = [];          % optional
+total_tic = tic; %#ok<NASGU>
+
+% ==================== Per-frequency basic terms ====================
+t1 = tic;
+for f = 1:F
+    Gf = Gammas{f};
+    Gf = (Gf+Gf')/2;  %#ok<NASGU>
+    logdet_grads{f} = -inv(Gf);   % -∂logdet/∂G = -G^{-1}
 end
+t_logdet = toc(t1);
 
-if gradient_params.chol_tolerance <= 0
-    error('module4_objective_gradient_main:invalid_chol_tolerance', ...
-          'chol_tolerance must be positive, got %.2e', gradient_params.chol_tolerance);
+t2 = tic;
+for f = 1:F
+    trace_grads{f} = (Sigmas{f}+Sigmas{f}')/2;  % ∂tr(SG)/∂G = S
 end
+t_trace = toc(t2);
 
-% ==================== Initialize Results Structure ====================
-gradient_results = struct();
-gradient_results.smooth_gradients = cell(F, 1);
-gradient_results.gradient_components = struct();
-gradient_results.gradient_components.logdet_gradients = cell(F, 1);
-gradient_results.gradient_components.trace_gradients = cell(F, 1);
-gradient_results.gradient_components.smoothing_gradients = cell(F, 1);
-gradient_results.computation_stats = struct();
-gradient_results.hermitian_violations = zeros(F, 1);
-gradient_results.success = false;
+% ==================== Cross-frequency smoothing ====================
+t3 = tic;
+if lambda1 > 0
+    try
+% function [smoothing_gradients, computation_stats] = module4_smoothing_gradient(precision_matrices, kernel_matrix, weight_matrix, params)
+par = struct('lambda1', lambda1,...
+    'mode', weight_mode);
+        smooth_grads = module4_smoothing_gradient( ...
+            Gammas, K, Wg, par);
+    catch ME
+        error('module4_objective_gradient_main:smoothing_failed', ...
+              'Cross-frequency smoothing gradient failed: %s', ME.message);
+    end
+else
+    for f = 1:F, smooth_grads{f} = zeros(p,p); end
+end
+t_smooth = toc(t3);
 
-% Initialize computation statistics
-stats = struct();
-stats.computation_times = zeros(1, 4);  % [logdet, trace, smoothing, total]
-stats.method_used = gradient_params.use_graph_laplacian;
-stats.lambda1_used = gradient_params.lambda1;
-stats.hermitian_enforcement_count = 0;
-stats.cholesky_failures = 0;
+% ==================== NEW: Spatial single-frequency smoothing ====================
+t_spatial = 0;
+if use_spatial
+    t4 = tic;
+    try
+        sp_opts = struct( ...
+            'lambda3',                  lambda3, ...
+            'spatial_graph_matrix',     Gsp, ...
+            'spatial_graph_is_laplacian', isLap, ...
+            'spatial_weight_mode',      sp_mode, ...
+            'return_gradient',          true, ...
+            'validate_inputs',          true, ...
+            'enforce_hermitian_grad',   force_H);
+        sp_out = module5_spatial_smoothing_singlefreq(Gammas, sp_opts);
+    catch ME
+        error('module4_objective_gradient_main:spatial_failed', ...
+              'Spatial smoothing gradient failed: %s', ME.message);
+    end
+    t_spatial = toc(t4);
 
-total_tic = tic;
-
-if gradient_params.verbose
-    fprintf('=== Module 4: Objective Gradient Computation ===\n');
-    fprintf('Processing %d frequencies, %d nodes\n', F, p);
-    if gradient_params.use_graph_laplacian
-        method_str = 'Laplacian';
+    if isfield(sp_out,'grad')
+        spatial_grads = sp_out.grad;
+    elseif isfield(sp_out,'gradients')
+        spatial_grads = sp_out.gradients;
     else
-        method_str = 'Direct';
+        error('module4_objective_gradient_main:spatial_missing_grad', ...
+              'module5_spatial_smoothing_singlefreq did not return gradients.');
     end
-    fprintf('Lambda1: %.6f | Method: %s\n', gradient_params.lambda1, method_str);
-    fprintf('--------------------------------------------\n');
+
+    if ~iscell(spatial_grads) || numel(spatial_grads) ~= F
+        error('module4_objective_gradient_main:spatial_bad_shape', ...
+              'Spatial gradients must be a cell array of length F.');
+    end
 end
 
-try
-    % ==================== Compute Log-Determinant Gradients ====================
-    if gradient_params.verbose, fprintf('Computing log-determinant gradients... '); end
-    logdet_tic = tic;
-    
-    [logdet_grads, logdet_stats] = module4_log_det_gradient(Gammas, gradient_params);
-    gradient_results.gradient_components.logdet_gradients = logdet_grads;
-    
-    stats.computation_times(1) = toc(logdet_tic);
-    stats.cholesky_failures = stats.cholesky_failures + logdet_stats.cholesky_failures;
-    
-    if gradient_params.verbose
-        fprintf('completed (%.3fs)\n', stats.computation_times(1));
-    end
-    
-    % ==================== Compute Trace Gradients ====================
-    if gradient_params.verbose, fprintf('Computing trace gradients... '); end
-    trace_tic = tic;
-    
-    [trace_grads, trace_stats] = module4_trace_gradient(Sigmas, gradient_params);
-    gradient_results.gradient_components.trace_gradients = trace_grads;
-    
-    stats.computation_times(2) = toc(trace_tic);
-    stats.hermitian_enforcement_count = stats.hermitian_enforcement_count + trace_stats.hermitian_enforcement_count;
-    
-    if gradient_params.verbose
-        fprintf('completed (%.3fs)\n', stats.computation_times(2));
-    end
-    
-    % ==================== Compute Smoothing Gradients ====================
-    if gradient_params.verbose, fprintf('Computing smoothing gradients... '); end
-    smoothing_tic = tic;
-    
-    % [smoothing_grads, smoothing_stats] = module4_smoothing_gradient(Gammas, K, Wg, gradient_params);
-    % [smoothing_grads, smoothing_stats] = module4_smoothing_gradient( ...
-    % Gammas, K, Wg, struct('lambda1', gradient_params.lambda1, ...
-    %                       'use_graph_laplacian', gradient_params.use_graph_laplacian, ...
-    %                       'weight_mode', weight_mode));
-    [smoothing_grads, smoothing_stats] = module4_smoothing_gradient( ...
-    Gammas, K, Wg, struct( ...
-        'lambda1', gradient_params.lambda1, ...
-        'use_graph_laplacian', gradient_params.use_graph_laplacian, ...
-        'force_hermitian', false, ...         % 该函数内部最后会做一次
-        'symmetrization_tolerance', gradient_params.symmetrization_tolerance, ...
-        'kernel_zero_tol', 1e-12, ...
-        'weight_mode', gradient_params.weight_mode ...
-    ));
-    gradient_results.gradient_components.smoothing_gradients = smoothing_grads;
-    
-    stats.computation_times(3) = toc(smoothing_tic);
-    
-    if gradient_params.verbose
-        fprintf('completed (%.3fs)\n', stats.computation_times(3));
-    end
-    
-    % ==================== Combine Gradients ====================
-    if gradient_params.verbose, fprintf('Combining gradient components... '); end
-    combine_tic = tic;
-    
-    for f = 1:F
-        % Combine all gradient components
-        G_f = logdet_grads{f} + trace_grads{f} + smoothing_grads{f};
-        
-        % Force Hermitian symmetry if requested
-        if gradient_params.force_hermitian
-            G_f_symmetric = (G_f + G_f') / 2;
-            hermitian_error = norm(G_f - G_f_symmetric, 'fro');
-            gradient_results.hermitian_violations(f) = hermitian_error;
-            
-            if hermitian_error > gradient_params.symmetrization_tolerance
-                stats.hermitian_enforcement_count = stats.hermitian_enforcement_count + 1;
-                if gradient_params.verbose && hermitian_error > 1e-8
-                    fprintf('\n  Warning: Large Hermitian violation at freq %d: %.2e', f, hermitian_error);
-                end
-            end
-            
-            G_f = G_f_symmetric;
+% ==================== Combine & finalize ====================
+t5 = tic;
+total_grads = cell(F,1);
+for f = 1:F
+    Gsum = logdet_grads{f} + trace_grads{f} + smooth_grads{f};
+    if use_spatial, Gsum = Gsum + spatial_grads{f}; end
+    if force_H
+        Gsum = (Gsum + Gsum')/2;
+        if sym_tol > 0
+            Gsum = (abs(Gsum) > sym_tol).*Gsum;
         end
-        
-        gradient_results.smooth_gradients{f} = G_f;
     end
-    
-    stats.computation_times(4) = toc(combine_tic);
-    
-    if gradient_params.verbose
-        fprintf('completed (%.3fs)\n', stats.computation_times(4));
-    end
-    
-    % ==================== Final Statistics ====================
-    stats.total_computation_time = toc(total_tic);
-    stats.max_hermitian_violation = max(gradient_results.hermitian_violations);
-    stats.mean_hermitian_violation = mean(gradient_results.hermitian_violations);
-    
-    gradient_results.computation_stats = stats;
-    gradient_results.success = true;
-    
-    if gradient_params.verbose
-        fprintf('--------------------------------------------\n');
-        fprintf('Module 4 Summary:\n');
-        fprintf('- Total time: %.3fs\n', stats.total_computation_time);
-        fprintf('- Max Hermitian violation: %.2e\n', stats.max_hermitian_violation);
-        fprintf('- Hermitian enforcements: %d\n', stats.hermitian_enforcement_count);
-        fprintf('- Cholesky failures: %d\n', stats.cholesky_failures);
-        fprintf('- Success: YES\n');
-        fprintf('============================================\n');
-    end
-    
-catch ME
-    stats.total_computation_time = toc(total_tic);
-    gradient_results.computation_stats = stats;
-    gradient_results.success = false;
-    
-    if gradient_params.verbose
-        fprintf('\n✗ Module 4 failed: %s\n', ME.message);
-    end
-    
-    rethrow(ME);
+    total_grads{f} = Gsum;
+end
+t_combine = toc(t5);
+
+% ==================== Pack results ====================
+gradient_results = struct();
+gradient_results.smooth_gradients = total_grads;
+
+components = struct();
+components.logdet_gradients    = logdet_grads;
+components.trace_gradients     = trace_grads;
+components.smoothing_gradients = smooth_grads;
+if use_spatial, components.spatial_gradients = spatial_grads; end
+gradient_results.gradient_components = components;
+
+stats = struct();
+stats.computation_times = [t_logdet, t_trace, t_smooth, t_combine];
+if use_spatial, stats.spatial_grad_time = t_spatial; end
+stats.symmetrization_tolerance = sym_tol;
+stats.force_hermitian          = force_H;
+gradient_results.computation_stats = stats;
+
+gradient_results.success = true;
+
+% ==================== helpers ====================
+function v = getf(s, name, defv)
+    if isfield(s, name) && ~isempty(s.(name)), v = s.(name); else, v = defv; end
 end
 
 end
