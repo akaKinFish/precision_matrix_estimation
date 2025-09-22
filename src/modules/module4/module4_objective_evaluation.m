@@ -21,6 +21,12 @@ function [objective_values, computation_stats] = module4_objective_evaluation(in
 %   .allow_eig_fallback     (logical)     default false (diagnostic only)
 %   .verbose                (logical)     default false
 %
+% 新增 options:
+%   .lambda3                     (double, >=0) default 0
+%   .spatial_graph_matrix        (pxp)
+%   .spatial_graph_is_laplacian  (logical) default true
+%   .spatial_weight_mode         ('node'|'hadamard') default 'node'
+
 % Stats fields unified:
 %   computation_time (+ alias total_computation_time),
 %   component_times.logdet/trace/smoothing/l1,
@@ -273,14 +279,39 @@ if evaluation_params.verbose
     fprintf('completed (%.3fs)\n', computation_stats.component_times.l1);
 end
 
+% ==================== Spatial (λ3) single-frequency penalty ====================
+objective_values.spatial_penalty = 0;
+if isfield(evaluation_params,'lambda3') && evaluation_params.lambda3 > 0 && ...
+   isfield(evaluation_params,'spatial_graph_matrix') && ~isempty(evaluation_params.spatial_graph_matrix)
+    try
+        sp_out = module5_spatial_smoothing_singlefreq(Gammas, struct( ...
+            'lambda3', evaluation_params.lambda3, ...
+            'spatial_graph_matrix', evaluation_params.spatial_graph_matrix, ...
+            'spatial_graph_is_laplacian', getfield(evaluation_params,'spatial_graph_is_laplacian',true), ...
+            'spatial_weight_mode', getfield(evaluation_params,'spatial_weight_mode','node'), ...
+            'return_gradient', false, ...
+            'validate_inputs', true, ...
+            'enforce_hermitian_grad', false ...
+        ));
+        objective_values.spatial_penalty = sp_out.term;
+    catch ME
+        warning('module4_objective_evaluation:spatial_eval_failed','%s',ME.message);
+        objective_values.spatial_penalty = 0;
+    end
+end
+
+
+% ==================== Combine ====================
 % ==================== Combine ====================
 objective_values.smooth_objective = ...
     objective_values.logdet_terms + ...
     objective_values.trace_terms + ...
-    objective_values.smoothing_penalty;
+    objective_values.smoothing_penalty + ...
+    objective_values.spatial_penalty;
 
 objective_values.total_objective = ...
     objective_values.smooth_objective + objective_values.l1_penalty;
+
 
 computation_stats.computation_time = toc(t_total);
 % alias for backward compatibility
@@ -292,6 +323,8 @@ if evaluation_params.verbose
     fprintf('  Log-determinant:  %12.6f\n', objective_values.logdet_terms);
     fprintf('  Trace terms:      %12.6f\n', objective_values.trace_terms);
     fprintf('  Smoothing (λ1):   %12.6f\n', objective_values.smoothing_penalty);
+    fprintf('  Spatial (λ3):     %12.6f\n', objective_values.spatial_penalty);
+
     fprintf('  L1 penalty (λ2):  %12.6f\n', objective_values.l1_penalty);
     fprintf('  ────────────────────────────────\n');
     fprintf('  Smooth objective: %12.6f\n', objective_values.smooth_objective);

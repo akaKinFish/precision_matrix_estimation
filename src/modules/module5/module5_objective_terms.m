@@ -106,9 +106,10 @@ if d.lambda2 > 0
     l1_term = d.lambda2 * l1_term;
 end
 
-% ---- 4) (NEW) single-frequency spatial smoothing *diagnostic* term -------
-% Not returned; computed only for logging or external diagnostics.
-spatial_term = 0; %#ok<NASGU>
+
+% ---- 4) (NEW) single-frequency spatial smoothing term -------
+% Write back into aux so callers (prox main) can consume it.
+aux.spatial_term = 0;
 if params.lambda3 > 0 && ~isempty(params.spatial_graph_matrix)
     try
         sp_out = module5_spatial_smoothing_singlefreq(Gamma_cells, struct( ...
@@ -120,14 +121,16 @@ if params.lambda3 > 0 && ~isempty(params.spatial_graph_matrix)
             'validate_inputs', true, ...
             'enforce_hermitian_grad', false ...
         ));
-        spatial_term = sp_out.term; %#ok<NASGU>
-        % assignin('caller','spatial_term_from_objective_terms',spatial_term); % optional
+        aux.spatial_term  = sp_out.term;
+        if isfield(sp_out,'stats'), aux.spatial_stats = sp_out.stats; end
     catch ME
-        warning('module5_objective_terms:spatial_diag_failed', ...
-            'Spatial smoothing diagnostic failed: %s', ME.message);
+        warning('module5_objective_terms:spatial_eval_failed', ...
+            'Spatial smoothing eval failed: %s', ME.message);
+        aux.spatial_term = 0;
     end
 end
 end
+
 
 % --- helpers ---
 function v = getfield_with_default(S, name, dv)
