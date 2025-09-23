@@ -126,12 +126,22 @@ metrics.per_freq = struct( ...
     'kl',kl_risk,'stein',stein_risk);
 metrics.overall  = struct('precision',prec_all,'recall',rec_all,'F1',F1_all);
 
+% % ---- Aggregated PR & ROC over all freqs (upper-tri, truth=nonzero) ----
+% [pr_R, pr_P, aupr] = aggregate_pr_(Omega_true, Omega_est);
+% [roc_FPR, roc_TPR, auroc] = aggregate_roc_(Omega_true, Omega_est);
+% metrics.agg_pr  = struct('recall',pr_R,'precision',pr_P,'aupr',aupr);
+% metrics.agg_roc = struct('fpr',roc_FPR,'tpr',roc_TPR,'auroc',auroc);
 % ---- Aggregated PR & ROC over all freqs (upper-tri, truth=nonzero) ----
-[pr_R, pr_P, aupr] = aggregate_pr_(Omega_true, Omega_est);
-[roc_FPR, roc_TPR, auroc] = aggregate_roc_(Omega_true, Omega_est);
+% NOTE: fix score direction → use negative absolute scores so that larger = more likely edge
+Omega_est_neg = cellfun(@(M) -abs(M), Omega_est, 'uniformoutput', false);
+
+[pr_R, pr_P, aupr] = aggregate_pr_(Omega_true, Omega_est_neg);
+[roc_FPR, roc_TPR, auroc] = aggregate_roc_(Omega_true, Omega_est_neg);
+
 metrics.agg_pr  = struct('recall',pr_R,'precision',pr_P,'aupr',aupr);
 metrics.agg_roc = struct('fpr',roc_FPR,'tpr',roc_TPR,'auroc',auroc);
 
+fprintf('[Curves ] AUPR=%.3f | AUROC=%.3f  (scores negated)\n', aupr, auroc);
 fprintf(['[GT-compare] mode=%s | Overall: P=%.3f  R=%.3f  F1=%.3f | ' ...
          'meanRelFrobMag=%.3f | meanFroUT=%.3f | meanFroOff=%.3f\n'], ...
     opts.mode, prec_all, rec_all, F1_all, mean(rfe_mag), mean(fro_rel_ut), mean(fro_rel_off));

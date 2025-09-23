@@ -202,6 +202,20 @@ params5 = struct( ...
     % 在线可视化（Live）
     params5.diag.live_plot = live_plot_cfg;
 
+    params5.alpha_min              = 1e-4;   % 防止 α 被回溯到数值噪声
+params5.armijo_c1              = 1e-4;   % Armijo 常数
+params5.backtrack_beta         = 0.5;    % 回溯时 α 缩放
+params5.max_backtrack_per_iter = 20;     % 每步最多回溯次数
+
+% 回溯累计触发“优先降 λ2”（退火），避免一直只缩 α
+params5.backtrack_patience     = 10;     % 连续回溯阈值
+params5.lambda2_decay_factor   = 0.9;    % 退火倍率
+params5.lambda2_min            = 0.01 * params5.lambda2;  % 不把 λ2 降到 0
+
+% 是否对角也做 L1（保持和你现在一致：不惩罚对角）
+params5.penalize_diagonal      = false;
+
+
     % 空间平滑
     if lambda3 > 0
         params5.lambda3                    = lambda3;

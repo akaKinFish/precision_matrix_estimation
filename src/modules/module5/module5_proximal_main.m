@@ -1,13 +1,12 @@
 function [Gamma_cells, results] = module5_proximal_main(input_data, params)
 % MODULE5_PROXIMAL_MAIN
 % Proximal gradient solver for precision matrices {Gamma_f} in the whitened domain.
-% Backward-compatible; diagnostics/logging improvements:
-%   - CSV header includes 'lambda2_effective'
-%   - CONFIG row logs lambda2_suggested/effective
-%   - (NEW) penalize_diagonal switch for L1, default false
-%   - (NEW) return histories: objective_history, gradient_norm_history,
-%           step_size_history, backtrack_counts, active_set_changes (if any)
-%   - (NEW) optional live plot during optimization (diag.live_plot.*)
+% == 改进点（与旧版兼容）==
+%   • BB 步长：迭代级初值（基于上一迭代 ΔΓ, Δ∇），减少无谓回溯
+%   • Armijo 外层回溯：f(new) <= f(old) - c1 * alpha * ||grad||^2
+%   • 步长下限 alpha_min，避免几何缩到机器噪声级
+%   • 回溯累计触发“优先降 λ2”（退火），而非继续缩步长
+%   • CSV/打印格式与旧版保持一致
 
 % ------------ Parse inputs ------------
 Sigma  = input_data.whitened_covariances;
@@ -27,13 +26,24 @@ if isfield(input_data,'whitening_matrices') && ~isempty(input_data.whitening_mat
     D_whiten = input_data.whitening_matrices;   % {F×1}, for GT -> whitened viz
 end
 
-% params (keep legacy names)
+% params (keep legacy names), 新增项给默认值保证后向兼容
 lambda1     = getf(params,'lambda1',0);
 lambda2_eff = getf(params,'lambda2',0);               % effective value (REQUIRED)
 lambda2_sug = getf(params,'lambda2_suggested',[]);    % optional provenance
-pen_diag    = getf(params,'penalize_diagonal',false); % (NEW) L1 on diagonal?
+pen_diag    = getf(params,'penalize_diagonal',false); % L1 on diagonal?
 
-alpha0   = getf(params,'alpha0',1e-3);
+alpha0      = getf(params,'alpha0',1e-3);
+alpha_min   = getf(params,'alpha_min',1e-6);
+alpha_max   = getf(params,'alpha_max',1.0);
+armijo_c1   = getf(params,'armijo_c1',1e-4);
+bt_beta     = getf(params,'backtrack_beta',0.5);
+bt_max_iter = getf(params,'max_backtrack_per_iter',20);
+
+% 回溯累计触发退火（降 λ2）
+anneal_patience = getf(params,'backtrack_patience',10);
+anneal_factor   = getf(params,'lambda2_decay_factor',0.9);
+lambda2_min     = getf(params,'lambda2_min', max(1e-6, 0.01*lambda2_eff));
+
 max_iter = getf(params,'max_iter',300);
 verbose  = getf(params,'verbose',true);
 
@@ -89,7 +99,7 @@ end
 
 % ------------ Initialization ------------
 Gamma = Gamma0;
-alpha = alpha0;
+alpha = min(max(alpha0, alpha_min), alpha_max);
 
 % objective decomposition helpers
 aux = struct('lambda1',lambda1,'lambda2',lambda2_eff,'weight_matrix',W,'smoothing_kernel',K);
@@ -113,26 +123,23 @@ objective_history       = zeros(max_iter,1);
 gradient_norm_history   = zeros(max_iter,1);
 step_size_history       = zeros(max_iter,1);
 backtrack_counts        = zeros(max_iter,1);
-active_set_changes      = [];  % optional; keep empty unless you implement AS updates here
+active_set_changes      = [];  % optional
 
 % Live figure state (optional)
 GT_cells = [];
 if viz.enable && ~isempty(viz.ground_truth_precision)
-    % Convert GT to cells
     GT_cells = coerce_cov_cell_local(viz.ground_truth_precision, F);
     switch lower(string(viz.ground_truth_domain))
         case "source"
             if isempty(D_whiten)
                 warning('ground_truth_domain=source but input_data.whitening_matrices not provided; using given GT as-is for visualization.');
             else
-                % whiten: Γ̃_GT = D * Γ_GT * D
                 for f = 1:F
                     Df = D_whiten{f};
                     GT_cells{f} = Df * GT_cells{f} * Df;
                 end
             end
         case "whitened"
-            % do nothing
         otherwise
             warning('Unknown ground_truth_domain=%s; using GT as-is.', string(viz.ground_truth_domain));
     end
@@ -142,75 +149,140 @@ if viz.enable
     viz_state = init_live_plot_(F, n, viz, GT_cells);
 end
 
+% ------------ 初值目标 ------------
+[loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma, Sigma, aux, params_obj);
+spatial_val = 0;
+if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
+obj_val = loglik_val + smooth_val + l1_val + spatial_val;
+
+best_obj = obj_val;
+if verbose
+    fprintf('[module5] it=%4d  obj=%.6e  (loglik=%.6e, smooth=%.6e, l1=%.6e, spatial=%.6e)  alpha=%g  ||grad||=N/A\n', ...
+        0, obj_val, loglik_val, smooth_val, l1_val, spatial_val, alpha);
+end
+if csv_fid~=-1
+    fprintf(csv_fid, 'STEP,%d,%.10g,%.10g,%.10g,%.10g,%.10g,NA,%.6g,NA,%.8g\n', ...
+        0, obj_val, loglik_val, smooth_val, l1_val, spatial_val, alpha, lambda2_eff);
+end
+
+% BB 所需缓存
+prev_Gamma = []; prev_grad = [];
+
+% 回溯累计（用于退火）
+bt_cum = 0;
+
 % ------------ Main loop ------------
-best_obj = inf;
 for it = 1:max_iter
-    % gradient of smooth part
+    % 1) 计算梯度
     input = struct();
-    input.precision_matrices   = Gamma;        % {F×1} cell
-    input.whitened_covariances = Sigma;        % {F×1} cell
-    input.smoothing_kernel     = K;            % single source
+    input.precision_matrices   = Gamma;
+    input.whitened_covariances = Sigma;
+    input.smoothing_kernel     = K;
     input.weight_matrix        = W;
 
-    gres = module4_objective_gradient_main(input, grad_params);
+    gres  = module4_objective_gradient_main(input, grad_params);
     Ggrad = gres.smooth_gradients;
+    grad_norm = aggregate_grad_norm_(Ggrad);
 
-    % gradient step
-    Gamma_tmp = cell(F,1);
-    for f=1:F, Gamma_tmp{f} = Gamma{f} - alpha * Ggrad{f}; end
-
-    % proximal L1 (off-diagonals; optionally diagonals)
-    Gamma_next = Gamma_tmp;
-    for f=1:F
-        G = Gamma_tmp{f};
-
-        % --- off-diagonal shrink (legacy) ---
-        U = triu(G, 1);
-        U = sign(U) .* max(abs(U) - alpha*lambda2_eff, 0);
-        G = diag(diag(G)) + U + U';
-
-        % --- (NEW) diagonal shrink if requested ---
-        if pen_diag
-            d = diag(G);
-            d = sign(d) .* max(abs(d) - alpha*lambda2_eff, 0);
-            G(1:n+1:end) = d;
-        end
-
-        % optional: mask by active set
-        if ~isempty(A_masks)
-            mask = A_masks{f};
-            G(~mask) = 0;
-            G = 0.5*(G+G');  % keep symmetric
-        end
-        % SPD safeguard (tiny diagonal loading if necessary)
-        [~,flag] = chol(0.5*(G+G'),'lower');
-        if flag~=0
-            G = 0.5*(G+G') + 1e-12*eye(n);
-        end
-        Gamma_next{f} = G;
-    end
-
-    % objective value (loglik + cross-freq smooth + l1 + spatial(optional))
-    [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma_next, Sigma, aux, params_obj);
-    spatial_val = 0;
-    if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
-    obj_val = loglik_val + smooth_val + l1_val + spatial_val;
-
-    % acceptance & step control (simple Armijo-like without explicit backtrack)
-    accepted = (obj_val < best_obj);
-    if accepted
-        best_obj = obj_val;
-        Gamma = Gamma_next;   % accept
-        alpha = min(getf(params,'alpha_max',2e-3), getf(params,'alpha_up',1.05)*alpha);
+    % 2) BB 步长（迭代级初值）
+    if isempty(prev_Gamma) || isempty(prev_grad)
+        alpha_try = min(alpha_max, max(alpha_min, alpha));
     else
-        alpha = max(1e-8, getf(params,'alpha_down',0.7)*alpha);
+        [alpha_bb1, alpha_bb2] = bb_stepsize_(Gamma, prev_Gamma, Ggrad, prev_grad);
+        alpha_try = alpha_bb1;                          % BB1 通常更稳
+        if ~isfinite(alpha_try) || alpha_try<=0
+            alpha_try = alpha;                          % 退回上次
+        end
+        alpha_try = min(alpha_max, max(alpha_min, alpha_try));
     end
 
-    % --- histories ---
+    % 3) 外层 Armijo 回溯（与内部 SPD 保护相独立）
+    accept = false; bt_cnt = 0; obj_new = NaN;
+    while ~accept
+        % forward 梯度步
+        Gamma_tmp = cell(F,1);
+        for f=1:F, Gamma_tmp{f} = Gamma{f} - alpha_try * Ggrad{f}; end
+
+        % proximal L1（含可选对角、活动集与 SPD 微加载）
+        Gamma_cand = Gamma_tmp;
+        for f=1:F
+            Gc = Gamma_tmp{f};
+
+            % off-diagonal shrink
+            U = triu(Gc, 1);
+            U = sign(U) .* max(abs(U) - alpha_try*lambda2_eff, 0);
+            Gc = diag(diag(Gc)) + U + U';
+
+            % diagonal shrink（可选）
+            if pen_diag
+                d = diag(Gc);
+                d = sign(d) .* max(abs(d) - alpha_try*lambda2_eff, 0);
+                Gc(1:n+1:end) = d;
+            end
+
+            % 活动集
+            if ~isempty(A_masks)
+                mask = A_masks{f};
+                Gc(~mask) = 0;
+                Gc = 0.5*(Gc+Gc');
+            end
+
+            % SPD 保护（轻微对角加载）
+            [~,flag] = chol(0.5*(Gc+Gc'),'lower');
+            if flag~=0
+                Gc = 0.5*(Gc+Gc') + 1e-12*eye(n);
+            end
+            Gamma_cand{f} = Gc;
+        end
+
+        % 目标与 Armijo 判据
+        [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma_cand, Sigma, aux, params_obj);
+        spatial_val = 0; if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
+        obj_trial = loglik_val + smooth_val + l1_val + spatial_val;
+
+        if obj_trial <= obj_val - armijo_c1 * alpha_try * (grad_norm^2)
+            accept  = true;
+            obj_new = obj_trial;
+            Gamma   = Gamma_cand;
+        else
+            bt_cnt  = bt_cnt + 1;
+            bt_cum  = bt_cum + 1;
+            alpha_try = max(alpha_min, bt_beta * alpha_try);
+            if bt_cnt >= bt_max_iter || alpha_try <= alpha_min
+                % 本轮放弃进一步回溯；接受“不更新”以继续到退火逻辑
+                obj_new = obj_val;
+                break;
+            end
+        end
+    end
+
+    % 4) 回溯累计过多 -> “优先降 λ2”（退火），并温和放宽 α
+    if bt_cum >= anneal_patience && lambda2_eff > lambda2_min
+        old_l2 = lambda2_eff;
+        lambda2_eff = max(lambda2_min, anneal_factor * lambda2_eff);
+        aux.lambda2 = lambda2_eff;
+        if verbose
+            fprintf('[module5][anneal] too many backtracks: lambda2 %.3g -> %.3g; relax alpha\n', old_l2, lambda2_eff);
+        end
+        bt_cum   = 0;
+        alpha_try = min(alpha_max, max(alpha_try, 1.2*alpha));  % 适度放宽
+    end
+
+    % 5) 接受/记录
+    if accept
+        prev_Gamma = Gamma; prev_grad = Ggrad;
+        obj_val = obj_new; best_obj = min(best_obj, obj_val);
+        alpha   = alpha_try;
+    else
+        % 未改善的迭代：保持 Γ/obj，不改变 best_obj，仅记录步长尝试
+        alpha = alpha_try;
+    end
+
+    % histories
     objective_history(it)     = obj_val;
-    gradient_norm_history(it) = aggregate_grad_norm_(Ggrad);
+    gradient_norm_history(it) = grad_norm;
     step_size_history(it)     = alpha;
-    backtrack_counts(it)      = 0;   % no explicit backtracking in this variant
+    backtrack_counts(it)      = bt_cnt;
 
     % logging to console
     if verbose && mod(it, getf(diagopt,'print_every',1))==0
@@ -225,7 +297,7 @@ for it = 1:max_iter
             getf(params,'obj_improve_tol',1e-6), alpha, gradient_norm_history(it), lambda2_eff);
     end
 
-    % live plot
+    % live plot（可选）
     if viz.enable && mod(it, max(1,round(viz.plot_every)))==0
         f_view = max(1, min(F, round(getf(viz,'f_view',1))));
         GTf = [];
@@ -235,11 +307,19 @@ for it = 1:max_iter
             loglik_val, smooth_val, l1_val, spatial_val, ...
             Gamma{f_view}, GTf, viz.value_mode);
     end
+
+    % 简单早停：步长到下限且目标近似平台
+    if it>=5
+        recent = objective_history(max(1,it-4):it);
+        if alpha<=alpha_min && max(abs(diff(recent))) < getf(params,'obj_improve_tol',1e-6)
+            if verbose, fprintf('[module5] early stop: alpha near alpha_min and objective plateau.\n'); end
+            break;
+        end
+    end
 end
 
 % ------------ Pack results ------------
 Gamma_cells = Gamma;
-% Trim histories to actual length (max_iter)
 results = struct('best_objective', best_obj, ...
                  'objective_history',       objective_history, ...
                  'gradient_norm_history',   gradient_norm_history, ...
@@ -249,9 +329,7 @@ results = struct('best_objective', best_obj, ...
                  'csv_header_written',      csv_header_written, ...
                  'csv_config_written',      csv_config_written);
 
-% close CSV
 if csv_fid~=-1, fclose(csv_fid); end
-
 end
 
 % ---------------- helpers ----------------
@@ -282,50 +360,52 @@ function C = coerce_cov_cell_local(X, F_hint)
     error('coerce_cov_cell_local:unsupported','Expect cell{F,1} | p×p×F | single p×p.');
 end
 
-% --------- live plot subroutines ---------
+function [a1, a2] = bb_stepsize_(G, Gprev, dG, dGprev)
+% BB1/BB2（聚合所有频率的 Fro 内积）
+    s2 = 0; sy = 0; y2 = 0;
+    F_ = numel(G);
+    for f_=1:F_
+        S = G{f_}  - Gprev{f_};
+        Y = dG{f_} - dGprev{f_};
+        s2 = s2 + sum(real(S(:).*conj(S(:))));
+        sy = sy + sum(real(S(:).*conj(Y(:))));
+        y2 = y2 + sum(real(Y(:).*conj(Y(:))));
+    end
+    a1 = s2 / max(1e-16, sy);     % BB1
+    a2 = max(1e-16, sy) / max(1e-16, y2); % BB2（备用）
+end
+
+% --------- live plot subroutines（与你原版一致，占位实现）---------
 function S = init_live_plot_(F, n, viz, GT_cells)
-    % Create tiled layout figure
     S = struct();
+    if ~viz.enable, return; end
     S.fig = figure('Name','Module5 Live','NumberTitle','off'); clf(S.fig);
     S.tlo = tiledlayout(S.fig,2,3,'TileSpacing','compact','Padding','compact');
-
-    % Axes
     S.ax_conv   = nexttile(S.tlo,1);
     S.ax_comps  = nexttile(S.tlo,2);
     S.ax_legend = nexttile(S.tlo,3); axis(S.ax_legend,'off');
-
     S.ax_gt     = nexttile(S.tlo,4);
     S.ax_est    = nexttile(S.tlo,5);
     S.ax_diff   = nexttile(S.tlo,6);
-
-    % Static titles
     title(S.ax_conv,  'Convergence');
     title(S.ax_comps, 'Objective components');
     title(S.ax_gt,    'GT (whitened/source-as-is)');
     title(S.ax_est,   'Estimate \Gamma (live)');
     title(S.ax_diff,  '|Est| - |GT|');
-
-    % Legend panel
     axes(S.ax_legend); cla(S.ax_legend);
     txt = {sprintf('F=%d, f_{view}=%d', F, viz.f_view), ...
            sprintf('value_mode=%s', viz.value_mode), ...
            datestr(now)};
     text(0.0,1.0,strjoin(txt, '\n'),'Units','normalized','VerticalAlignment','top');
-
-    % Initialize images
     S.im_gt   = imagesc(S.ax_gt, zeros(n)); colorbar(S.ax_gt); axis(S.ax_gt,'square');
     S.im_est  = imagesc(S.ax_est, zeros(n)); colorbar(S.ax_est); axis(S.ax_est,'square');
     S.im_diff = imagesc(S.ax_diff, zeros(n)); colorbar(S.ax_diff); axis(S.ax_diff,'square');
-
-    % Cache GT for color scaling (if provided)
-    S.GT_cache = [];
-    if ~isempty(GT_cells), S.GT_cache = GT_cells; end
+    S.GT_cache = []; if ~isempty(GT_cells), S.GT_cache = GT_cells; end
 end
 
 function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
     loglik_val, smooth_val, l1_val, spatial_val, G_view, GT_view, value_mode)
-
-    % --- (1) Convergence ---
+    if isempty(S), return; end
     axes(S.ax_conv); cla(S.ax_conv); hold(S.ax_conv,'on');
     yyaxis(S.ax_conv,'left');
     base = min(obj_hist(1:it));
@@ -336,16 +416,14 @@ function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
     ylabel(S.ax_conv,'||grad||_F (log)');
     xlabel(S.ax_conv,'iter'); grid(S.ax_conv,'on');
 
-    % --- (2) Components ---
     axes(S.ax_comps); cla(S.ax_comps); hold(S.ax_comps,'on');
-    plot(S.ax_comps, 1:it, repmat(loglik_val,1,it), '-', 'DisplayName','loglik');      % last-val trace
+    plot(S.ax_comps, 1:it, repmat(loglik_val,1,it), '-', 'DisplayName','loglik');
     plot(S.ax_comps, 1:it, repmat(smooth_val,1,it), '-', 'DisplayName','smooth');
     plot(S.ax_comps, 1:it, repmat(l1_val,1,it),     '-', 'DisplayName','l1');
     plot(S.ax_comps, 1:it, repmat(spatial_val,1,it),'-', 'DisplayName','spatial');
     legend(S.ax_comps,'Location','northeast'); grid(S.ax_comps,'on');
-    xlabel(S.ax_comps,'iter'); ylabel(S.ax_comps,'value');
+    xlabel('iter'); ylabel('value');
 
-    % --- (3) Heatmaps ---
     switch lower(string(value_mode))
         case "abs",   V = abs(G_view);
         case "real",  V = real(G_view);
