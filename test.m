@@ -38,13 +38,14 @@ opts_el    = struct('maxit', 50, 'tol', 1e-6, 'verbose', false);
 warm = eloreta_warmstart_from_covs(emp_cov_cell, L, gamma_grid, opts_el);
 
 % 作为 M-step 的 warm start：上一轮源域精度 Ω_prev
-Omega_prev = warm.Omega_init;                     % {F×1}, 每个 n×n
+Omega_prev = warm.Omega_init;                 % {F×1}, 每个 n×n
 
 % （可选）也把 eLORETA 的源协方差作为上一轮二阶矩，便于 ΔS 统计更稳定
 Sjj_prev   = warm.Sjj_e;                          % {F×1}, 每个 n×n
 
 % （可选）若希望第一轮 E-step 的先验不再是 I，可用下行把 prior 设为 inv(Ω_init)
 % estep_in.source_prior_covariances = invert_and_fix(Omega_prev, 1e-10);
+
 
 %% 2) Fixed resources (K, W, spatial L) —— once for all EM iterations
 K = make_frequency_kernel(F, 3.0);    % single source of truth
@@ -61,6 +62,7 @@ end
 fprintf('Spatial L normalized: eig[min,max]=[%.2e, %.2e] -> [%.2e, %.2e]\n', ...
     Linfo.min_eig_before, Linfo.max_eig_before, Linfo.min_eig_after, Linfo.max_eig_after);
 
+%% 3) EM loop settings
 %% 3) EM loop settings  —— 10轮外层 + 快速内层
 em = struct();
 em.max_em_iter      = 10;      % 外层 EM 10 轮
@@ -77,8 +79,8 @@ em.lambda3_ratio    = 0.3;
 % —— 内层(Prox)关键：放开步长上限、减少最大迭代数、加速自适应
 em.inner = struct( ...
     'alpha0',  0.1, ...          % 初始步长：给一个“可迈得动”的值
-    'alpha_max', 0.6, ...        % 允许快速放大到 ~O(1) 的水平
-    'alpha_up', 1.2, ...         % 放大倍率更激进
+    'alpha_max', 1.0, ...        % 允许快速放大到 ~O(1) 的水平
+    'alpha_up', 1.5, ...         % 放大倍率更激进
     'alpha_down', 0.6, ...       % 退火时稍保守
     'alpha_grow_patience', 1, ...% 每 1 步就允许尝试放大
     'max_iter', 30, ...          % 每次 M-step 最多 30 步（原来100）
@@ -88,6 +90,7 @@ em.inner = struct( ...
     'diag', struct('enable', true, 'update_every', 1, 'metrics_every', 1, ...
                    'print_every', 1, 'f_view', 1, 'log_csv', 'prox_trace.csv', ...
                    'keep_fig_open', true));
+
 
 %% 4) State for EM
 A_masks = [];                     % 活跃集（滞后更新）
@@ -103,6 +106,7 @@ end
 hold_counter = 0;
 lambda2_base = [];
 hp_last      = [];
+
 
 % 可视化设置
 live_plot_cfg = struct('enable', true, 'f_view', 1, 'plot_every', 5, ...
@@ -129,20 +133,15 @@ for t = 1:em.max_em_iter
     S_xixi_accum = zeros(p,p,'like',estep_in.noise_covariance);
 
     for f = 1:F
-        % 先验 Σ_prior(f)
-        Sigma_prior_f = estep_in.source_prior_covariances{f};
-        Sigma_prior_f = 0.5*(Sigma_prior_f + Sigma_prior_f');   % 数值厄米化
+        % 后验协方差 Σ_{i|v}(f)
+        Sigma_post_f = module2_posterior_source_covariance( ...
+            estep_in.source_prior_covariances{f}, ...
+            L, ...
+            estep_in.noise_covariance, ...
+            struct('regularization_factor',1e-8,'verbose',false));
 
-        % 先验精度 Ω_prior = Σ_prior^{-1}（稳健求逆）
-        Omega_prior_f = inv_psd_robust_(Sigma_prior_f, 1e-8, 1e-12);
-
-        % 后验 Σ_{i|v}(f) = (Ω_prior + L' Σ_{ξξ}^{-1} L)^{-1}
-        LinvX = L' / estep_in.noise_covariance;                % L' Σ_{ξξ}^{-1}
-        A_f   = Omega_prior_f + LinvX * L;                     % SPD
-        Sigma_post_f = inv_psd_robust_(A_f, 1e-8, 1e-12);      % 逆回协方差
-
-        % 传递算子 T_{jv}(f) = Σ_{i|v} L' Σ_{ξξ}^{-1}
-        T_jv_f  = Sigma_post_f * LinvX;
+        % 传递算子 T_{jv}(f)
+        T_jv_f  = Sigma_post_f * (L' / estep_in.noise_covariance);
 
         % 残差传递 T_{ξv}(f) = I - L*T_{jv}(f)
         T_xi_v_f = I_p - L * T_jv_f;
@@ -165,7 +164,7 @@ for t = 1:em.max_em_iter
     Sigma_xixi_new = Sigma_xixi_new + ridge * eye(p,'like',Sigma_xixi_new);
 
     % （可选）EM 指数平滑，抑制抖动
-    eta = 0.3;   % 0~1，小=更平滑
+    eta = 0.3;  % 0~1，小=更平滑
     Sigma_xixi = (1-eta)*estep_in.noise_covariance + eta*Sigma_xixi_new;
 
     % 确保 SPD（必要时再微量加载）
@@ -176,10 +175,6 @@ for t = 1:em.max_em_iter
 
     % 回写：下一轮 E 步使用更新后的噪声
     estep_in.noise_covariance = Sigma_xixi;
-
-    % （可选）快速自检
-    assert(all(eig(0.5*(Sigma_xixi + Sigma_xixi')) > 0), 'Updated noise covariance is not SPD.');
-    fprintf('[NOISE] trace(Sigma_xixi)=%.3g\n', trace(Sigma_xixi));
     %% ===== End Noise M-step =====
 
     %% Preprocessing / Whitening in source domain (Module 1)
@@ -239,8 +234,11 @@ for t = 1:em.max_em_iter
         lambda1, hp.lambda2_suggested, lambda2_effective, lambda3, alpha0);
 
     %% M-step（Module 5，白化域）
+    % Warm start transport: Γ_init = D^{-1} Ω_prev D^{-1}
     % Warm start transport: Γ_init = D^{-1} Ω_prev D^{-1}   (首轮亦如此，Ω_prev 来自 eLORETA)
     Gamma_init = transport_init(Omega_prev, D_src, Sjj_tilde);
+
+
 
     input_data_m5 = struct();
     input_data_m5.whitened_covariances = Sjj_tilde;
@@ -249,40 +247,52 @@ for t = 1:em.max_em_iter
     input_data_m5.weight_matrix        = W;
     input_data_m5.active_set_mask      = {A_masks{:}};
     input_data_m5.whitening_matrices   = D_src;                   % 仅供 Live 可视化
-
-    alpha0_override = max(0.02, min(0.30, hp.alpha * 50));   % 经验兜底
-    em.inner.alpha0 = alpha0_override;
-    fprintf('[STEP] alpha0(hp)=%.3g -> alpha0(used)=%.3g, alpha_max=%.2f\n', ...
-            hp.alpha, em.inner.alpha0, em.inner.alpha_max);
-
-    params5 = struct( ...
-        'lambda1', lambda1, ...
-        'lambda2', lambda2_effective, ...
-        'lambda2_suggested', hp.lambda2_suggested, ...
-        'alpha0',  em.inner.alpha0, ...
-        'max_iter', em.inner.max_iter, 'verbose', true, ...
-        'active_set_update_freq', 10, ...
-        'alpha_max', em.inner.alpha_max, 'alpha_up', em.inner.alpha_up, ...
-        'alpha_down', em.inner.alpha_down, 'alpha_grow_patience', em.inner.alpha_grow_patience, ...
-        'obj_improve_tol', em.inner.obj_improve_tol, ...
-        'weight_mode', em.inner.weight_mode, 'use_graph_laplacian', em.inner.use_graph_laplacian, ...
-        'diag', em.inner.diag );
+alpha0_override = max(0.05, min(0.4, hp.alpha * 200));   % 经验兜底：把 hp.alpha 提升 ~200 倍但不超过 0.4
+em.inner.alpha0 = alpha0_override;                       % 回写到 em.inner 供后面使用
+fprintf('[STEP] alpha0(hp)=%.3g -> alpha0(used)=%.3g, alpha_max=%.2f\n', ...
+        hp.alpha, em.inner.alpha0, em.inner.alpha_max);
+    % params5 = struct( ...
+    %     'lambda1', lambda1, ...
+    %     'lambda2', lambda2_effective, ...
+    %     'lambda2_suggested', hp.lambda2_suggested, ...
+    %     'alpha0',  alpha0, ...
+    %     'max_iter', em.inner.max_iter, 'verbose', true, ...
+    %     'active_set_update_freq', 10, ...
+    %     'alpha_max', em.inner.alpha_max, 'alpha_up', em.inner.alpha_up, ...
+    %     'alpha_down', em.inner.alpha_down, 'alpha_grow_patience', em.inner.alpha_grow_patience, ...
+    %     'obj_improve_tol', em.inner.obj_improve_tol, ...
+    %     'weight_mode', em.inner.weight_mode, 'use_graph_laplacian', em.inner.use_graph_laplacian, ...
+    %     'diag', em.inner.diag );
+    %% 组装 M-step 参数（保持你现有的其它字段不变）
+params5 = struct( ...
+    'lambda1', lambda1, ...
+    'lambda2', lambda2_effective, ...
+    'lambda2_suggested', hp.lambda2_suggested, ...
+    'alpha0',  em.inner.alpha0, ...      % <== 使用上面的 override
+    'max_iter', em.inner.max_iter, 'verbose', true, ...
+    'active_set_update_freq', 10, ...
+    'alpha_max', em.inner.alpha_max, 'alpha_up', em.inner.alpha_up, ...
+    'alpha_down', em.inner.alpha_down, 'alpha_grow_patience', em.inner.alpha_grow_patience, ...
+    'obj_improve_tol', em.inner.obj_improve_tol, ...
+    'weight_mode', em.inner.weight_mode, 'use_graph_laplacian', em.inner.use_graph_laplacian, ...
+    'diag', em.inner.diag );
 
     % 在线可视化（Live）
     params5.diag.live_plot = live_plot_cfg;
-    
+
     params5.alpha_min              = 1e-4;   % 防止 α 被回溯到数值噪声
-    params5.armijo_c1              = 1e-5;   % Armijo 常数
-    params5.backtrack_beta         =  0.3;    % 回溯时 α 缩放
-    params5.max_backtrack_per_iter = 25;     % 每步最多回溯次数
+params5.armijo_c1              = 1e-4;   % Armijo 常数
+params5.backtrack_beta         = 0.5;    % 回溯时 α 缩放
+params5.max_backtrack_per_iter = 20;     % 每步最多回溯次数
 
-    % 回溯累计触发“优先降 λ2”（退火），避免一直只缩 α
-    params5.backtrack_patience     = 10;     % 连续回溯阈值
-    params5.lambda2_decay_factor   = 0.9;    % 退火倍率
-    params5.lambda2_min            = 0.01 * params5.lambda2;  % 不把 λ2 降到 0
+% 回溯累计触发“优先降 λ2”（退火），避免一直只缩 α
+params5.backtrack_patience     = 10;     % 连续回溯阈值
+params5.lambda2_decay_factor   = 0.9;    % 退火倍率
+params5.lambda2_min            = 0.01 * params5.lambda2;  % 不把 λ2 降到 0
 
-    % 是否对角也做 L1（保持和你现在一致：不惩罚对角）
-    params5.penalize_diagonal      = false;
+% 是否对角也做 L1（保持和你现在一致：不惩罚对角）
+params5.penalize_diagonal      = false;
+
 
     % 空间平滑
     if lambda3 > 0
@@ -528,7 +538,7 @@ end
 function Gamma_init = transport_init(Omega_prev, D_src, Sjj_tilde)
 % 将上一轮源域精度搬运到当前白化域：Γ_init = D^{-1} Ω_prev D^{-1}
 % 若上一轮为空，则用 “稳健逆 S̃” 作为启动（替代原来的 diag(1./diag(S̃))）。
-    F = numel(D_src);
+    F = numel(D_src); 
     Gamma_init = cell(F,1);
     if isempty(Omega_prev)
         for f = 1:F
@@ -539,16 +549,17 @@ function Gamma_init = transport_init(Omega_prev, D_src, Sjj_tilde)
             d = max(d, 1e-10);                       % 小特征值抬到阈值
             G = U * diag(1./d) * U';                 % 稳健逆
             G = (G + G')/2;                          % 数值对称化
-            Gamma_init{f} = G;
+            Gamma_init{f} = D \ (Omega_prev{f} / D);     % D^{-1} * Ω_prev * D^{-1)
         end
         return;
     end
     for f=1:F
         D = D_src{f};
-        Gamma_init{f} = D \ (Omega_prev{f} / D);     % D^{-1} * Ω_prev * D^{-1}
+        Gamma_init{f} = (D \ Omega_prev{f}) / D;     % D^{-1} * Ω_prev * D^{-1}
         Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2;
     end
 end
+
 
 function Sigma_prior = invert_and_fix(Omega_cell, eps_ld)
 % Robust inversion for next-round priors:

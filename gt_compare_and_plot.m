@@ -132,16 +132,11 @@ metrics.overall  = struct('precision',prec_all,'recall',rec_all,'F1',F1_all);
 % metrics.agg_pr  = struct('recall',pr_R,'precision',pr_P,'aupr',aupr);
 % metrics.agg_roc = struct('fpr',roc_FPR,'tpr',roc_TPR,'auroc',auroc);
 % ---- Aggregated PR & ROC over all freqs (upper-tri, truth=nonzero) ----
-% NOTE: fix score direction → use negative absolute scores so that larger = more likely edge
-Omega_est_neg = cellfun(@(M) -abs(M), Omega_est, 'uniformoutput', false);
-
-[pr_R, pr_P, aupr] = aggregate_pr_(Omega_true, Omega_est_neg);
-[roc_FPR, roc_TPR, auroc] = aggregate_roc_(Omega_true, Omega_est_neg);
-
-metrics.agg_pr  = struct('recall',pr_R,'precision',pr_P,'aupr',aupr);
-metrics.agg_roc = struct('fpr',roc_FPR,'tpr',roc_TPR,'auroc',auroc);
-
-fprintf('[Curves ] AUPR=%.3f | AUROC=%.3f  (scores negated)\n', aupr, auroc);
+[pr_R, pr_P, aupr, pr_flipped] = aggregate_pr_(Omega_true, Omega_est);
+[roc_FPR, roc_TPR, auroc, roc_flipped] = aggregate_roc_(Omega_true, Omega_est);
+fprintf('[Curves ] AUPR=%.3f%s | AUROC=%.3f%s\n', ...
+    aupr, ternary(pr_flipped,' (flipped)',''), ...
+    auroc, ternary(roc_flipped,' (flipped)',''));
 fprintf(['[GT-compare] mode=%s | Overall: P=%.3f  R=%.3f  F1=%.3f | ' ...
          'meanRelFrobMag=%.3f | meanFroUT=%.3f | meanFroOff=%.3f\n'], ...
     opts.mode, prec_all, rec_all, F1_all, mean(rfe_mag), mean(fro_rel_ut), mean(fro_rel_off));
@@ -261,49 +256,64 @@ Xinv = U * diag(1./d) * U';
 Xinv = (Xinv+Xinv')/2;
 end
 
-function [R, P, AUPR] = aggregate_pr_(Otrue, Oest)
-% PR over all freqs, truth = (|Omega_true| > 0) on UT; scores = |Omega_est|
-truth = []; scores = [];
-F = numel(Otrue); p = size(Otrue{1},1);
-for f=1:F
-    T=abs(Otrue{f}); E=abs(Oest{f});
-    T(1:p+1:end)=0; E(1:p+1:end)=0;
-    truth  = [truth;  upper_tri_vec(T) > 0];
-    scores = [scores; upper_tri_vec(E)];
-end
-% sort by score desc
-[s, ord] = sort(scores(:),'descend');
-y = truth(:); y = y(ord);
-tp = cumsum(y);
-fp = cumsum(~y);
-P = tp ./ max(1,(tp+fp));           % precision
-R = tp / max(1,sum(y));             % recall
-% remove NaNs at the very beginning if any
-bad = isnan(P) | isnan(R);
-P(bad)=[]; R(bad)=[];
-% AUPR (trapz over recall)
-AUPR = trapz(R, P);
+function [R,P,AUPR,flipped] = aggregate_pr_(Otrue, Oest)
+% 汇总所有频率、取上三角，自动选择更优的排序方向（desc vs asc）
+    if ~iscell(Otrue), Otrue = {Otrue}; end
+    if ~iscell(Oest),  Oest  = {Oest};  end
+    n  = size(Oest{1},1);
+    IU = triu(true(n),1);
+    s_all = []; y_all = [];
+    for f = 1:numel(Oest)
+        E = Oest{f}; T = Otrue{min(f,numel(Otrue))};
+        s = abs(E(IU));                 % 原打分（默认：越大越“有边”）
+        y = abs(T(IU)) > 0;             % 1=有边, 0=无边
+        s_all = [s_all; s];
+        y_all = [y_all; y];
+    end
+
+    % 两种方向的 AUPR
+    [R1,P1,~,au_pos] = perfcurve(y_all,  s_all, true, 'xCrit','reca','yCrit','prec');
+    [R2,P2,~,au_neg] = perfcurve(y_all, -s_all, true, 'xCrit','reca','yCrit','prec');
+
+    if au_neg > au_pos
+        flipped = true;
+        R=R2; P=P2; AUPR=au_neg;
+    else
+        flipped = false;
+        R=R1; P=P1; AUPR=au_pos;
+    end
 end
 
-function [FPR, TPR, AUROC] = aggregate_roc_(Otrue, Oest)
-% ROC over all freqs, truth = (|Omega_true| > 0) on UT; scores = |Omega_est|
-truth = []; scores = [];
-F = numel(Otrue); p = size(Otrue{1},1);
-for f=1:F
-    T=abs(Otrue{f}); E=abs(Oest{f});
-    T(1:p+1:end)=0; E(1:p+1:end)=0;
-    truth  = [truth;  upper_tri_vec(T) > 0];
-    scores = [scores; upper_tri_vec(E)];
+
+function [FPR,TPR,AUROC,flipped] = aggregate_roc_(Otrue, Oest)
+% 汇总所有频率、取上三角，自动选择更优的排序方向（desc vs asc）
+    if ~iscell(Otrue), Otrue = {Otrue}; end
+    if ~iscell(Oest),  Oest  = {Oest};  end
+    n  = size(Oest{1},1);
+    IU = triu(true(n),1);
+    s_all = []; y_all = [];
+    for f = 1:numel(Oest)
+        E = Oest{f}; T = Otrue{min(f,numel(Otrue))};
+        s = abs(E(IU));                 % 原打分（默认：越大越“有边”）
+        y = abs(T(IU)) > 0;             % 1=有边, 0=无边
+        s_all = [s_all; s];
+        y_all = [y_all; y];
+    end
+
+    % 计算两种方向的 AUROC
+    [~,~,~,au_pos] = perfcurve(y_all,  s_all, true);
+    [~,~,~,au_neg] = perfcurve(y_all, -s_all, true);
+
+    if au_neg > au_pos
+        flipped = true;
+        [FPR,TPR,~,AUROC] = perfcurve(y_all, -s_all, true); % 用更优方向
+    else
+        flipped = false;
+        [FPR,TPR,~,AUROC] = perfcurve(y_all,  s_all, true);
+    end
 end
-[s, ord] = sort(scores(:),'descend');
-y = truth(:); y = y(ord);
-P = max(1,sum(y)); N = max(1,sum(~y));
-tp = cumsum(y);      fn = P - tp;
-fp = cumsum(~y);     tn = N - fp;
-TPR = tp / P;  FPR = fp / N;
-% prepend (0,0) and append (1,1) for a proper ROC polyline
-FPR = [0; FPR; 1];
-TPR = [0; TPR; 1];
-% AUROC
-AUROC = trapz(FPR, TPR);
+
+function out = ternary(cond, a, b)
+% 简单三目：cond 为 true 返回 a，否则返回 b
+    if cond, out = a; else, out = b; end
 end

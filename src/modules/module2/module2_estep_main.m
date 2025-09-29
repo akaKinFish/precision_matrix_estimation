@@ -151,7 +151,7 @@ for f = 1:F
         % (5) Initial precisions
         eps_reg = estep_params.regularization_factor;
         min_rat = estep_params.min_eigenvalue_ratio;
-        [Omega_src_init_f, neg1, small1]   = inv_psd_robust(Sigma_post_f, eps_reg, min_rat); % n×n
+        [Omega_src_init_f, neg1, small1]   = inv_psd_robust(Sigma_jj_f, eps_reg, min_rat); % n×n
         [Omega_resid_init_f, neg2, small2] = inv_psd_robust(S_xi_xi_f,  eps_reg, min_rat);   % p×p
         estep_results.initial_precision_matrices{f}          = Omega_src_init_f;   % source-domain
         estep_results.residual_initial_precision_matrices{f} = Omega_resid_init_f; % sensor-domain (diagnostic)

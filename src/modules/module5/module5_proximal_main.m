@@ -101,6 +101,11 @@ end
 Gamma = Gamma0;
 alpha = min(max(alpha0, alpha_min), alpha_max);
 
+% %%% FIX: 对 warm start/任意初值做“对称化 + 对角归一 + SPD 投影”（每个频点）
+for f=1:F
+    Gamma{f} = project_spd_(Gamma{f}, 1e-8, true);  % eig-floor=1e-8, 规范化 diag->1
+end
+
 % objective decomposition helpers
 aux = struct('lambda1',lambda1,'lambda2',lambda2_eff,'weight_matrix',W,'smoothing_kernel',K);
 params_obj = struct('weight_mode',weight_mode,'use_graph_laplacian',use_L, ...
@@ -149,8 +154,18 @@ if viz.enable
     viz_state = init_live_plot_(F, n, viz, GT_cells);
 end
 
-% ------------ 初值目标 ------------
-[loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma, Sigma, aux, params_obj);
+% ------------ 初值目标（带兜底） ------------
+try
+    [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma, Sigma, aux, params_obj);
+catch ME
+    % %%% NEW: 若仍因非 PD 失败，抬高地板再试一次
+    if contains(ME.message,'objective_terms')
+        for f=1:F, Gamma{f} = project_spd_(Gamma{f}, 1e-6, true); end
+        [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma, Sigma, aux, params_obj);
+    else
+        rethrow(ME);
+    end
+end
 spatial_val = 0;
 if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
 obj_val = loglik_val + smooth_val + l1_val + spatial_val;
@@ -227,18 +242,32 @@ for it = 1:max_iter
                 Gc = 0.5*(Gc+Gc');
             end
 
-            % SPD 保护（轻微对角加载）
-            [~,flag] = chol(0.5*(Gc+Gc'),'lower');
-            if flag~=0
-                Gc = 0.5*(Gc+Gc') + 1e-12*eye(n);
-            end
+            % %%% FIX: SPD 保护必须对“每个频点”做完整投影（对称化+对角归一+特征值地板）
+           Gc = project_spd_(Gc, 1e-6, true);
+
             Gamma_cand{f} = Gc;
         end
 
-        % 目标与 Armijo 判据
-        [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma_cand, Sigma, aux, params_obj);
-        spatial_val = 0; if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
-        obj_trial = loglik_val + smooth_val + l1_val + spatial_val;
+        % 目标与 Armijo 判据（带兜底：若仍出错则降步重试）
+        try
+            [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma_cand, Sigma, aux, params_obj);
+            spatial_val = 0; if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
+            obj_trial = loglik_val + smooth_val + l1_val + spatial_val;
+        catch ME
+            if contains(ME.message,'objective_terms')
+                % %%% NEW: 目标评估失败 → 认为步长过大（或谱地板不足），回溯
+                bt_cnt  = bt_cnt + 1; bt_cum = bt_cum + 1;
+                alpha_try = max(alpha_min, bt_beta * alpha_try);
+                if bt_cnt >= bt_max_iter || alpha_try <= alpha_min
+                    obj_trial = obj_val;   % 放弃本轮更新
+                    break;
+                else
+                    continue;              % 继续回溯尝试
+                end
+            else
+                rethrow(ME);
+            end
+        end
 
         if obj_trial <= obj_val - armijo_c1 * alpha_try * (grad_norm^2)
             accept  = true;
@@ -447,4 +476,20 @@ function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
         title(S.ax_gt, 'GT (N/A)');
     end
     drawnow limitrate;
+end
+
+% %%% NEW: 统一的 SPD 投影（对称化 + 可选对角归一 + 特征值地板）
+function G = project_spd_(G, eig_floor, norm_diag)
+    G = 0.5*(G+G');                     % Hermitian
+    if norm_diag
+        d = real(diag(G));
+        d = max(d, 1e-12);
+        D = diag(1./sqrt(d));
+        G = D*G*D;                      % 使 diag ≈ 1
+        G = 0.5*(G+G');
+    end
+    [U,S] = eig(0.5*(G+G'));
+    s = max(diag(S), eig_floor);
+    G = U*diag(s)*U';
+    G = 0.5*(G+G');
 end
