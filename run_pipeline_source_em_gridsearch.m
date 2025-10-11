@@ -387,22 +387,31 @@ end
 
 %% ====== 轻量本地工具（保持不变） ======
 function Gamma_init = transport_init_local(Omega_prev, D_src, Sjj_tilde)
-    F = numel(D_src); Gamma_init = cell(F,1);
+% 将上一轮源域精度搬运到当前白化域：Γ_init = D^{-1} Ω_prev D^{-1}
+% 若上一轮为空，则用 “稳健逆 S̃” 作为启动（Hermitian → 地板 → 特征逆 → 对称化）
+    F = numel(D_src); 
+    Gamma_init = cell(F,1);
+
     if isempty(Omega_prev)
         for f = 1:F
-            St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;
+            St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;   % Hermitian
             [U, D] = eig(full(St), 'vector');
-            d = max(real(D), 1e-10);
-            G = U*diag(1./d)*U'; Gamma_init{f} = (G+G')/2;
+            d = real(D);
+            d = max(d, 1e-10);                       % 地板
+            G = U * diag(1./d) * U';                 % 稳健逆
+            G = (G + G')/2;                          % 数值对称化
+            Gamma_init{f} = G;                       % ←← 必须是 G；启动阶段**不要**访问 Omega_prev
         end
         return;
     end
-    for f=1:F
+
+    for f = 1:F
         D = D_src{f};
-        G = (D \ Omega_prev{f}) / D;
-        Gamma_init{f} = (G+G')/2;
+        Gamma_init{f} = (D \ Omega_prev{f}) / D;     % D^{-1} * Ω_prev * D^{-1}
+        Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2;
     end
 end
+
 
 function [L_byS, L_byG] = estimate_L_candidates_local(Omega_prev, D_src, Sjj_tilde)
     F = numel(Sjj_tilde); Ls=0; Lg=0;

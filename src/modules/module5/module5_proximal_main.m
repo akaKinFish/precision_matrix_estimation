@@ -103,7 +103,7 @@ alpha = min(max(alpha0, alpha_min), alpha_max);
 
 % %%% FIX: 对 warm start/任意初值做“对称化 + 对角归一 + SPD 投影”（每个频点）
 for f=1:F
-    Gamma{f} = project_spd_(Gamma{f}, 1e-8, true);  % eig-floor=1e-8, 规范化 diag->1
+    Gamma{f} = project_spd_(Gamma{f}, 5e-2, true);  % eig-floor=1e-8, 规范化 diag->1
 end
 
 % objective decomposition helpers
@@ -160,7 +160,7 @@ try
 catch ME
     % %%% NEW: 若仍因非 PD 失败，抬高地板再试一次
     if contains(ME.message,'objective_terms')
-        for f=1:F, Gamma{f} = project_spd_(Gamma{f}, 1e-6, true); end
+        for f=1:F, Gamma{f} = project_spd_(Gamma{f}, 5e-2, true); end
         [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma, Sigma, aux, params_obj);
     else
         rethrow(ME);
@@ -212,81 +212,97 @@ for it = 1:max_iter
     end
 
     % 3) 外层 Armijo 回溯（与内部 SPD 保护相独立）
-    accept = false; bt_cnt = 0; obj_new = NaN;
-    while ~accept
-        % forward 梯度步
-        Gamma_tmp = cell(F,1);
-        for f=1:F, Gamma_tmp{f} = Gamma{f} - alpha_try * Ggrad{f}; end
+% 3) 复合（ISTA）回溯：只对光滑部分用二次上界，L1 不进上界
+% 3) 复合（ISTA）回溯：只对光滑部分用二次上界，L1 不进上界
+accept = false; bt_cnt = 0; obj_new = obj_val;
 
-        % proximal L1（含可选对角、活动集与 SPD 微加载）
-        Gamma_cand = Gamma_tmp;
-        for f=1:F
-            Gc = Gamma_tmp{f};
+% 在当前 Gamma 处，重新评估"光滑部分"作上界基点
+[loglik_old, smooth_old, l1_old, aux_terms_old] = module5_objective_terms(Gamma, Sigma, aux, params_obj);
+spatial_old = 0; if isfield(aux_terms_old,'spatial_term'), spatial_old = aux_terms_old.spatial_term; end
+f_s_old = loglik_old + smooth_old + spatial_old;   % 光滑部分
 
-            % off-diagonal shrink
-            U = triu(Gc, 1);
-            U = sign(U) .* max(abs(U) - alpha_try*lambda2_eff, 0);
-            Gc = diag(diag(Gc)) + U + U';
-
-            % diagonal shrink（可选）
-            if pen_diag
-                d = diag(Gc);
-                d = sign(d) .* max(abs(d) - alpha_try*lambda2_eff, 0);
-                Gc(1:n+1:end) = d;
-            end
-
-            % 活动集
-            if ~isempty(A_masks)
-                mask = A_masks{f};
-                Gc(~mask) = 0;
-                Gc = 0.5*(Gc+Gc');
-            end
-
-            % %%% FIX: SPD 保护必须对“每个频点”做完整投影（对称化+对角归一+特征值地板）
-           Gc = project_spd_(Gc, 1e-6, true);
-
-            Gamma_cand{f} = Gc;
-        end
-
-        % 目标与 Armijo 判据（带兜底：若仍出错则降步重试）
-        try
-            [loglik_val, smooth_val, l1_val, aux_terms] = module5_objective_terms(Gamma_cand, Sigma, aux, params_obj);
-            spatial_val = 0; if isfield(aux_terms,'spatial_term'), spatial_val = aux_terms.spatial_term; end
-            obj_trial = loglik_val + smooth_val + l1_val + spatial_val;
-        catch ME
-            if contains(ME.message,'objective_terms')
-                % %%% NEW: 目标评估失败 → 认为步长过大（或谱地板不足），回溯
-                bt_cnt  = bt_cnt + 1; bt_cum = bt_cum + 1;
-                alpha_try = max(alpha_min, bt_beta * alpha_try);
-                if bt_cnt >= bt_max_iter || alpha_try <= alpha_min
-                    obj_trial = obj_val;   % 放弃本轮更新
-                    break;
-                else
-                    continue;              % 继续回溯尝试
-                end
-            else
-                rethrow(ME);
-            end
-        end
-
-        if obj_trial <= obj_val - armijo_c1 * alpha_try * (grad_norm^2)
-            accept  = true;
-            obj_new = obj_trial;
-            Gamma   = Gamma_cand;
-        else
-            bt_cnt  = bt_cnt + 1;
-            bt_cum  = bt_cum + 1;
+while ~accept
+    % 1) 基于 alpha_try 做一次 prox+SPD 得到候选
+    % Gamma_cand = prox_step_then_spd(Gamma, Ggrad, alpha_try, A_masks, lambda2_eff, pen_diag, n);
+    if isfield(params,'use_single_step') && params.use_single_step
+        Gamma_cand = prox_step_single_wrapper(Gamma, Ggrad, alpha_try, A_masks, lambda2_eff, pen_diag);
+    else
+        Gamma_cand = prox_step_then_spd(Gamma, Ggrad, alpha_try, A_masks, lambda2_eff, pen_diag, n);
+    end
+    % 2) 评估候选的目标分量
+    try
+        [loglik_new, smooth_new, l1_new, aux_terms_new] = module5_objective_terms(Gamma_cand, Sigma, aux, params_obj);
+        spatial_new = 0; if isfield(aux_terms_new,'spatial_term'), spatial_new = aux_terms_new.spatial_term; end
+        f_s_new = loglik_new + smooth_new + spatial_new;              % 光滑部分
+        obj_trial = f_s_new + l1_new;                                 % 总目标（用于记录/显示）
+    catch ME
+        if contains(ME.message,'objective_terms')
+            % 目标评估失败 → 认为步长过大（或谱地板不足），回溯缩步
+            bt_cnt  = bt_cnt + 1; bt_cum = bt_cum + 1;
             alpha_try = max(alpha_min, bt_beta * alpha_try);
             if bt_cnt >= bt_max_iter || alpha_try <= alpha_min
-                % 本轮放弃进一步回溯；接受“不更新”以继续到退火逻辑
-                obj_new = obj_val;
+                obj_trial = obj_val;   % 放弃更新
                 break;
+            else
+                continue;              % 继续回溯
             end
+        else
+            rethrow(ME);
         end
     end
 
-    % 4) 回溯累计过多 -> “优先降 λ2”（退火），并温和放宽 α
-    if bt_cum >= anneal_patience && lambda2_eff > lambda2_min
+    % 3) 复合上界判据：f_s(new) <= f_s(old) + <grad_old, Δ> + (1/(2α))||Δ||^2
+    %    其中 Δ = Gamma_cand - Gamma；内积逐频点求 Fro 内积的实部
+    lin_term = 0; sqnorm = 0;
+    for f=1:F
+        Delta  = Gamma_cand{f} - Gamma{f};
+        lin_term = lin_term + real(sum(sum(conj(Ggrad{f}).*Delta)));
+        sqnorm   = sqnorm   + sum(sum(real(Delta.*conj(Delta))));
+    end
+    majorant = f_s_old + lin_term + (0.5/alpha_try)*sqnorm;
+
+    % if f_s_new <= majorant + 1e-12        % 允许极小数值误差
+    %     % 通过：接受候选，更新状态
+    %     accept  = true;
+    %     obj_new = obj_trial;
+    %     Gamma   = Gamma_cand;
+    % 
+    %     % 同步"当前点"的分量值，供日志/可视化使用
+    %     loglik_val  = loglik_new;
+    %     smooth_val  = smooth_new;
+    %     spatial_val = spatial_new;
+    %     l1_val      = l1_new;
+    % else
+    if f_s_new <= majorant + 1e-12
+    accept  = true;
+    obj_new = obj_trial;
+    Gamma   = Gamma_cand;
+    loglik_val  = loglik_new; smooth_val = smooth_new; spatial_val = spatial_new; l1_val = l1_new;
+elseif obj_trial < obj_val - 1e-12
+    % 兜底：虽然没过 majorant，但总目标下降——放行
+    accept  = true;
+    obj_new = obj_trial;
+    Gamma   = Gamma_cand;
+    loglik_val  = loglik_new; smooth_val = smooth_new; spatial_val = spatial_new; l1_val = l1_new;
+else
+        % 不通过：缩步，并用新步长重新做 prox+SPD
+        bt_cnt   = bt_cnt + 1; bt_cum = bt_cum + 1;
+        alpha_try = max(alpha_min, bt_beta * alpha_try);
+        if bt_cnt >= bt_max_iter || alpha_try <= alpha_min
+            % 放弃更新：保持原值
+            obj_new = obj_val;
+            % 为了日志一致，回退显示为"旧点"的分量
+            loglik_val  = loglik_old;
+            smooth_val  = smooth_old;
+            spatial_val = spatial_old;
+            l1_val      = l1_old;
+            break;
+        end
+    end
+end
+
+% 4) 回溯累计过多 -> "优先降 λ2"（退火），并温和放宽 α
+if bt_cum >= anneal_patience && lambda2_eff > lambda2_min
         old_l2 = lambda2_eff;
         lambda2_eff = max(lambda2_min, anneal_factor * lambda2_eff);
         aux.lambda2 = lambda2_eff;
@@ -306,6 +322,10 @@ for it = 1:max_iter
         % 未改善的迭代：保持 Γ/obj，不改变 best_obj，仅记录步长尝试
         alpha = alpha_try;
     end
+% —— 在进入回溯前，基于当前 Gamma 的最小特征值给 alpha_try 上一道安全闸 ——
+mu = min_eig_sym_(Gamma);                 % 取所有频点的最小特征值（对称化）
+alpha_safe = 0.25 * (mu^2);               % 大约 1/(4L)，其中 L <= 1/mu^2
+alpha_try = min(alpha_max, max(alpha_min, min(alpha_try, alpha_safe)));
 
     % histories
     objective_history(it)     = obj_val;
@@ -404,10 +424,86 @@ function [a1, a2] = bb_stepsize_(G, Gprev, dG, dGprev)
     a2 = max(1e-16, sy) / max(1e-16, y2); % BB2（备用）
 end
 
-% --------- live plot subroutines（与你原版一致，占位实现）---------
+% % --------- live plot subroutines（与你原版一致，占位实现）---------
+% function S = init_live_plot_(F, n, viz, GT_cells)
+%     S = struct();
+%     if ~viz.enable, return; end
+%     S.fig = figure('Name','Module5 Live','NumberTitle','off'); clf(S.fig);
+%     S.tlo = tiledlayout(S.fig,2,3,'TileSpacing','compact','Padding','compact');
+%     S.ax_conv   = nexttile(S.tlo,1);
+%     S.ax_comps  = nexttile(S.tlo,2);
+%     S.ax_legend = nexttile(S.tlo,3); axis(S.ax_legend,'off');
+%     S.ax_gt     = nexttile(S.tlo,4);
+%     S.ax_est    = nexttile(S.tlo,5);
+%     S.ax_diff   = nexttile(S.tlo,6);
+%     title(S.ax_conv,  'Convergence');
+%     title(S.ax_comps, 'Objective components');
+%     title(S.ax_gt,    'GT (whitened/source-as-is)');
+%     title(S.ax_est,   'Estimate \Gamma (live)');
+%     title(S.ax_diff,  '|Est| - |GT|');
+%     axes(S.ax_legend); cla(S.ax_legend);
+%     txt = {sprintf('F=%d, f_{view}=%d', F, viz.f_view), ...
+%            sprintf('value_mode=%s', viz.value_mode), ...
+%            datestr(now)};
+%     text(0.0,1.0,strjoin(txt, '\n'),'Units','normalized','VerticalAlignment','top');
+%     S.im_gt   = imagesc(S.ax_gt, zeros(n)); colorbar(S.ax_gt); axis(S.ax_gt,'square');
+%     S.im_est  = imagesc(S.ax_est, zeros(n)); colorbar(S.ax_est); axis(S.ax_est,'square');
+%     S.im_diff = imagesc(S.ax_diff, zeros(n)); colorbar(S.ax_diff); axis(S.ax_diff,'square');
+%     S.GT_cache = []; if ~isempty(GT_cells), S.GT_cache = GT_cells; end
+% end
+% 
+% function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
+%     loglik_val, smooth_val, l1_val, spatial_val, G_view, GT_view, value_mode)
+%     if isempty(S), return; end
+%     axes(S.ax_conv); cla(S.ax_conv); hold(S.ax_conv,'on');
+%     yyaxis(S.ax_conv,'left');
+%     base = min(obj_hist(1:it));
+%     semilogy(S.ax_conv, max(obj_hist(1:it)-base, eps), '-o','MarkerSize',3);
+%     ylabel(S.ax_conv,'Objective (shifted, log)');
+%     yyaxis(S.ax_conv,'right');
+%     semilogy(S.ax_conv, max(grad_hist(1:it), eps), '-s','MarkerSize',3);
+%     ylabel(S.ax_conv,'||grad||_F (log)');
+%     xlabel(S.ax_conv,'iter'); grid(S.ax_conv,'on');
+% 
+%     axes(S.ax_comps); cla(S.ax_comps); hold(S.ax_comps,'on');
+%     plot(S.ax_comps, 1:it, repmat(loglik_val,1,it), '-', 'DisplayName','loglik');
+%     plot(S.ax_comps, 1:it, repmat(smooth_val,1,it), '-', 'DisplayName','smooth');
+%     plot(S.ax_comps, 1:it, repmat(l1_val,1,it),     '-', 'DisplayName','l1');
+%     plot(S.ax_comps, 1:it, repmat(spatial_val,1,it),'-', 'DisplayName','spatial');
+%     legend(S.ax_comps,'Location','northeast'); grid(S.ax_comps,'on');
+%     xlabel('iter'); ylabel('value');
+% 
+%     switch lower(string(value_mode))
+%         case "abs",   V = abs(G_view);
+%         case "real",  V = real(G_view);
+%         case "imag",  V = imag(G_view);
+%         otherwise,    V = abs(G_view);
+%     end
+%     set(S.im_est,  'CData', V);
+%     if ~isempty(GT_view)
+%         switch lower(string(value_mode))
+%             case "abs",   GTV = abs(GT_view);
+%             case "real",  GTV = real(GT_view);
+%             case "imag",  GTV = imag(GT_view);
+%             otherwise,    GTV = abs(GT_view);
+%         end
+%         set(S.im_gt,   'CData', GTV);
+%         set(S.im_diff, 'CData', abs(V) - abs(GTV));
+%         title(S.ax_gt, 'GT (whitened/source-as-is)');
+%     else
+%         set(S.im_gt,   'CData', zeros(size(V)));
+%         set(S.im_diff, 'CData', zeros(size(V)));
+%         title(S.ax_gt, 'GT (N/A)');
+%     end
+%     drawnow limitrate;
+% end
+
+% --------- live plot subroutines（修正版）---------
 function S = init_live_plot_(F, n, viz, GT_cells)
     S = struct();
     if ~viz.enable, return; end
+
+    % --- figure & axes ---
     S.fig = figure('Name','Module5 Live','NumberTitle','off'); clf(S.fig);
     S.tlo = tiledlayout(S.fig,2,3,'TileSpacing','compact','Padding','compact');
     S.ax_conv   = nexttile(S.tlo,1);
@@ -416,25 +512,44 @@ function S = init_live_plot_(F, n, viz, GT_cells)
     S.ax_gt     = nexttile(S.tlo,4);
     S.ax_est    = nexttile(S.tlo,5);
     S.ax_diff   = nexttile(S.tlo,6);
+
     title(S.ax_conv,  'Convergence');
     title(S.ax_comps, 'Objective components');
     title(S.ax_gt,    'GT (whitened/source-as-is)');
     title(S.ax_est,   'Estimate \Gamma (live)');
     title(S.ax_diff,  '|Est| - |GT|');
+
     axes(S.ax_legend); cla(S.ax_legend);
     txt = {sprintf('F=%d, f_{view}=%d', F, viz.f_view), ...
            sprintf('value_mode=%s', viz.value_mode), ...
            datestr(now)};
     text(0.0,1.0,strjoin(txt, '\n'),'Units','normalized','VerticalAlignment','top');
-    S.im_gt   = imagesc(S.ax_gt, zeros(n)); colorbar(S.ax_gt); axis(S.ax_gt,'square');
+
+    % --- images & colorbars ---
+    S.im_gt   = imagesc(S.ax_gt,  zeros(n)); colorbar(S.ax_gt);  axis(S.ax_gt,'square');
     S.im_est  = imagesc(S.ax_est, zeros(n)); colorbar(S.ax_est); axis(S.ax_est,'square');
-    S.im_diff = imagesc(S.ax_diff, zeros(n)); colorbar(S.ax_diff); axis(S.ax_diff,'square');
+    S.im_diff = imagesc(S.ax_diff,zeros(n)); colorbar(S.ax_diff);axis(S.ax_diff,'square');
+
+    % --- caches / states ---
     S.GT_cache = []; if ~isempty(GT_cells), S.GT_cache = GT_cells; end
+
+    % 历史（A2）：用于 components 折线
+    S.loglik_hist  = [];
+    S.smooth_hist  = [];
+    S.l1_hist      = [];
+    S.spatial_hist = [];
+
+    % 色轴固定状态（A3）
+    S.gt_caxis_fixed = false;
+    S.gt_caxis       = [];   % 将在第一次有 GT 数据时锁定
 end
 
 function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
     loglik_val, smooth_val, l1_val, spatial_val, G_view, GT_view, value_mode)
+
     if isempty(S), return; end
+
+    % ====== Convergence panel ======
     axes(S.ax_conv); cla(S.ax_conv); hold(S.ax_conv,'on');
     yyaxis(S.ax_conv,'left');
     base = min(obj_hist(1:it));
@@ -445,14 +560,23 @@ function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
     ylabel(S.ax_conv,'||grad||_F (log)');
     xlabel(S.ax_conv,'iter'); grid(S.ax_conv,'on');
 
-    axes(S.ax_comps); cla(S.ax_comps); hold(S.ax_comps,'on');
-    plot(S.ax_comps, 1:it, repmat(loglik_val,1,it), '-', 'DisplayName','loglik');
-    plot(S.ax_comps, 1:it, repmat(smooth_val,1,it), '-', 'DisplayName','smooth');
-    plot(S.ax_comps, 1:it, repmat(l1_val,1,it),     '-', 'DisplayName','l1');
-    plot(S.ax_comps, 1:it, repmat(spatial_val,1,it),'-', 'DisplayName','spatial');
-    legend(S.ax_comps,'Location','northeast'); grid(S.ax_comps,'on');
-    xlabel('iter'); ylabel('value');
+    % ====== Objective components（A2：维护历史再画） ======
+    % 记录历史
+    S.loglik_hist(it)  = loglik_val;
+    S.smooth_hist(it)  = smooth_val;
+    S.l1_hist(it)      = l1_val;
+    S.spatial_hist(it) = spatial_val;
 
+    % 绘制
+    axes(S.ax_comps); cla(S.ax_comps); hold(S.ax_comps,'on');
+    plot(S.ax_comps, 1:it, S.loglik_hist(1:it),  '-', 'DisplayName','loglik');
+    plot(S.ax_comps, 1:it, S.smooth_hist(1:it),  '-', 'DisplayName','smooth');
+    plot(S.ax_comps, 1:it, S.l1_hist(1:it),      '-', 'DisplayName','l1');
+    plot(S.ax_comps, 1:it, S.spatial_hist(1:it), '-', 'DisplayName','spatial');
+    legend(S.ax_comps,'Location','northeast'); grid(S.ax_comps,'on');
+    xlabel(S.ax_comps,'iter'); ylabel(S.ax_comps,'value');
+
+    % ====== Matrices (estimate / GT / diff) ======
     switch lower(string(value_mode))
         case "abs",   V = abs(G_view);
         case "real",  V = real(G_view);
@@ -460,6 +584,7 @@ function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
         otherwise,    V = abs(G_view);
     end
     set(S.im_est,  'CData', V);
+
     if ~isempty(GT_view)
         switch lower(string(value_mode))
             case "abs",   GTV = abs(GT_view);
@@ -470,13 +595,24 @@ function S = update_live_plot_(S, it, obj_hist, grad_hist, ...
         set(S.im_gt,   'CData', GTV);
         set(S.im_diff, 'CData', abs(V) - abs(GTV));
         title(S.ax_gt, 'GT (whitened/source-as-is)');
+
+        % A3：首次有 GT 数据时锁定色轴，后续保持不变
+        if ~S.gt_caxis_fixed
+            caxis(S.ax_gt, 'auto');                 % 先自动
+            S.gt_caxis = caxis(S.ax_gt);            % 记下范围
+            S.gt_caxis_fixed = true;
+        else
+            caxis(S.ax_gt, S.gt_caxis);             % 固定色轴
+        end
     else
         set(S.im_gt,   'CData', zeros(size(V)));
         set(S.im_diff, 'CData', zeros(size(V)));
         title(S.ax_gt, 'GT (N/A)');
     end
+
     drawnow limitrate;
 end
+
 
 % %%% NEW: 统一的 SPD 投影（对称化 + 可选对角归一 + 特征值地板）
 function G = project_spd_(G, eig_floor, norm_diag)
@@ -492,4 +628,74 @@ function G = project_spd_(G, eig_floor, norm_diag)
     s = max(diag(S), eig_floor);
     G = U*diag(s)*U';
     G = 0.5*(G+G');
+end
+
+function Gcells = prox_step_then_spd(Gamma, Ggrad, alpha, A_masks, lambda2_eff, pen_diag, n)
+% 对每个频点：前向梯度步 → L1 proximal（含可选对角/活跃集）→ SPD 投影
+    F_ = numel(Gamma);
+    Gcells = cell(F_,1);
+    for f_=1:F_
+        Gc = Gamma{f_} - alpha * Ggrad{f_};
+
+        % off-diagonal soft-threshold
+        U = triu(Gc,1);
+        U = sign(U) .* max(abs(U) - alpha*lambda2_eff, 0);
+        Gc = diag(diag(Gc)) + U + U';
+
+        % diagonal（可选）
+        if pen_diag
+            d = diag(Gc);
+            d = sign(d) .* max(abs(d) - alpha*lambda2_eff, 0);
+            Gc(1:n+1:end) = d;
+        end
+
+        % 活动集（可选）
+        if ~isempty(A_masks)
+            mask = A_masks{f_};
+            Gc(~mask) = 0;
+            Gc = 0.5*(Gc+Gc');
+        end
+
+        % SPD 投影（含对角归一）
+        Gc = project_spd_(Gc, 1e-6, false);
+
+        Gcells{f_} = Gc;
+    end
+end
+
+function mu = min_eig_sym_(Gcells)
+    mu = inf;
+    for f=1:numel(Gcells)
+        e = eig(0.5*(Gcells{f}+Gcells{f}'));   % Hermitian
+        mu = min(mu, min(real(e)));
+    end
+    if ~isfinite(mu) || mu<=0, mu = 1e-6; end
+end
+function Gcells = prox_step_single_wrapper(Gamma, Ggrad, alpha, A_masks, lambda2_eff, pen_diag)
+% 用 module5_single_proximal_step 做一次“前向-近端-PSD”的候选更新
+    F_ = numel(Gamma);
+    Gcells = cell(F_,1);
+
+    aux_data = struct('lambda2', lambda2_eff);
+    step_params = struct( ...
+        'mode',              'simplified', ...
+        'beta_backtrack',    0.5, ...
+        'max_backtrack',     5, ...        % 只做 SPD 级回溯，避免与外层回溯打架
+        'ridge_scale',       1e-10, ...
+        'ridge_min',         1e-12, ...
+        'min_eig_floor',     1e-8, ...
+        'penalize_diagonal', logical(pen_diag), ...
+        'penalize_mask',     [], ...
+        'verbose',           false );
+
+    for f_ = 1:F_
+        if ~isempty(A_masks) && numel(A_masks) >= f_ && ~isempty(A_masks{f_})
+            active_mask = A_masks{f_};   % true=可更新
+        else
+            active_mask = [];            % 不用活跃集
+        end
+
+        [Gcells{f_}, ~] = module5_single_proximal_step( ...
+            Gamma{f_}, Ggrad{f_}, alpha, active_mask, aux_data, step_params);
+    end
 end

@@ -297,23 +297,30 @@ end
 
 function Gamma_init = transport_init(Omega_prev, D_src, Sjj_tilde)
 % 将上一轮源域精度搬运到当前白化域：Γ_init = D^{-1} Ω_prev D^{-1}
-% 若上一轮为空，则用 diag(1./diag(S̃)) 的简单启动。
-    F = numel(D_src);
+% 若上一轮为空，则用 “稳健逆 S̃” 作为启动（Hermitian → 地板 → 特征逆 → 对称化）
+    F = numel(D_src); 
     Gamma_init = cell(F,1);
+
     if isempty(Omega_prev)
-        for f=1:F
-            d = real(diag(Sjj_tilde{f}));
-            d = max(d, 1e-8);
-            Gamma_init{f} = diag(1./d);
+        for f = 1:F
+            St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;   % Hermitian
+            [U, D] = eig(full(St), 'vector');
+            d = real(D);
+            d = max(d, 1e-10);                       % 地板
+            G = U * diag(1./d) * U';                 % 稳健逆
+            G = (G + G')/2;                          % 数值对称化
+            Gamma_init{f} = G;                       % ←← 必须是 G；启动阶段**不要**访问 Omega_prev
         end
         return;
     end
-    for f=1:F
+
+    for f = 1:F
         D = D_src{f};
-        Gamma_init{f} = (D \ Omega_prev{f}) / D;  % D^{-1} * Ω * D^{-1}
-        Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2; % 数值对称化
+        Gamma_init{f} = (D \ Omega_prev{f}) / D;     % D^{-1} * Ω_prev * D^{-1}
+        Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2;
     end
 end
+
 
 function Sigma_prior = invert_and_fix(Omega_cell, eps_ld)
 % Robust inversion for next-round priors:

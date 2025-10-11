@@ -32,22 +32,56 @@ assert(isa(estep_in.source_prior_covariances,'cell') && numel(estep_in.source_pr
 assert(all(cellfun(@(S) isequal(size(S),[n n]), estep_in.source_prior_covariances)));
 
 %% 1.5) eLORETA warm start (Plan A): build Ω^(0) from {Svv_f}
-gamma_grid = logspace(-4, 1, 30);                 % 可按需调整扫描范围与密度
-opts_el    = struct('maxit', 50, 'tol', 1e-6, 'verbose', false);
+warm_method = 'ssblpp';   % 'ssblpp' | 'eloreta'
 
-warm = eloreta_warmstart_from_covs(emp_cov_cell, L, gamma_grid, opts_el);
+switch lower(warm_method)
+    case 'ssblpp'
+        opts_ws = struct();
+        opts_ws.m   = T;                 % 有效样本数：用你的仿真 T（4096）
+        % 若已有解剖/parcel 信息，可传进来；否则默认每点独立：
+        % opts_ws.parcellation = my_parcellation;  
+        % 若想用标准版（带 W），提供 W（n×n）。没有就走 ultralarge：
+        % opts_ws.W = speye(n);
+        warm = warmstart_ssblpp_from_covs(emp_cov_cell, L, opts_ws);
 
-% 作为 M-step 的 warm start：上一轮源域精度 Ω_prev
-Omega_prev = warm.Omega_init;                     % {F×1}, 每个 n×n
+    case 'eloreta'
+        gamma_grid = logspace(-4, 1, 30);
+        opts_el    = struct('maxit', 50, 'tol', 1e-6, 'verbose', false);
+        warm = eloreta_warmstart_from_covs(emp_cov_cell, L, gamma_grid, opts_el);
+
+    otherwise
+        error('Unknown warm_method.');
+end
+
+Omega_prev = warm.Omega_init; 
+Sjj_prev   = warm.Sjj_e;     % 如果你喜欢，也可把它作为首轮 E-step 的先验二阶矩
 
 % （可选）也把 eLORETA 的源协方差作为上一轮二阶矩，便于 ΔS 统计更稳定
-Sjj_prev   = warm.Sjj_e;                          % {F×1}, 每个 n×n
-
+% Sjj_prev   = Omega_true;                          % {F×1}, 每个 n×n
+% Omega_prev = Sigma_true;
 % （可选）若希望第一轮 E-step 的先验不再是 I，可用下行把 prior 设为 inv(Ω_init)
 % estep_in.source_prior_covariances = invert_and_fix(Omega_prev, 1e-10);
 
 %% 2) Fixed resources (K, W, spatial L) —— once for all EM iterations
-K = make_frequency_kernel(F, 3.0);    % single source of truth
+% K = make_frequency_kernel(F, 3.0);    % single source of truth
+%% 2) Fixed resources (K, W, spatial L) —— once for all EM iterations
+K = make_frequency_kernel(F, 3.0);    % unnormalized symmetric Gaussian
+
+% --- enforce single normalization by infinity-norm (row-sum) ---
+K = real(0.5*(K + K'));               % 强制对称 + 去复数虚部
+K = max(K, 0);                         % 数值非负裁剪（稳健）
+
+row_sums_before = sum(K,2);
+maxrow_before   = max(row_sums_before);
+if maxrow_before > 0
+    K = K / maxrow_before;             % 统一到 ||K||_∞ = 1
+end
+
+% diagnostics（便于核对是否已统一尺度）
+rho_after = max(abs(eig(K)));
+fprintf('[DIAG] K normalized: maxrow %.3f -> %.3f, rho=%.3f\n', ...
+        maxrow_before, max(sum(K,2)), rho_after);
+
 W = make_uniform_weight(n);
 
 % Spatial Laplacian (spectrally normalized) — if available in sim, use it.
@@ -77,7 +111,7 @@ em.lambda3_ratio    = 0.3;
 % —— 内层(Prox)关键：放开步长上限、减少最大迭代数、加速自适应
 em.inner = struct( ...
     'alpha0',  0.1, ...          % 初始步长：给一个“可迈得动”的值
-    'alpha_max', 0.6, ...        % 允许快速放大到 ~O(1) 的水平
+    'alpha_max', 5.0, ...        % 允许快速放大到 ~O(1) 的水平
     'alpha_up', 1.2, ...         % 放大倍率更激进
     'alpha_down', 0.6, ...       % 退火时稍保守
     'alpha_grow_patience', 1, ...% 每 1 步就允许尝试放大
@@ -103,7 +137,11 @@ end
 hold_counter = 0;
 lambda2_base = [];
 hp_last      = [];
-
+% —— Step 2: λ2 自适应起点 + 逐轮延续（只在本文件里管）
+lambda2_curr   = [];   % 运行中的（逐轮衰减）的 λ2
+lambda2_floor  = [];   % 不低于超参建议值（hp.lambda2_suggested）
+lambda2_decay  = 0.85; % 每轮 EM 递减因子（0.7~0.9 可调）
+tau_l2         = 0.80; % 自适应起点比例：λ2_init = τ * median_offdiag(|∇f|) at t=1
 % 可视化设置
 live_plot_cfg = struct('enable', true, 'f_view', 1, 'plot_every', 5, ...
     'value_mode','abs', 'ground_truth_domain','source');
@@ -201,7 +239,7 @@ for t = 1:em.max_em_iter
         input_data_m3.whitened_covariances = Sjj_tilde;
         input_data_m3.frequencies          = 1:F;
         act = module3_active_set(input_data_m3, struct( ...
-            'proxy_method','correlation', 'quantile_level',0.25, ...
+            'proxy_method','correlation', 'quantile_level',0.1, ...
             'force_diagonal_active', true, 'verbose', false));
         A_masks = arrayfun(@(f) logical(act.combined_active_mask(:,:,f)), 1:F, 'uni', 0);
         act_mark = '*updated*';
@@ -250,10 +288,35 @@ for t = 1:em.max_em_iter
     input_data_m5.active_set_mask      = {A_masks{:}};
     input_data_m5.whitening_matrices   = D_src;                   % 仅供 Live 可视化
 
-    alpha0_override = max(0.02, min(0.30, hp.alpha * 50));   % 经验兜底
-    em.inner.alpha0 = alpha0_override;
-    fprintf('[STEP] alpha0(hp)=%.3g -> alpha0(used)=%.3g, alpha_max=%.2f\n', ...
-            hp.alpha, em.inner.alpha0, em.inner.alpha_max);
+    % === 使用 Lipschitz 诊断推荐步长（更靠谱）===
+% 估计 L 的两个候选（你已实现）：L_byS=max||S̃||²，L_byG=max||Γ^{-1}||²
+% [L_byS, L_byG] = estimate_L_candidates(Gamma_init, Sjj_tilde);
+% L_est      = min([L_byS, L_byG]);          % 取更紧的上界
+% alpha_rec  = 0.9 / max(L_est, 1e-12);      % 留 10% 裕度
+% % 取一半的推荐值起步，别超过 alpha_max，也别小到迈不动
+% alpha0_override = min(0.5*alpha_rec, em.inner.alpha_max);
+% alpha0_override = max(alpha0_override, 5e-4);   % 防过小起步
+% em.inner.alpha0 = alpha0_override;
+% 
+% fprintf('[STEP] alpha0(rec)=%.3g (from L≈%.3g) -> alpha0(used)=%.3g, alpha_max=%.2f\n', ...
+%         alpha_rec, L_est, em.inner.alpha0, em.inner.alpha_max);
+% 
+%     fprintf('[STEP] alpha0(hp)=%.3g -> alpha0(used)=%.3g, alpha_max=%.2f\n', ...
+%             hp.alpha, em.inner.alpha0, em.inner.alpha_max);
+
+% L_byS=max||S̃||²，L_byG=max||Γ^{-1}||²
+[L_byS, L_byG] = estimate_L_candidates(Gamma_init, Sjj_tilde);
+L_est     = min([L_byS, L_byG]);                % 更紧上界
+alpha_rec = 0.9 / max(L_est, 1e-12);            % 留10%裕度
+
+% 关键：取 {hp.alpha, 0.5*alpha_rec, alpha_max} 的最小值，再设地板
+alpha0_used = min([hp.alpha, 0.5*alpha_rec, em.inner.alpha_max]);
+alpha0_used = max(alpha0_used, 5e-4);
+em.inner.alpha0 = alpha0_used;
+
+fprintf('[STEP] alpha0(rec)=%.3g (from L≈%.3g)\n', alpha_rec, L_est);
+fprintf('[STEP] alpha0(hp)=%.3g -> alpha0(used)=%.3g, alpha_max=%.2f\n', ...
+        hp.alpha, em.inner.alpha0, em.inner.alpha_max);
 
     params5 = struct( ...
         'lambda1', lambda1, ...
@@ -271,15 +334,16 @@ for t = 1:em.max_em_iter
     % 在线可视化（Live）
     params5.diag.live_plot = live_plot_cfg;
     
-    params5.alpha_min              = 1e-4;   % 防止 α 被回溯到数值噪声
-    params5.armijo_c1              = 1e-5;   % Armijo 常数
-    params5.backtrack_beta         =  0.3;    % 回溯时 α 缩放
-    params5.max_backtrack_per_iter = 25;     % 每步最多回溯次数
+params5.alpha_min              = 1e-5;   % 允许更小的下限（模块5默认本来也支持更小）
+params5.armijo_c1              = 1e-5;   % 保持
+params5.backtrack_beta         = 0.5;    % 回溯别太狠，缩小一半更平滑
+params5.max_backtrack_per_iter = 25;     % 保持
+   % 每步最多回溯次数
 
     % 回溯累计触发“优先降 λ2”（退火），避免一直只缩 α
-    params5.backtrack_patience     = 10;     % 连续回溯阈值
-    params5.lambda2_decay_factor   = 0.9;    % 退火倍率
-    params5.lambda2_min            = 0.01 * params5.lambda2;  % 不把 λ2 降到 0
+    params5.backtrack_patience     = Inf;     % 连续回溯阈值
+    params5.lambda2_decay_factor   = 1.0;    % 退火倍率
+    params5.lambda2_min            = params5.lambda2;  % 不把 λ2 降到 0
 
     % 是否对角也做 L1（保持和你现在一致：不惩罚对角）
     params5.penalize_diagonal      = false;
@@ -486,13 +550,14 @@ function C = coerce_cov_cell(X, F_hint)
 end
 
 function K = make_frequency_kernel(F, sigma)
-% Gaussian kernel along frequency index (1..F), row-normalized
+% Gaussian kernel along frequency index (1..F); normalization is done by caller
     if nargin < 2, sigma = 3.0; end
     [I,J] = ndgrid(1:F,1:F);
     K = exp(-((I-J).^2)/(2*sigma^2));
     K = (K + K')/2;               % 保证对称
-    K = K / max(sum(K,2));        % 统一尺度（不破坏对称）
 end
+
+
 
 function W = make_uniform_weight(n)
 % Ones off-diagonal, zeros on diagonal
@@ -527,28 +592,30 @@ end
 
 function Gamma_init = transport_init(Omega_prev, D_src, Sjj_tilde)
 % 将上一轮源域精度搬运到当前白化域：Γ_init = D^{-1} Ω_prev D^{-1}
-% 若上一轮为空，则用 “稳健逆 S̃” 作为启动（替代原来的 diag(1./diag(S̃))）。
-    F = numel(D_src);
+% 若上一轮为空，则用 “稳健逆 S̃” 作为启动（Hermitian → 地板 → 特征逆 → 对称化）
+    F = numel(D_src); 
     Gamma_init = cell(F,1);
+
     if isempty(Omega_prev)
         for f = 1:F
             St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;   % Hermitian
-            % —— SPD 投影 + 特征值地板，避免病态/负特征值
             [U, D] = eig(full(St), 'vector');
             d = real(D);
-            d = max(d, 1e-10);                       % 小特征值抬到阈值
+            d = max(d, 1e-10);                       % 地板
             G = U * diag(1./d) * U';                 % 稳健逆
             G = (G + G')/2;                          % 数值对称化
-            Gamma_init{f} = G;
+            Gamma_init{f} = G;                       % ←← 必须是 G；启动阶段**不要**访问 Omega_prev
         end
         return;
     end
-    for f=1:F
+
+    for f = 1:F
         D = D_src{f};
-        Gamma_init{f} = D \ (Omega_prev{f} / D);     % D^{-1} * Ω_prev * D^{-1}
+        Gamma_init{f} = (D \ Omega_prev{f}) / D;     % D^{-1} * Ω_prev * D^{-1}
         Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2;
     end
 end
+
 
 function Sigma_prior = invert_and_fix(Omega_cell, eps_ld)
 % Robust inversion for next-round priors:
@@ -618,6 +685,13 @@ function g = read_grad_norm_(prox_res)
         if isnumeric(g) && ~isnan(g), return; end
         if isfield(prox_res,'history') && isfield(prox_res.history,'grad_norm')
             h = prox_res.history.grad_norm;
+                % === 新版 module5 返回的字段名 ===
+    if isnumeric(g) && ~isnan(g), return; end
+    if isfield(prox_res,'gradient_norm_history')
+        h = prox_res.gradient_norm_history;
+        if ~isempty(h), g = h(end); end
+    end
+
             if ~isempty(h), g = h(end); end
         end
         if isnumeric(g) && ~isnan(g), return; end
