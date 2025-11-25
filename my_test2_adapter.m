@@ -1,414 +1,542 @@
-function [Omega_src, Dsrc, Gamma_tilde_star, outs] = my_test2_adapter(emp_covariance, L, T, cfg, Omega_true)
-% MY_TEST2_ADAPTER  严格复刻 test2 管线（统一接口版）
-%
-% 入参
-%   emp_covariance : {F×1} / p×p×F / 单张 p×p（传感器域经验协方差）
-%   L              : p×n leadfield
-%   T              : 标称样本数
-%   cfg            : 可选配置（详见内部）
-%   Omega_true     : {F×1} GT 源域 precision（可选；不推荐用于初值）
-%
-% 出参
-%   Omega_src         : {F×1} 最终源域 precision（recolor + refit 后）
-%   Dsrc              : {F×1} 白化矩阵（用于评估/可视化）
-%   Gamma_tilde_star  : {F×1} 白化域 precision（最终）
-%   outs              : 结构体，包含所有中间产物
+function [Omega_est, Dsrc_est, Gamma_est, outs] = my_test2_adapter(emp_cov_cell, L, T, cfg, Omega_true_opt)
+% 薄适配器：预处理→调用 module2_estep_main（含 BC-V 风格 E 步与噪声内循环、白化）→ M 步（5/8）→ 可选 refit
 
+if nargin < 3, error('至少需要 emp_cov_cell, L, T'); end
 if nargin < 4 || isempty(cfg), cfg = struct(); end
-if nargin < 5, Omega_true = []; end
+if nargin < 5, Omega_true_opt = []; end
 
-%% ========== 0) 统一数据形态 ==========
-emp_cov_cell = coerce_cov_cell_(emp_covariance);
+% ---------- 基本准备 ----------
+emp_cov_cell = coerce_cov_cell(emp_cov_cell);
 F = numel(emp_cov_cell);
-p = size(L,1);  
-n = size(L,2);
+[p,n] = size(L);
 
-%% ========== 1) 构造 E 步输入（scalar struct） ==========
-prior_cell = repmat({eye(n)}, F, 1);
+verbose       = getf(cfg,'verbose',true);
+do_scale_L    = getf(cfg,'do_scale_L',true);
+do_scale_data = getf(cfg,'do_scale_data',true);
+q_act         = getf(cfg,'q_act',0.10);
+kernel_sigma  = getf(cfg,'kernel_sigma',3.0);
+lambda3_ratio = getf(cfg,'lambda3_ratio',0.0);
+lambda1_override = getf(cfg,'lambda1',[]);
+lambda2_factor   = getf(cfg,'lambda2_factor',1.0);
+do_support_refit = getf(cfg,'do_support_refit',true);
+noise_model   = getf(cfg,'noise_model','scalar');
 
+% ---------- 预处理（“数据换壳”，非计算性） ----------
+if do_scale_L
+    sL = sqrt(trace(L*L')/size(L,1));
+    if isfinite(sL)&&sL>0, L = L/sL; if verbose, fprintf('[scale] L by 1/%.3g\n',sL); end, end
+end
+if do_scale_data
+    gamma_grid = logspace(-4,1,30);
+    warm_tmp   = eloreta_warmstart_from_covs(emp_cov_cell, L, gamma_grid, struct('maxit',50,'tol',1e-6,'verbose',false));
+    scl = ones(F,1);
+    for f=1:F
+        d = mean(real(diag(warm_tmp.Sjj_e{f}))); if ~isfinite(d)||d<=0, d=1; end
+        emp_cov_cell{f} = emp_cov_cell{f}/d; scl(f)=d;
+    end
+    if verbose, fprintf('[scale] data per-freq by eLORETA mean power, median=%.3g\n', median(scl)); end
+end
+
+% ---------- E-step（把重计算交给 module2） ----------
 estep_in = struct();
 estep_in.leadfield_matrix         = L;
 estep_in.empirical_covariances    = emp_cov_cell;
-estep_in.source_prior_covariances = prior_cell;
-estep_in.noise_covariance         = pick_(cfg,'Sigma_xixi', eye(p));
-estep_in.frequencies              = 1:F;
-
-assert(isstruct(estep_in) && isscalar(estep_in));
-assert(iscell(estep_in.empirical_covariances) && numel(estep_in.empirical_covariances)==F);
-
-%% ========== [ADD-1] sSSBL风格：尺度统一 ==========
-% 1) Leadfield 尺度归一化
-scaleLvj = sqrt(trace(L*L')/p);
-if isfinite(scaleLvj) && scaleLvj>0
-    L = L / scaleLvj;
-    estep_in.leadfield_matrix = L;
-    if pick_(cfg,'verbose',false)
-        fprintf('[SCALE] Leadfield scaled by 1/%.3g\n', scaleLvj);
-    end
+estep_in.source_prior_covariances = repmat({eye(n)}, F, 1);
+% 初噪声：标量模型用 trace/p * 1e-2
+if strcmpi(noise_model,'scalar')
+    trS = 0; for f=1:F, trS = trS + trace(emp_cov_cell{f}); end
+    sigma2_init = real(trS/(F*p))*1e-2; sigma2_init = max(sigma2_init,1e-10);
+    estep_in.noise_covariance = sigma2_init * eye(p);
+else
+    estep_in.noise_covariance = eye(p)*1e-4; % 其它模型占位
 end
+estep_in.frequencies = 1:F;
 
-% 2) 数据尺度归一化（关键补充）
-gamma_grid = logspace(-4, 1, 30);
-opts_el = struct('maxit', 50, 'tol', 1e-6, 'verbose', false);
-warm_tmp = eloreta_warmstart_from_covs(emp_cov_cell, L, gamma_grid, opts_el);
+estep_params = struct('noise_model',noise_model, ...
+                      'estep_inner_iters', getf(getf(cfg,'em',struct()), 'max_estep_iter', 2), ...
+                      'eta_sigma', getf(getf(cfg,'em',struct()), 'eta_sigma', 0.3), ...
+                      'do_whitening', true, ...
+                      'whitening_opts', struct('smoothing_method','moving_average','loading_factor',1e-6,'min_power',1e-10,'verbose',false));
 
-scaleJ = zeros(F,1);
-for f=1:F
-    Sjj_e = warm_tmp.Sjj_e{f};
-    scaleJ(f) = mean(abs(diag(Sjj_e)));
-    if ~isfinite(scaleJ(f)) || scaleJ(f)<=0
-        scaleJ(f) = 1;
-    end
-    emp_cov_cell{f} = emp_cov_cell{f} / scaleJ(f);
-end
-estep_in.empirical_covariances = emp_cov_cell;
+E = module2_estep_main(estep_in, estep_params);
 
-if pick_(cfg,'verbose',false)
-    fprintf('[SCALE] Data scaled per-freq, median factor=%.3g\n', median(scaleJ));
-end
+Sjj_tilde = E.whitening.Sigma_tilde;
+D_src     = E.whitening.D;
+Psijj     = E.effective_source_second_moments;
+Sigma_post_cell = E.posterior_source_covariances;
+sigma2_final = E.noise.sigma2_scalar_final; %#ok<NASGU>
 
-%% ========== 1.5) Warm start（关键补充） ==========
-warm_method = pick_(cfg, 'warm_method', 'ssblpp');
-switch lower(warm_method)
-    case 'ssblpp'
-        opts_ws = struct(); 
-        opts_ws.m = T;
-        warm = warmstart_ssblpp_from_covs(emp_cov_cell, L, opts_ws);
-    case 'eloreta'
-        warm = warm_tmp;  % 复用前面的
-    otherwise
-        error('Unknown warm_method: %s', warm_method);
-end
-Omega_prev = warm.Omega_init; 
-Sjj_prev   = warm.Sjj_e;
-
-%% ========== 2) E-step（Module 2） ==========
-E = module2_estep(estep_in, struct( ...
-    'ensure_hermitian',true, 'ensure_real_diag',true, ...
-    'ensure_psd',true, 'psd_tol',1e-10, 'diag_loading',1e-10));
-Sjj_hat = E.source_second_moments;
-
-%% ========== [ADD-5] Noise M-step + node variance（关键补充） ==========
-% VARETA 子空间
-[U,Sv,V] = svd(L, 'econ');
-sing2 = diag(Sv).^2; 
-cum = cumsum(sing2)/sum(sing2);
-r = find(cum>=0.99, 1, 'first'); 
-if isempty(r), r = size(Sv,1); end
-Ur = U(:,1:r); 
-Sr = Sv(1:r,1:r); 
-Vr = V(:,1:r);
-
-I_p = eye(p); 
-S_xixi_accum = zeros(p,p,'like',estep_in.noise_covariance);
-node_var_cell = cell(F,1);
-
-for f = 1:F
-    Sigma_prior_f = estep_in.source_prior_covariances{f};
-    Sigma_prior_f = 0.5*(Sigma_prior_f + Sigma_prior_f');
-    Omega_prior_f = inv_psd_robust_(Sigma_prior_f, 1e-8, 1e-12);
-    
-    % 子空间版后验协方差
-    SigInvUr = (estep_in.noise_covariance \ Ur);
-    M = Ur' * SigInvUr;
-    A_f = Omega_prior_f + Vr * (Sr * (M * Sr)) * Vr';
-    A_f = (A_f + A_f')/2;
-    Sigma_post_f = inv_psd_robust_(A_f, 1e-8, 1e-12);
-    node_var_cell{f} = real(diag(Sigma_post_f));
-    
-    % 残差噪声协方差
-    LinvX = L' / estep_in.noise_covariance;
-    T_jv_f = Sigma_post_f * LinvX;
-    T_xi_v_f = I_p - L * T_jv_f;
-    S_res_f = T_xi_v_f * emp_cov_cell{f} * T_xi_v_f' + L * Sigma_post_f * L';
-    S_res_f = 0.5*(S_res_f + S_res_f');
-    S_xixi_accum = S_xixi_accum + S_res_f;
-end
-
-Sigma_xixi_new = S_xixi_accum / F;
-Sigma_xixi_new = 0.5*(Sigma_xixi_new + Sigma_xixi_new');
-ridge = 1e-10 * trace(Sigma_xixi_new)/p;
-Sigma_xixi_new = Sigma_xixi_new + ridge * eye(p,'like',Sigma_xixi_new);
-
-% 平滑更新
-eta = pick_(cfg, 'noise_eta', 0.3);
-Sigma_xixi = (1-eta)*estep_in.noise_covariance + eta*Sigma_xixi_new;
-[~,chol_flag] = chol(0.5*(Sigma_xixi + Sigma_xixi'),'lower');
-if chol_flag ~= 0
-    Sigma_xixi = Sigma_xixi + 1e-6*eye(p,'like',Sigma_xixi);
-end
-estep_in.noise_covariance = Sigma_xixi;
-
-if pick_(cfg,'verbose',false)
-    fprintf('[NOISE] trace(Sigma_xixi)=%.3g\n', trace(Sigma_xixi));
-end
-
-%% ========== 3) Whitening（Module 1） ==========
-pre = module1_preproc_from_covset(Sjj_hat, struct( ...
-    'smoothing_method','moving_average', ...
-    'loading_factor', 1e-6, ...
-    'min_power', 1e-10, ...
-    'verbose', false));
-Dsrc     = pre.D;              % ⭐ 输出变量1
-Sjj_tilde = pre.Sigma_tilde;
-
-%% ========== 4) Active set（Module 3） ==========
-input_m3 = struct();
-input_m3.whitened_covariances = Sjj_tilde;
-input_m3.frequencies = 1:F;
-
-act = module3_active_set(input_m3, struct( ...
-    'proxy_method','correlation', ...
-    'quantile_level', pick_(cfg,'active_quantile',0.10), ...
-    'force_diagonal_active', true, ...
-    'verbose', false));
+% ---------- Active set ----------
+input_data_m3 = struct();
+        input_data_m3.whitened_covariances = Sjj_tilde;
+        input_data_m3.frequencies = 1:F;
+act = module3_active_set(input_data_m3, struct('proxy_method','correlation', ...
+                     'quantile_level', q_act, 'force_diagonal_active', true, 'verbose', false));
 A_masks = arrayfun(@(f) logical(act.combined_active_mask(:,:,f)), 1:F, 'uni', 0);
 
-%% ========== 5) Hyperparameters（Module 6） ==========
-K = make_frequency_kernel_(F, pick_(cfg,'kernel_sigma',3.0));
-K = real(0.5*(K + K')); 
-K = max(K, 0);
-row_sums = sum(K,2); 
-maxrow = max(row_sums);
-if maxrow > 0, K = K / maxrow; end
-
-W = make_uniform_weight_(n);
-
-input_m6 = struct();
-input_m6.whitened_covariances = Sjj_tilde;
-input_m6.kernel_matrix = K;
-input_m6.weight_matrix = W;
-input_m6.active_set_mask = {A_masks{:}};
-
-hp = module6_hyperparameter_config(input_m6, struct('use_gershgorin', true));
-
-lambda1 = pick_(cfg,'lambda1', hp.lambda1);
-lambda2 = pick_(cfg,'lambda2', hp.lambda2_suggested);
-lambda3_ratio = pick_(cfg,'lambda3_ratio', 0.3);
+% ---------- 超参数（Module 6） ----------
+K = make_frequency_kernel(F, kernel_sigma);
+K = real(0.5*(K+K')); K = K / max(1,max(sum(K,2)));
+W = ones(n); W(1:n+1:end)=0;
+input_data_m6 = struct();
+        input_data_m6.whitened_covariances = Sjj_tilde;
+        input_data_m6.kernel_matrix        = K;
+        input_data_m6.weight_matrix        = W;
+        input_data_m6.active_set_mask      = {A_masks{:}};
+hp = module6_hyperparameter_config(input_data_m6, struct('use_gershgorin', true));
+lambda1 = hp.lambda1; if ~isempty(lambda1_override), lambda1 = lambda1_override; end
+lambda2 = lambda2_factor * hp.lambda2_suggested;
 lambda3 = lambda3_ratio * lambda1;
-alpha0  = pick_(cfg,'alpha0', hp.alpha);
+alpha0  = hp.alpha;
 
-%% ========== 6) Initial precision（白化域） ==========
-Gamma_init = transport_init_(Omega_prev, Dsrc, Sjj_tilde);
+if verbose
+    fprintf('[HP] λ1=%.3g, λ2=%.3g, λ3=%.3g, α=%.3g\n', lambda1, lambda2, lambda3, alpha0);
+end
 
-%% ========== [ADD-3] 自适应 L1 权重（关键补充） ==========
-l1w_cell = cell(F,1);
+% ---------- M-step（Module 5 PGD） ----------
+Gamma_init = cell(F,1);
 for f=1:F
-    wi = 1 ./ (node_var_cell{f} + 1e-8);  
-    wi = wi / median(wi);
-    
-    % 基于前一步的度数
-    if isempty(Omega_prev)
-        Om_for_deg = warm.Omega_init{f};
-    else
-        Om_for_deg = Omega_prev{f};
-    end
-    sup = triu(abs(Om_for_deg) > 1e-8, 1);
-    deg = sum(sup | sup', 2);
-    Dg = 1 ./ sqrt((deg + 1) * (deg + 1).');
-    
-    Wnode = sqrt(wi * wi.');
-    Wpen = Wnode .* Dg; 
-    Wpen(1:n+1:end) = 0;
-    l1w_cell{f} = Wpen;
+    St = 0.5*(Sjj_tilde{f}+Sjj_tilde{f}');
+    Gamma_init{f} = inv_psd_robust_(St, 1e-8, 1e-12);
 end
 
-%% ========== 7) Module 5: Proximal（白化域） ==========
-input_m5 = struct();
-input_m5.whitened_covariances = Sjj_tilde;
-input_m5.initial_precision = Gamma_init;
-input_m5.smoothing_kernel = K;
-input_m5.weight_matrix = W;
-input_m5.active_set_mask = {A_masks{:}};
-input_m5.whitening_matrices = Dsrc;
+params5 = struct();
+params5.lambda1 = lambda1;
+params5.lambda2 = lambda2;
+params5.lambda2_suggested = hp.lambda2_suggested;
+params5.lambda3 = lambda3;
+params5.alpha0  = min(alpha0, 0.5);
+params5.max_iter = getf(getf(cfg,'inner',struct()),'max_iter',30);
+params5.verbose  = verbose;
+params5.active_set_update_freq = 10;
+params5.alpha_max = 5.0; params5.alpha_up=1.2; params5.alpha_down=0.6; params5.alpha_grow_patience=1;
+params5.obj_improve_tol = 5e-6;
+params5.weight_mode = 'hadamard';
+params5.use_graph_laplacian = true;
+params5.spatial_graph_matrix = eye(n); % 若有图替换
+params5.spatial_graph_is_laplacian = true;
+params5.spatial_weight_mode = 'node';
+params5.diag = struct('enable',false);
+params5.alpha_min = 1e-5; params5.armijo_c1=1e-5;
+params5.backtrack_beta=0.5; params5.max_backtrack_per_iter=25;
+params5.backtrack_patience=Inf; params5.lambda2_decay_factor=1.0; params5.lambda2_min=lambda2;
+params5.penalize_diagonal = false;
+params5.l1_weights = [];
+params5.use_single_step = true;
 
-params5 = struct( ...
-    'lambda1', lambda1, ...
-    'lambda2', lambda2, ...
-    'lambda2_suggested', hp.lambda2_suggested, ...
-    'alpha0', alpha0, ...
-    'max_iter', pick_(cfg,'max_iter',30), ...
-    'verbose', false, ...
-    'alpha_max', 5.0, ...
-    'alpha_up', 1.2, ...
-    'alpha_down', 0.6, ...
-    'alpha_grow_patience', 1, ...
-    'obj_improve_tol', 5e-6, ...
-    'weight_mode', 'hadamard', ...
-    'use_graph_laplacian', true, ...
-    'penalize_diagonal', false, ...
-    'l1_weights', {l1w_cell}, ...
-    'use_single_step', true, ...
-    'diag', struct('enable', false));
+input_data_m5 = struct();
+input_data_m5.whitened_covariances = Sjj_tilde;
+input_data_m5.initial_precision    = Gamma_init;
+input_data_m5.smoothing_kernel     = K;
+input_data_m5.weight_matrix        = W;
+input_data_m5.active_set_mask      = {A_masks{:}}; %#ok<CCAT>
+input_data_m5.whitening_matrices   = D_src;
 
-% 空间正则化
-if lambda3 > 0
-    % 如果有空间图，使用；否则用占位符
-    if isfield(cfg,'spatial_laplacian') && ~isempty(cfg.spatial_laplacian)
-        Lsp = cfg.spatial_laplacian;
-    else
-        L_raw = laplacian_placeholder_(n);
-        [Lsp, ~] = normalize_graph_laplacian_(L_raw, 'spectral');
-    end
-    
-    params5.lambda3 = lambda3;
-    params5.spatial_graph_matrix = Lsp;
-    params5.spatial_graph_is_laplacian = true;
-    params5.spatial_weight_mode = 'node';
-end
+[Gamma_tilde, prox_res] = module5_proximal(input_data_m5, params5);
 
-[Gamma_tilde_star, proximal_results] = module5_proximal(input_m5, params5);
-% ⭐ Gamma_tilde_star 是输出变量2
+% ---------- recolor ----------
+input_data_m8 = struct();
+    input_data_m8.whitened_precision_matrices = Gamma_tilde;
+    input_data_m8.whitening_matrices = D_src;
+recol = module8_recoloring(input_data_m8, struct());
+Omega_src = recol.recolored_precision_matrices;
 
-%% ========== [ADD-4] Support-refit 去偏（关键补充） ==========
-if pick_(cfg,'enable_refit', true)
+% ---------- 支撑再拟合（可选） ----------
+if do_support_refit
     support_cell = cell(F,1);
     for f=1:F
-        Gf = Gamma_tilde_star{f};
-        M = abs(Gf) > 1e-8; 
-        M(1:n+1:end) = true;  % 保持对角线
-        support_cell{f} = M;
+        G0 = Gamma_tilde{f}; M = abs(G0)>1e-8; M(1:n+1:end)=true; support_cell{f}=M;
     end
-    
-    Gamma_init_refit = cell(F,1);
-    for f=1:F
-        G0 = Gamma_tilde_star{f};
-        G0(~support_cell{f}) = 0;
-        Gamma_init_refit{f} = (G0 + G0')/2;
-    end
-    
-    input_m5_refit = input_m5;
-    input_m5_refit.initial_precision = Gamma_init_refit;
-    input_m5_refit.active_set_mask = support_cell;
-    
-    params_refit = params5;
-    params_refit.max_iter = pick_(cfg,'refit_maxiter',10);
-    params_refit.lambda2 = 1e-8;
-    params_refit.l1_weights = [];
-    params_refit.active_set_update_freq = Inf;
-    
-    [Gamma_tilde_star, ~] = module5_proximal(input_m5_refit, params_refit);
-    % ⭐ 更新 Gamma_tilde_star
+    params_refit = params5; params_refit.max_iter=10; params_refit.lambda2=1e-8;
+    params_refit.l1_weights=[]; params_refit.active_set_update_freq=Inf; params_refit.use_single_step=true;
+    Ginit_ref = cell(F,1); for f=1:F, Ginit_ref{f} = 0.5*( (Gamma_tilde{f}.*support_cell{f}) + (Gamma_tilde{f}.*support_cell{f})'); end
+    input_data_m5_ref = input_data_m5; input_data_m5_ref.initial_precision=Ginit_ref; input_data_m5_ref.active_set_mask=support_cell;
+    [Gamma_tilde_refit, ~] = module5_proximal(input_data_m5_ref, params_refit);
+    input_data_m8_refit = struct();
+    input_data_m8_refit.whitened_precision_matrices = Gamma_tilde_refit;
+    input_data_m8_refit.whitening_matrices = D_src;
+    recol2 = module8_recoloring(input_data_m8_refit, struct());
+    Omega_src = recol2.recolored_precision_matrices;
 end
 
-%% ========== 8) Module 8: Recoloring（反白化） ==========
-input8 = struct();
-input8.whitened_precision_matrices = Gamma_tilde_star;
-input8.whitening_matrices = Dsrc;
-recol = module8_recoloring(input8, struct());
-Omega_src = recol.recolored_precision_matrices;  % ⭐ 输出变量0（主输出）
-Omega_src = cellfun(@(A) (A+A')/2, Omega_src, 'uni', 0);
+% ---------- 输出 ----------
+Gamma_est = Gamma_tilde;
+Omega_est = Omega_src;
+Dsrc_est  = invert_cell_spd_(Omega_src, 1e-8, 1e-12);
 
-%% ========== 输出 ==========
-if nargout >= 4
-    outs = struct();
-    outs.estep_results = E;
-    outs.Sjj_hat = Sjj_hat;
-    outs.preprocessing = pre;
-    outs.active_results = act;
-    outs.hyperparams = hp;
-    outs.proximal_results = proximal_results;
-    outs.recoloring_results = recol;
-    outs.warm = warm;
-    outs.node_var_cell = node_var_cell;
-    outs.scaleJ = scaleJ;
-    outs.K = K;
-    outs.W = W;
+outs = struct();
+outs.estep = E;
+outs.prox_res = prox_res;
+outs.A_masks = A_masks;
+outs.K = K; outs.W = W;
+
+% 小结
+if verbose
+    f_view = 1; Om = Omega_src{f_view};
+    pcorr = abs(-Om) ./ sqrt((abs(diag(Om))+eps) * (abs(diag(Om))+eps)');
+    pcorr(1:n+1:end)=0;
+    fprintf('Done. Partial coherence@f=%d: max=%g, median=%g\n', f_view, max(pcorr(:)), median(pcorr(pcorr>0)));
+end
+end
+
+% ===== helpers（与你之前版本一致）=====
+%% ======== 辅助函数（保持你原有版本，仅微小稳健化） ========
+function v = get_field(s, name, default_val)
+if isfield(s, name) && ~isempty(s.(name))
+    v = s.(name);
 else
-    outs = struct();  % 空结构体
+    v = default_val;
+end
 end
 
+function C = coerce_cov_cell(X, F_hint)
+if isa(X,'cell')
+    C = X(:);
+    return;
 end
-
-%% ==================== Helpers ====================
-function C = coerce_cov_cell_(X)
-    if iscell(X), C = X(:); return; end
-    if isnumeric(X) && ndims(X)==3 && size(X,1)==size(X,2)
-        F = size(X,3); C = cell(F,1);
-        for f=1:F, C{f} = (X(:,:,f)+X(:,:,f)')/2; end
-        return;
+if isnumeric(X) && ndims(X)==3 && size(X,1)==size(X,2)
+    F = size(X,3);
+    C = cell(F,1);
+    for f = 1:F
+        C{f} = X(:,:,f);
     end
-    if isnumeric(X) && ismatrix(X) && size(X,1)==size(X,2)
-        C = {(X+X')/2}; return;
-    end
-    error('emp_covariance: unsupported format');
+    return;
 end
-
-function v = pick_(s, key, dflt)
-    if isfield(s,key) && ~isempty(s.(key))
-        v = s.(key);
+if isnumeric(X) && ismatrix(X) && size(X,1)==size(X,2)
+    if nargin>=2 && ~isempty(F_hint)
+        C = repmat({X}, F_hint, 1);
     else
-        v = dflt;
+        C = {X};
     end
+    return;
+end
+error('coerce_cov_cell:unsupported','Expect cell{F,1} | p×p×F | single p×p.');
 end
 
-function K = make_frequency_kernel_(F, sigma)
-    [I,J] = ndgrid(1:F,1:F);
-    K = exp(-((I-J).^2)/(2*sigma^2));
-    K = (K + K')/2;
+function K = make_frequency_kernel(F, sigma)
+if nargin < 2, sigma = 3.0; end
+[I,J] = ndgrid(1:F,1:F);
+K = exp(-((I-J).^2)/(2*sigma^2));
+K = (K + K')/2;
 end
 
-function W = make_uniform_weight_(n)
-    W = ones(n); 
-    W(1:n+1:end) = 0;
+function W = make_uniform_weight(n)
+W = ones(n);
+W(1:n+1:end) = 0;
 end
 
-function L = laplacian_placeholder_(n)
-    A = ones(n) - eye(n); 
-    d = sum(A,2); 
-    L = diag(d) - A;
+function L = laplacian_placeholder(n)
+A = ones(n) - eye(n);
+d = sum(A,2);
+L = diag(d) - A;
 end
 
-function [Lnorm, info] = normalize_graph_laplacian_(L, mode)
-    if nargin<2, mode='spectral'; end
-    L = (L+L')/2; 
-    ev = eig(full(L));
-    info.min_eig_before = min(real(ev)); 
-    info.max_eig_before = max(real(ev));
-    switch lower(mode)
-        case 'spectral'
-            s = max(1, info.max_eig_before); 
-            Lnorm = L / s;
-        otherwise
-            Lnorm = L;
-    end
-    ev2 = eig(full(Lnorm)); 
-    info.min_eig_after = min(real(ev2)); 
-    info.max_eig_after = max(real(ev2));
+function [Lnorm, info] = normalize_graph_laplacian(L, mode)
+if nargin<2, mode='spectral'; end
+L = (L+L')/2;
+ev = eig(full(L));
+info.min_eig_before = min(real(ev));
+info.max_eig_before = max(real(ev));
+
+switch lower(mode)
+    case 'spectral'
+        s = max(1, info.max_eig_before);
+        Lnorm = L / s;
+    otherwise
+        Lnorm = L;
 end
 
-function Gamma_init = transport_init_(Omega_prev, D_src, Sjj_tilde)
-    F = numel(D_src); 
-    Gamma_init = cell(F,1);
-    if isempty(Omega_prev)
-        for f=1:F
-            St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;
-            [U, D] = eig(full(St), 'vector'); 
-            d = real(D); 
-            d = max(d, 1e-10);
-            G = U * diag(1./d) * U'; 
-            G = (G + G')/2;
-            Gamma_init{f} = G;
-        end
-        return;
-    end
+ev2 = eig(full(Lnorm));
+info.min_eig_after = min(real(ev2));
+info.max_eig_after = max(real(ev2));
+end
+
+function Gamma_init = transport_init(Omega_prev, D_src, Sjj_tilde)
+F = numel(D_src);
+Gamma_init = cell(F,1);
+
+if isempty(Omega_prev)
     for f=1:F
-        D = D_src{f}; 
-        Gamma_init{f} = (D \ Omega_prev{f}) / D; 
-        Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2;
+        St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;
+        [U, D] = eig(full(St), 'vector');
+        d = real(D);
+        d = max(d, 1e-10);
+        G = U * diag(1./d) * U';
+        G = (G + G')/2;
+        Gamma_init{f} = G;
     end
+    return;
+end
+
+for f=1:F
+    D = D_src{f};
+    Gamma_init{f} = (D \ Omega_prev{f}) / D;  % 等价于 inv(D)*Ω*inv(D)'
+    Gamma_init{f} = (Gamma_init{f} + Gamma_init{f}')/2;
+end
+end
+
+function Sigma_prior = invert_and_fix(Omega_cell, eps_ld)
+if nargin < 2, eps_ld = 1e-10; end
+F = numel(Omega_cell);
+n = size(Omega_cell{1},1);
+Sigma_prior = cell(F,1);
+
+for f=1:F
+    Om = (Omega_cell{f} + Omega_cell{f}')/2;
+    Om(~isfinite(Om)) = 0;
+    d = real(diag(Om));
+    d = max(d, eps_ld);
+    Om(1:n+1:end) = d;
+    [U, S] = eig(full(Om), 'vector');
+    S = real(S);
+    S = max(S, 2*eps_ld);
+    Sigma = U * diag(1./S) * U';
+    Sigma = (Sigma + Sigma')/2;
+    Sigma(1:n+1:end) = real(diag(Sigma));
+    Sigma_prior{f} = Sigma;
+end
+end
+
+function [dOmega, dS] = compute_deltas(Omega, Omega_prev, Sjj, Sjj_prev)
+if isempty(Omega_prev)
+    dOmega = inf;
+else
+    num=0; den=0;
+    for f=1:numel(Omega)
+        num = num + norm(Omega{f}-Omega_prev{f},'fro');
+        den = den + norm(Omega_prev{f},'fro');
+    end
+    dOmega = num / max(1, den);
+end
+
+if isempty(Sjj_prev)
+    dS = inf;
+else
+    num=0; den=0;
+    for f=1:numel(Sjj)
+        num = num + norm(Sjj{f}-Sjj_prev{f},'fro');
+        den = den + norm(Sjj_prev{f},'fro');
+    end
+    dS = num / max(1, den);
+end
+end
+
+function g = read_grad_norm_(prox_res)
+g = NaN;
+try
+    if isfield(prox_res,'grad_norm')
+        g = prox_res.grad_norm;
+    end
+    if isnan(g) && isfield(prox_res,'gradient_norm_history')
+        h = prox_res.gradient_norm_history;
+        if ~isempty(h)
+            g = h(end);
+        end
+    end
+    if isnan(g) && isfield(prox_res,'grad_norm_mean')
+        g = prox_res.grad_norm_mean;
+    end
+    if isnan(g)
+        g = -1;
+    end
+catch
+    g = -1;
+end
 end
 
 function Om = inv_psd_robust_(A, eps_reg, min_ratio)
-    A = (A + A')/2; 
-    [V,D] = eig(A); 
-    d = real(diag(D)); 
-    dmax = max(d);
-    floor_val = max(min_ratio * max(dmax, eps), 0);
-    d(d<floor_val) = floor_val; 
-    if eps_reg > 0
-        d = (d + eps_reg * dmax) / (1 + eps_reg); 
+A = (A + A')/2;
+[V,D] = eig(A);
+d = real(diag(D));
+dmax = max(d);
+floor_val = max(min_ratio * max(dmax, eps), 0);
+d(d<floor_val) = floor_val;
+if eps_reg > 0
+    d = (d + eps_reg * dmax) / (1 + eps_reg);
+end
+Om = V * diag(1./d) * V';
+Om = (Om + Om')/2;
+end
+
+function [L_byS, L_byG] = estimate_L_candidates(Gamma_init, Sjj_tilde)
+F = numel(Sjj_tilde);
+Ls = 0;
+Lg = 0;
+
+for f = 1:F
+    St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;
+    s = svds(St, 1);
+    Ls = max(Ls, s^2);
+
+    G = (Gamma_init{f} + Gamma_init{f}')/2;
+    try
+        lam_min = min(real(eig(G)));
+        if ~isfinite(lam_min) || lam_min <= 0
+            invnorm = svds(pinv(G), 1);
+        else
+            invnorm = 1/lam_min;
+        end
+    catch
+        invnorm = svds(pinv(G), 1);
     end
-    Om = V * diag(1./d) * V'; 
-    Om = (Om + Om')/2;
+    Lg = max(Lg, invnorm^2);
+end
+
+L_byS = Ls;
+L_byG = Lg;
+end
+
+function diag_whitening_sanity(Sjj_hat, Sjj_tilde, D_src, iter_id)
+F = numel(Sjj_hat);
+md_hat = zeros(F,1); sd_hat = zeros(F,1);
+md_til = zeros(F,1); sd_til = zeros(F,1);
+rel_err = zeros(F,1);
+is_spd = true;
+
+for f = 1:F
+    Sh = (Sjj_hat{f} + Sjj_hat{f}')/2;
+    St = (Sjj_tilde{f} + Sjj_tilde{f}')/2;
+    D = D_src{f};
+    md_hat(f) = mean(real(diag(Sh)));
+    sd_hat(f) = std(real(diag(Sh)));
+    md_til(f) = mean(real(diag(St)));
+    sd_til(f) = std(real(diag(St)));
+    R = D*Sh*D - St;
+    rel_err(f) = norm(R,'fro') / max(1, norm(St,'fro'));
+    try
+        ev = eig(St);
+        is_spd = is_spd && all(real(ev) > -1e-10);
+    catch
+        is_spd = false;
+    end
+end
+
+fprintf(['[DIAG][t=%d] <Whitening>\n    mean(diag S_hat)=%.3g±%.3g | ' ...
+    'mean(diag S_tilde)=%.3g±%.3g (≈1)\n' ...
+    '    max relErr ||D*S*D - S_tilde||_F / ||S_tilde||_F = %.2e | ' ...
+    'S_tilde SPD? %s\n'], ...
+    iter_id, mean(md_hat), mean(sd_hat), mean(md_til), mean(sd_til), ...
+    max(rel_err), ternary(is_spd,'YES','NO'));
+
+if mean(md_til) > 2 || mean(md_til) < 0.5
+    warning('[DIAG] whitened diagonals far from 1 (mean=%.3g).', mean(md_til));
+end
+if max(rel_err) > 1e-6
+    warning('[DIAG] D*S*D and S_tilde mismatch (%.2e).', max(rel_err));
+end
+end
+
+function out = ternary(cond, a, b)
+if cond, out = a; else, out = b; end
+end
+
+%% ========= eLORETA warmstart helpers =========
+function warm = eloreta_warmstart_from_covs(Svv_cell, L, gamma_grid, opts)
+if nargin < 4, opts = struct(); end
+maxit = getf(opts,'maxit',50);
+tol = getf(opts,'tol',1e-6);
+verb = getf(opts,'verbose',false);
+
+F = numel(Svv_cell);
+Tjv_cell = cell(F,1);
+Sjj_cell = cell(F,1);
+Om0_cell = cell(F,1);
+gcv_cell = cell(F,1);
+gopt_cell = cell(F,1);
+
+for f = 1:F
+    Svv = Svv_cell{f};
+    [Tjv, Sjj, ~, gamma_opt, gcv] = eloreta_simple_(Svv, L, gamma_grid, maxit, tol, verb);
+    Sjj = psd_project_(Sjj);
+    Om0 = inv_psd_robust_(Sjj, 1e-8, 1e-12);
+    Tjv_cell{f} = Tjv;
+    Sjj_cell{f} = Sjj;
+    Om0_cell{f} = Om0;
+    gcv_cell{f} = gcv;
+    gopt_cell{f} = gamma_opt;
+end
+
+warm = struct('Omega_init',{Om0_cell}, 'Sjj_e',{Sjj_cell}, 'Tjv',{Tjv_cell}, ...
+    'gamma_opt',{gopt_cell}, 'gcv_curve',{gcv_cell});
+end
+
+function [Tjv, Sjj, W, gamma_opt, gcv] = eloreta_simple_(Svv, L, gamma_grid, maxit, tol, verb)
+[p,n] = size(L);
+gcv = zeros(numel(gamma_grid),1);
+best.T = [];
+best.W = [];
+best.gamma = NaN;
+best.score = Inf;
+
+for k = 1:numel(gamma_grid)
+    gamma = gamma_grid(k);
+    w = ones(n,1);
+    for it=1:maxit
+        Winv = diag(1./w);
+        A = hermi_(L*Winv*L');
+        alpha = gamma * trace(A)/p;
+        M = inv_psd_(A + alpha*eye(p));
+        w_old = w;
+        for i=1:n
+            li = L(:,i);
+            mii = real(li' * M * li);
+            w(i) = sqrt(max(mii, eps));
+        end
+        if norm(w-w_old)/max(1,norm(w_old)) < tol
+            break;
+        end
+    end
+    Winv = diag(1./w);
+    T = Winv * L' * M;
+    Txiv = eye(p) - L*T;
+    num = real(trace(hermi_(Txiv*Svv*Txiv')))/p;
+    den = (real(trace(Txiv))/p)^2 + eps;
+    gcv(k) = num / den;
+    if gcv(k) < best.score
+        best.T = T;
+        best.W = diag(w);
+        best.gamma = gamma;
+        best.score = gcv(k);
+    end
+    if verb && (mod(k,10)==1)
+        fprintf('[eLORETA] gamma=%.3g, GCV=%.3g\n', gamma, gcv(k));
+    end
+end
+
+Tjv = best.T;
+gamma_opt = best.gamma;
+W = best.W;
+Sjj = Tjv * Svv * Tjv';
+end
+
+function A = hermi_(A)
+A = (A + A')/2;
+end
+
+function X = inv_psd_(X)
+X = hermi_(X);
+[U,S] = eig(X,'vector');
+S = max(real(S), eps);
+X = U*diag(1./S)*U';
+X = hermi_(X);
+end
+
+function S = psd_project_(S)
+S = hermi_(S);
+[U,d] = eig(S,'vector');
+d = max(real(d), 0);
+S = U*diag(d)*U';
+S = hermi_(S);
+end
+
+function v = getf(s, f, d)
+if isfield(s,f) && ~isempty(s.(f))
+    v = s.(f);
+else
+    v = d;
+end
+end
+function S = invert_cell_spd_(Omega_cell, eps_reg, min_ratio)
+    F=numel(Omega_cell); S=cell(F,1);
+    for f=1:F, S{f}=inv_psd_robust_(Omega_cell{f}, eps_reg, min_ratio); end
 end

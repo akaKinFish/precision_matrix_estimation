@@ -7,6 +7,8 @@ if isempty(project_root)
     project_root = pwd;
 end
 
+addpath(genpath('G:\MEEG_Source_Connectivity_SoftPack-master'))
+
 % Add all necessary directories to path
 addpath(project_root);
 addpath(genpath(fullfile(project_root, 'src')));
@@ -17,3 +19,5 @@ addpath(fullfile(project_root, 'config'));
 
 fprintf('Precision Matrix Estimation project paths configured.\\n');
 fprintf('Project root: %s\\n', project_root);
+
+addpath(genpath('F:\XiAlphaNet'));

@@ -12,6 +12,11 @@ data/cache/*
 results/figures/*
 results/metrics/*
 results/logs/*
+figs/*
+result/*
+result_1/*
+result_32/*
+results/*
 !results/*/.gitkeep
 
 # OS files

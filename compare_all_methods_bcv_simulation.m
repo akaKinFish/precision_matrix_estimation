@@ -1,4 +1,4 @@
-function results = compare_all_methods(cfg)
+function results = compare_all_methods_bcv_simulation(cfg)
 % COMPARE_ALL_METHODS  仿真 → 估计 →（BC-V风格）评测 → 控制台输出 → 保存
 %
 % 评测改为三块：
@@ -85,51 +85,118 @@ fprintf('================= compare_all_methods =================\n');
 
 %% ========= 1) 仿真 =========
 fprintf('==[1/5] Simulation (%s generator) ==\n', cfg.simulator);
-switch lower(getd(cfg,'simulator','bayes'))
-    case 'matched'
-        cfg_sim2 = struct();
-        cfg_sim2.p = cfg.n_nodes;
-        cfg_sim2.n = cfg.n_sensors;
-        cfg_sim2.F = cfg.n_freq;
-        cfg_sim2.T = cfg.n_samples;
-        cfg_sim2.edge_density = cfg.edge_density;
-        cfg_sim2.lambda1_star = cfg.lambda1_star;
-        cfg_sim2.lambda2_star = cfg.lambda2_star;
-        cfg_sim2.noise_type = cfg.noise_type;
-        cfg_sim2.sigma_xi2 = cfg.sigma_xi2;
-        cfg_sim2.leadfield_type = cfg.leadfield_type;
-        cfg_sim2.complex_samples = cfg.complex_samples;
-        cfg_sim2 = override_struct(cfg_sim2, getd(cfg,'sim_matched',struct()));
-        [Omega_true, Sigma_true, emp_cov_cell, L, T, bayes_truth, sim] = module7_simulation_matched(cfg_sim2);
-    otherwise
-        cfg_sim = struct();
-        cfg_sim.p = cfg.n_nodes;
-        cfg_sim.m = cfg.n_sensors;
-        cfg_sim.F = cfg.n_freq;
-        cfg_sim.T = cfg.n_samples;
-        cfg_sim.edge_density = cfg.edge_density;
-        cfg_sim.modeN = cfg.modeN;
-        cfg_sim.support_strategy = cfg.support_strategy;
-        cfg_sim.lambda1_star = cfg.lambda1_star;
-        cfg_sim.lambda2_star = cfg.lambda2_star;
-        cfg_sim.sigma_xi2 = cfg.sigma_xi2;
-        cfg_sim.delta_eps = cfg.delta_eps;
-        cfg_sim.noise_type = cfg.noise_type;
-        cfg_sim.complex_samples = cfg.complex_samples;
-        [Omega_true, Sigma_true, emp_cov_cell, L, T, bayes_truth, sim] = module7_simulation_bayesian(cfg_sim);
+process_waitbar = waitbar(0,'Please wait...');
+%%
+%% Create partial correlations (ThetaJJ)
+%  Generate source (state) empirical covariance (SJJ) and source (state) activity (J)
+m                    = 600;             % Sample number
+q                    = 10;              % Number of generators
+p                    = 3;              % Number of sensors
+nblocks              = 2;               % Number of blocks in simulation
+options.config       = 2;               % (2) overlapping blocks (1) nonoverlapping blocks
+options.var          = 2;               % (2) complex variable (1) real variable
+options.extensions   = [ceil(q/3); ceil(q/3); q - 2*ceil(q/3)]; % patches extensions
+options.connections  = [1 2; 2 3];      % patches connections
+% [Sjj_sim,j_sim,Thetajj_sim] = gen_hggm1(m,q,nblocks,options);
+% j_sim = transpose(j_sim);
+
+[Sjj_sim,j_sim,Thetajj_sim] = gen_hggm2(m,q,options);
+%% Creating pseudoLead Field (L)
+Lvj             = zeros(p,q);
+radj            = 60;
+radv            = 85;
+angj            = 2*pi/q;
+angv            = 2*pi/p;
+for contv = 1:p
+    for contj = 1:q
+        waitbar((contv*contj)/(p*q),process_waitbar,strcat('Creating pseudoLead Field (L)'));
+        vectv            = [radv*cos((contv-1)*angv); radv*sin((contv-1)*angv)];
+        vectj            = [radj*cos((contj-1)*angj); radj*sin((contj-1)*angj)];
+        r                = vectv - vectj;
+        r_unit           = r/sqrt(sum(abs(r).^2));
+        miu              = vectj/sqrt(sum(abs(vectj).^2));
+        Lvj(contv,contj) = (1/(4*pi))*miu'*r_unit/sqrt(sum(abs(r).^2))^2;
+    end
 end
+delete(process_waitbar);
 
-print_sim_summary(bayes_truth, sim, Omega_true);
 
-% 保存仿真数据
-emp_covariance = emp_cov_cell;  %#ok<NASGU>
-save(fullfile(outdir,'sim_data.mat'), 'Omega_true','Sigma_true','emp_cov_cell','emp_covariance','L','T','bayes_truth','sim','cfg');
+% LeadFields      = {Lvj};
+% save('LeadFields_pseudo','LeadFields')
+%% pseudo-cortex
+
+process_waitbar = waitbar(0,'Please wait...');
+vertices        = zeros(q,2);
+for contj = 1:q
+    waitbar((contj)/(q),process_waitbar,strcat('pseudo-cortex'));
+    vertices(contj,:)    = [radj*cos((contj-1)*angj) radj*sin((contj-1)*angj)];
+end
+delete(process_waitbar);
+
+process_waitbar = waitbar(0,'Please wait...');
+faces           = [[1:q]' [2:q 1]'];
+cortex.vertices = vertices;
+cortex.faces    = faces;
+coor            = zeros(p,2);
+for contv = 1:p
+    waitbar((contv)/(p),process_waitbar,strcat('HeadModel-pseudo ',' cortex ',' coor'));
+    coor(contv,:)    = [radv*cos((contv-1)*angv) radv*sin((contv-1)*angv)];
+end
+delete(process_waitbar);
+
+%%
+process_waitbar = waitbar(0,'Please wait...');
+
+%% Generate data
+v0              = Lvj*j_sim; % data (observation)
+%% Biological noise
+bionoise        = randn(q,m) + 1i*randn(q,m);
+bionoise        = Lvj*bionoise;
+bionoise        = sum(abs(v0(:)).^2)^(1/2)*bionoise/sum(abs(bionoise(:)).^2)^(1/2);
+%% Sensor noise
+sensnoise       = randn(p,m) + 1i*randn(p,m);
+sensnoise       = sum(abs(v0(:)).^2)^(1/2)*sensnoise/sum(abs(sensnoise(:)).^2)^(1/2);
+%% Corrupted data
+v               = v0 + 0.1*bionoise + 0.1*sensnoise;
+%% Data empirical covariance
+Svv             = cov(v');
+%% Data empirical covariance
+Svv             = cov(v');
+
+% ====== [新增]：把“真值”补齐，统一为 BC-V 语义 ======
+T               = m;                 % 样本数 = 你用来造 Svv 的时段数
+F               = 1;                 % 这一版仿真是单频
+emp_cov_cell    = {Svv};
+L               = Lvj;
+
+% 【关键修正】Omega_true 应当是精度真值（Thetajj_sim），不是协方差
+Omega_true      = { hermitize(Thetajj_sim) };
+
+% 如果后面评测会用到 Sigma_true，就顺便给出真值协方差（Ω 的稳健逆）
+Sigma_true      = { inv_psd( Omega_true{1} ) };
+
+% 【新增】构造 bayes_truth（给 GLS 白化/似然打分用）
+% 只把“传感器噪声”当作观测噪声真值；生理噪声属于源域扰动，不并入 Σ_xixi
+Sigma_xixi_true = cov( (0.1*sensnoise)' );  % p×p
+Sigma_xixi_true = (Sigma_xixi_true + Sigma_xixi_true')/2;    % Hermitian
+bayes_truth = struct();
+bayes_truth.noise_type        = 'matrix';    % 告诉后续：我提供了完整的 Σ_xixi 真值
+bayes_truth.Sigma_xixi_true   = Sigma_xixi_true;
+
+% （可选，仅用于日志展示，不参与计算）
+bayes_truth.lambda1_true = getd(cfg,'lambda1_star',NaN);
+bayes_truth.lambda2_true = getd(cfg,'lambda2_star',NaN);
+
+% （可选）记录仿真元信息，方便保存/复现
+sim = struct('p', q, 'm', m, 'F', F, 'T', T);
+
 
 %% ========= 2) 你的算法（my_test2 扫参） =========
 fprintf('==[2/5] Run YOUR algorithm (my_test2_adapter, hyperparam sweep) ==\n');
 
 % baseline 适配器配置
 cfg_est_base = struct();
+bayes_truth.noise_type = 'matrix';
 switch lower(bayes_truth.noise_type)
     case 'scalar'
         % 修正：使用 getd 替代 ifempty
