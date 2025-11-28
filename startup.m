@@ -7,14 +7,11 @@ if isempty(project_root)
     project_root = pwd;
 end
 
-addpath(genpath('G:\MEEG_Source_Connectivity_SoftPack-master'))
 
 % Add all necessary directories to path
 addpath(project_root);
 addpath(genpath(fullfile(project_root, 'src')));
 addpath(genpath(fullfile(project_root, 'utils')));
-addpath(genpath(fullfile(project_root, 'tests')));
-addpath(fullfile(project_root, 'examples'));
 addpath(fullfile(project_root, 'config'));
 
 fprintf('Precision Matrix Estimation project paths configured.\\n');

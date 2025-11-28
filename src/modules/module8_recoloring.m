@@ -24,7 +24,7 @@ function recoloring_results = module8_recoloring(input_data, recoloring_params)
     % -------- Route to main or fallback core ----------
     try
         if exist('module8_recoloring_main','file') == 2
-            % 把“已归一化”的 in_data 传给主实现
+            % 把"已归一化"的 in_data 传给主实现
             recoloring_results = module8_recoloring_main(in_data, recoloring_params);
             % 兼容：补充 success 字段
             if ~isfield(recoloring_results,'success'), recoloring_results.success = true; end
