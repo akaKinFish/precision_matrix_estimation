@@ -36,7 +36,7 @@ cfg.rayleigh_range = 2.5:0.25:4.5;
 % 3. Run Solver
 % Note: J-SPACE returns Sigma_src_est (Covariance/Cross-Spectrum) and Omega_est (Precision)
 try
-    [~, Sigma_src_est, ~] = solver_jspace(Svv_cell, L, [], cfg);
+    [~, Sigma_src_est, ~] = solver_jspace_adaptive(Svv_cell, L, [], cfg);
 
     % 4. Convert Output back to 3D Matrix
     Sjj_jspace = zeros(Nr, Nr, Nw);

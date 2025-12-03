@@ -182,21 +182,21 @@ for j = 1:Nsub
     data.age = 25;  % Subject age
     data.freq = freq;
 
-    % disp('->> Xi-AlphaNeT Inverse Solution');
-    % [x, ~, G, x0] = Xi_ALphaNET(properties, data, parameters);
-    % source_act_cross = functions.auxx.CrossSpectrum.eval_source_conn(x.Solution, data.freq, parameters.Model.R, properties, parameters);
-    % XA_Sjj_cross = source_act_cross.Cross.Full;
-    % 
-    % % Additional processing (mean cross-spectrum)
-    % % Calculate the mean cross-spectrum across frequencies
-    % mn_Sjj_cross = mn_cross(Svv_cross, K, 0);
-    % 
-    % disp('->> eLORETA Processing...');
-    % % Compute eLORETA source cross-spectra for each frequency bin
-    % parfor i = 1:Nw
-    %     source = inverse(Svv_cross(:,:,i), L);
-    %     eL_Sjj_cross(:,:,i) = source.eloreata.Sjj;
-    % end
+    disp('->> Xi-AlphaNeT Inverse Solution');
+    [x, ~, G, x0] = Xi_ALphaNET(properties, data, parameters);
+    source_act_cross = functions.auxx.CrossSpectrum.eval_source_conn(x.Solution, data.freq, parameters.Model.R, properties, parameters);
+    XA_Sjj_cross = source_act_cross.Cross.Full;
+
+    % Additional processing (mean cross-spectrum)
+    % Calculate the mean cross-spectrum across frequencies
+    mn_Sjj_cross = mn_cross(Svv_cross, K, 0);
+
+    disp('->> eLORETA Processing...');
+    % Compute eLORETA source cross-spectra for each frequency bin
+    parfor i = 1:Nw
+        source = inverse(Svv_cross(:,:,i), L);
+        eL_Sjj_cross(:,:,i) = source.eloreata.Sjj;
+    end
     
     % [ADDED] J-SPACE Processing
     disp('->> J-SPACE Processing...');

@@ -79,24 +79,24 @@ if USE_GPU
 end
 
 % ============================================================
-    % [FIX] Handle Empty GraphLaplacian
-    % ============================================================
-    % If user passed [], we must ensure lambda3 is effectively disabled 
-    % or the matrix is valid for multiplication.
-    
-    if isempty(GraphLaplacian)
-        if VERBOSE
-            fprintf('[J-SPACE] No Spatial Laplacian provided. Disabling Spatial Smoothing (Lambda3).\n');
-        end
-        % Option A: Disable parameter
-        L3_RATIO = 0; 
-        
-        % Option B: Create dummy zero matrix (safe for multiplication)
-        GraphLaplacian = zeros(Nr, Nr, 'like', L); 
-    end
+% [FIX] Handle Empty GraphLaplacian
+% ============================================================
+% If user passed [], we must ensure lambda3 is effectively disabled
+% or the matrix is valid for multiplication.
 
-    % History Storage
-    outs = struct('loglik', [], 'best_lambdas', []);
+if isempty(GraphLaplacian)
+    if VERBOSE
+        fprintf('[J-SPACE] No Spatial Laplacian provided. Disabling Spatial Smoothing (Lambda3).\n');
+    end
+    % Option A: Disable parameter
+    L3_RATIO = 0;
+
+    % Option B: Create dummy zero matrix (safe for multiplication)
+    GraphLaplacian = zeros(Nr, Nr, 'like', L);
+end
+
+% History Storage
+outs = struct('loglik', [], 'best_lambdas', []);
 
 % ============================================================
 % 2. Initialization: eLORETA
@@ -191,134 +191,134 @@ for em_iter = 1:MAX_EM_ITER
     % Heuristic for Lambda3 (Spatial): usually smaller than Lambda1
     lambda3_used = lambda1_used * L3_RATIO;
 
-% --------------------------------------------------------
-        % M-Step Part 4: PGD with Grid Search + EBIC (Module 5)
-        % --------------------------------------------------------
-        
-        % A. Define Grid (保持不变，基于数据)
-        S_ref = Sjj_tilde{1};
-        mask_off = tril(true(Nr), -1);
-        max_val = max(abs(S_ref(mask_off)));
-        
-        % 确保 max_val 有意义
-        if max_val < 1e-3, max_val = 1.0; end 
-        
-        % 搜索范围：从最大相关性开始，下探到 0.1% 
-        min_val = max_val * 0.001; 
-        lambda_grid = logspace(log10(max_val), log10(min_val), GRID_SIZE);
-        
-        % B. Prepare Fixed Params for PGD
-        m5_input.whitened_covariances = Sjj_tilde;
-        m5_input.smoothing_kernel     = m6_input.kernel_matrix;
-        m5_input.weight_matrix        = eye(Nr);
-        m5_input.active_mask          = active_mask;
-        
-        m5_params.lambda1 = lambda1_used;
-        m5_params.lambda3 = lambda3_used;
-        m5_params.spatial_graph_matrix = GraphLaplacian;
-        m5_params.spatial_graph_is_laplacian = true;
-        
-        % [FIX 1] 激进的步长：不要用保守的 alpha_used，给个大初值，靠回溯去缩减
-        m5_params.alpha0   = 0.5;  
-        
-        % [FIX 2] 更严格的容差，防止早停
-        m5_params.tol      = 1e-7; 
-        
-        m5_params.max_iter = 100; 
-        m5_params.verbose  = false; % 关掉内部打印，避免刷屏
-        m5_params.auto_tune = false; % 关掉内部 Gershgorin，我们手动控制了 alpha
-        m5_params.weight_mode = 'hadamard';
+    % --------------------------------------------------------
+    % M-Step Part 4: PGD with Grid Search + EBIC (Module 5)
+    % --------------------------------------------------------
 
-        % C. Run Grid Search
-        best_score = Inf;
-        best_Gamma = Gamma_warm_start;
-        best_lambda = lambda_grid(1);
-        best_density = 0;
-        
-        current_G = Gamma_warm_start;
-        
+    % A. Define Grid (保持不变，基于数据)
+    S_ref = Sjj_tilde{1};
+    mask_off = tril(true(Nr), -1);
+    max_val = max(abs(S_ref(mask_off)));
+
+    % 确保 max_val 有意义
+    if max_val < 1e-3, max_val = 1.0; end
+
+    % 搜索范围：从最大相关性开始，下探到 0.1%
+    min_val = max_val * 0.001;
+    lambda_grid = logspace(log10(max_val), log10(min_val), GRID_SIZE);
+
+    % B. Prepare Fixed Params for PGD
+    m5_input.whitened_covariances = Sjj_tilde;
+    m5_input.smoothing_kernel     = m6_input.kernel_matrix;
+    m5_input.weight_matrix        = eye(Nr);
+    m5_input.active_mask          = active_mask;
+
+    m5_params.lambda1 = lambda1_used;
+    m5_params.lambda3 = lambda3_used;
+    m5_params.spatial_graph_matrix = GraphLaplacian;
+    m5_params.spatial_graph_is_laplacian = true;
+
+    % [FIX 1] 激进的步长：不要用保守的 alpha_used，给个大初值，靠回溯去缩减
+    m5_params.alpha0   = 0.5;
+
+    % [FIX 2] 更严格的容差，防止早停
+    m5_params.tol      = 1e-7;
+
+    m5_params.max_iter = 100;
+    m5_params.verbose  = false; % 关掉内部打印，避免刷屏
+    m5_params.auto_tune = false; % 关掉内部 Gershgorin，我们手动控制了 alpha
+    m5_params.weight_mode = 'hadamard';
+
+    % C. Run Grid Search
+    best_score = Inf;
+    best_Gamma = Gamma_warm_start;
+    best_lambda = lambda_grid(1);
+    best_density = 0;
+
+    current_G = Gamma_warm_start;
+
+    if VERBOSE
+        fprintf('  [M-Step] Grid Search (MaxVal=%.2e) ...\n', max_val);
+        fprintf('          %-10s | %-10s | %-10s | %-12s\n', 'Lambda', 'Density', 'Alpha', 'Score');
+    end
+
+    % Get Selection Metric (Default EBIC gamma=0 to encourage edges)
+    metric_type = get_cfg(cfg, 'selection_metric', 'ebic');
+    ebic_gamma  = get_cfg(cfg, 'ebic_gamma', 0.0);
+
+    for k = 1:GRID_SIZE
+        lam = lambda_grid(k);
+
+        % Update Params
+        m5_params.lambda2 = lam;
+        m5_input.precision_matrices = current_G;
+
+        % [FIX 3] 如果上一次结果是全零（Identity），不要用它做 Warm Start
+        % 因为在全零点梯度的变化极小，容易再次陷进去。
+        % 重新初始化为 Inv(Sigma) 会更有活力。
+        if k > 1
+            G_prev = current_G{1}; G_prev(1:Nr+1:end)=0;
+            if max(abs(G_prev(:))) < 1e-8
+                % Reset Warm Start if previous was dead
+                % current_G = Gamma_warm_start; % 或者保持 Identity
+                % 更好的策略：增大一点 alpha，刺激它跳出来
+                m5_params.alpha0 = 1.0;
+            end
+        end
+
+        % Run PGD
+        [G_temp, stats_temp] = module5_proximal_main(m5_input, m5_params);
+
+        % --- Calculate Score ---
+        G1 = G_temp{1};
+        [ld, valid] = utils_math.safe_log_det(G1);
+        if ~valid, ld = -1e10; end
+        tr_val = real(trace(Sjj_tilde{1} * G1));
+
+        G_off = G1; G_off(1:Nr+1:end) = 0;
+        num_edges = sum(abs(G_off(:)) > 1e-5) / 2;
+        density = num_edges / (Nr*(Nr-1)/2);
+
+        % 熔断机制
+        if density > 0.25
+            if VERBOSE, fprintf('          %.4e | >25%% (Stop)\n', lam); end
+            break;
+        end
+
+        % Compute Metric
+        minus_2_ll = M_SAMPLES * (tr_val - ld);
+
+        switch lower(metric_type)
+            case 'aic',  current_score = minus_2_ll + 2 * num_edges;
+            case 'bic',  current_score = minus_2_ll + num_edges * log(M_SAMPLES);
+            otherwise,   current_score = minus_2_ll + num_edges * log(M_SAMPLES) + ...
+                    4 * num_edges * ebic_gamma * log(Nr);
+        end
+
+        % 打印调试信息 (显示最终的 alpha，确认它有没有变大)
+        final_alpha = stats_temp.final_alpha;
+        is_best = '';
+        if current_score < best_score
+            best_score = current_score;
+            best_Gamma = G_temp;
+            best_lambda = lam;
+            best_density = density;
+            is_best = '(*)';
+        end
+
         if VERBOSE
-            fprintf('  [M-Step] Grid Search (MaxVal=%.2e) ...\n', max_val);
-            fprintf('          %-10s | %-10s | %-10s | %-12s\n', 'Lambda', 'Density', 'Alpha', 'Score');
+            fprintf('          %.4e | %5.2f%%     | %.2e    | %.4e %s\n', ...
+                lam, density*100, final_alpha, current_score, is_best);
         end
-        
-        % Get Selection Metric (Default EBIC gamma=0 to encourage edges)
-        metric_type = get_cfg(cfg, 'selection_metric', 'ebic'); 
-        ebic_gamma  = get_cfg(cfg, 'ebic_gamma', 0.0); 
-        
-        for k = 1:GRID_SIZE
-            lam = lambda_grid(k);
-            
-            % Update Params
-            m5_params.lambda2 = lam;
-            m5_input.precision_matrices = current_G; 
-            
-            % [FIX 3] 如果上一次结果是全零（Identity），不要用它做 Warm Start
-            % 因为在全零点梯度的变化极小，容易再次陷进去。
-            % 重新初始化为 Inv(Sigma) 会更有活力。
-            if k > 1
-                G_prev = current_G{1}; G_prev(1:Nr+1:end)=0;
-                if max(abs(G_prev(:))) < 1e-8
-                     % Reset Warm Start if previous was dead
-                     % current_G = Gamma_warm_start; % 或者保持 Identity
-                     % 更好的策略：增大一点 alpha，刺激它跳出来
-                     m5_params.alpha0 = 1.0; 
-                end
-            end
-            
-            % Run PGD
-            [G_temp, stats_temp] = module5_proximal_main(m5_input, m5_params);
-            
-            % --- Calculate Score ---
-            G1 = G_temp{1};
-            [ld, valid] = utils_math.safe_log_det(G1);
-            if ~valid, ld = -1e10; end
-            tr_val = real(trace(Sjj_tilde{1} * G1));
-            
-            G_off = G1; G_off(1:Nr+1:end) = 0;
-            num_edges = sum(abs(G_off(:)) > 1e-5) / 2;
-            density = num_edges / (Nr*(Nr-1)/2);
-            
-            % 熔断机制
-            if density > 0.25
-                if VERBOSE, fprintf('          %.4e | >25%% (Stop)\n', lam); end
-                break; 
-            end
-            
-            % Compute Metric
-            minus_2_ll = M_SAMPLES * (tr_val - ld);
-            
-            switch lower(metric_type)
-                case 'aic',  current_score = minus_2_ll + 2 * num_edges;
-                case 'bic',  current_score = minus_2_ll + num_edges * log(M_SAMPLES);
-                otherwise,   current_score = minus_2_ll + num_edges * log(M_SAMPLES) + ...
-                                            4 * num_edges * ebic_gamma * log(Nr);
-            end
-            
-            % 打印调试信息 (显示最终的 alpha，确认它有没有变大)
-            final_alpha = stats_temp.final_alpha;
-            is_best = '';
-            if current_score < best_score
-                best_score = current_score;
-                best_Gamma = G_temp;
-                best_lambda = lam;
-                best_density = density;
-                is_best = '(*)';
-            end
-            
-            if VERBOSE
-                fprintf('          %.4e | %5.2f%%     | %.2e    | %.4e %s\n', ...
-                        lam, density*100, final_alpha, current_score, is_best);
-            end
-            
-            current_G = G_temp;
-        end
-        
-        Gamma_warm_start = best_Gamma;
-    
+
+        current_G = G_temp;
+    end
+
+    Gamma_warm_start = best_Gamma;
+
     if VERBOSE
         fprintf('           Selected lambda2=%.2e | Density=%.2f%% | %s=%.2e\n', ...
-                best_lambda, best_density*100, upper(metric_type), best_score);
+            best_lambda, best_density*100, upper(metric_type), best_score);
     end
     % [NEW] M-Step Part 4.5: Debiasing & Rayleigh Selection
 
@@ -381,23 +381,48 @@ for em_iter = 1:MAX_EM_ITER
     Omega_new = recol.recolored_precision_matrices;
 
     for f=1:F
-        Om = (Omega_new{f} + Omega_new{f}')/2;
-        try
-            % Invert Precision to get Covariance
-            Sigma_temp = inv(Om + 1e-12*eye(Nr));
+        % 1. Symmetrize Precision Matrix
+        Om = (Omega_new{f} + Omega_new{f}') / 2;
 
-            % [FIX]: Sanitize Sigma to avoid complex dust
-            Sigma_temp = (Sigma_temp + Sigma_temp') / 2; % Force Hermitian
+        % 2. Robust Inversion via Eigendecomposition
+        %    Direct inv() is unstable for sparse/ill-conditioned matrices.
+        %    We use eig() to floor tiny eigenvalues before inversion.
 
-            % Force Diagonal to be Real (Power must be real)
-            % Remove tiny imaginary parts caused by numerical inversion
-            p_idx = 1:Nr+1:Nr*Nr;
-            Sigma_temp(p_idx) = real(Sigma_temp(p_idx));
+        % Ensure we are working with full matrices for eig()
+        if issparse(Om), Om = full(Om); end
 
-            Sigma_source_curr{f} = Sigma_temp;
-        catch
-            Sigma_source_curr{f} = pinv(Om);
+        [V, D_vec] = eig(Om, 'vector');
+
+        % Floor eigenvalues: Precision eigenvalues correspond to 1/Variance.
+        % Extremely small precision eigenvalues (< 1e-9) lead to exploding variance.
+        % We clamp them to a safe minimum (e.g., 1e-8).
+        min_prec_tol = 1e-8;
+        D_safe = max(real(D_vec), min_prec_tol);
+
+        % Reconstruct Covariance: Sigma = V * D^{-1} * V'
+        % Optimized multiplication: V * ( (1./D) .* V' )
+        S_next = V * ( (1 ./ D_safe) .* V' );
+
+        % 3. Numerical Sanitization
+        % Remove imaginary dust and force symmetry
+        S_next = real((S_next + S_next') / 2);
+
+        % 4. Physics Constraint: Diagonal Positivity
+        % Variance (Power) implies diagonal elements MUST be positive.
+        d_diag = diag(S_next);
+        if any(d_diag <= 0)
+            % Fix invalid diagonals caused by numerical undershoot
+            d_diag(d_diag <= 0) = 1e-12;
+            S_next(1:Nr+1:end) = d_diag;
+
+            % Optional: strict SPD projection if needed
+            % [S_next, ~] = utils_math.project_spd(S_next, 1e-12);
         end
+
+        % 5. Momentum / Inertia Update
+        % Sigma_new = (1 - rate) * Sigma_old + rate * Sigma_estimated
+        Sigma_source_curr{f} = (1 - UPDATE_RATE) * Sigma_source_curr{f} + UPDATE_RATE * S_next;
+
     end
 
     % Store stats
