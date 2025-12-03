@@ -46,9 +46,9 @@ function [Gamma_debiased, Gamma_rayleigh] = module_debias(Gamma_hat_cell, S_whit
         Gamma_debiased{f} = G_tilde;
         
         % --- 2. Variance Estimation (Eq 7.10) ---
-        % Asymptotic variance proxy for the debiased estimator
-        d = diag(G_tilde);
-        Var_proxy = real(d * d') + abs(G_tilde).^2;
+        % Use the original (biased) estimator for the variance proxy as in the docs
+        d = diag(G);
+        Var_proxy = real(d * d') + abs(G).^2;
         
         % --- 3. Rayleigh Thresholding (Eq 7.12) ---
         % Statistical significance test

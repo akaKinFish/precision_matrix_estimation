@@ -30,6 +30,10 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
     
     if isfield(cfg, 'm_samples'), M_SAMPLES = cfg.m_samples; else, M_SAMPLES = 100 * Nr; end
 
+    % Frequency kernel and spatial weights for smoothing
+    K_freq = get_cfg(cfg, 'freq_kernel', eye(F));
+    W_gamma = get_cfg(cfg, 'weight_matrix', eye(Nr));
+
     % Handle Empty Laplacian
     if isempty(GraphLaplacian)
         L3_RATIO = 0; GraphLaplacian = zeros(Nr, Nr, 'like', L);
@@ -99,7 +103,8 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         
         % Hyperparams
         m6_in.whitened_covariances = Sjj_tilde;
-        m6_in.kernel_matrix = eye(F); m6_in.weight_matrix = eye(Nr);
+        m6_in.kernel_matrix = K_freq; 
+        m6_in.weight_matrix = W_gamma;
         hp = module6_hyperparameters(m6_in, 'verbose', false);
         
         % M-Step Grid Search (Internal)
@@ -109,8 +114,8 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         lambda_grid = logspace(log10(max_val), log10(min_val), GRID_SIZE);
         
         m5_in.whitened_covariances = Sjj_tilde;
-        m5_in.smoothing_kernel = eye(F);
-        m5_in.weight_matrix = eye(Nr);
+        m5_in.smoothing_kernel = K_freq;
+        m5_in.weight_matrix = W_gamma;
         m5_in.active_mask = module3_active_set(Sjj_tilde, struct('quantile_level', ACT_Q));
         
         m5_p.lambda1 = hp.lambda1 * L1_RATIO;
@@ -161,22 +166,63 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
             fprintf('  Selected lambda2=%.2e | Density=%.2f%% | Score=%.2e\n', best_lam, best_den*100, best_score);
         end
         
-        % Debiasing
-        [Gamma_debiased, Gamma_ray] = module_debias(best_G, Sjj_tilde, M_SAMPLES);
-        
+        % Debiasing (dense)
+        [Gamma_debiased, ~] = module_debias(best_G, Sjj_tilde, M_SAMPLES);
+
+        % Rayleigh threshold search (uses debiased matrices, variance from Gamma_hat)
+        ray_params.lambda1 = m5_p.lambda1;
+        ray_params.lambda3 = m5_p.lambda3;
+        ray_params.weight_mode = m5_p.weight_mode;
+        ray_params.variance_source = 'hat';
+        ray_params.Gamma_hat = best_G;
+        if isfield(cfg, 'rayleigh_range')
+            ray_params.r_range = cfg.rayleigh_range;
+        end
+
+        [Gamma_ray, best_r, ~] = module_rayleigh_search( ...
+            Gamma_debiased, Sjj_tilde, M_SAMPLES, K_freq, W_gamma, ray_params);
+
+        % Support mask for SPD refit (lambda2 = 0)
+        refit_mask = cell(F, 1);
+        for f=1:F
+            refit_mask{f} = abs(Gamma_ray{f}) > 0;
+            refit_mask{f}(1:Nr+1:end) = true;
+        end
+
+        refit_in = m5_in;
+        refit_in.precision_matrices = Gamma_ray;
+        refit_in.active_mask = refit_mask;
+
+        refit_params = m5_p;
+        refit_params.lambda2 = 0;
+        refit_params.max_iter = min(50, m5_p.max_iter);
+        refit_params.tol = min(m5_p.tol, 5e-4);
+
+        [Gamma_refit, ~] = module5_proximal_main(refit_in, refit_params);
+        best_G = Gamma_refit;
+        Gamma_warm_start = best_G;
+
+        if VERBOSE
+            fprintf('  Rayleigh best r=%.2f | Refitting on support with lambda2=0\n', best_r);
+        end
+
         % Recoloring
-        m8_in.whitened_precision_matrices = Gamma_ray;
+        m8_in.whitened_precision_matrices = best_G;
         m8_in.whitening_matrices = D_cell;
         recol = module8_recoloring(m8_in, struct('verbose', false));
         Omega_new = recol.recolored_precision_matrices;
-        
-        % Inertia Update
+
+        % Inertia Update with SPD projection before inversion
         for f=1:F
             Om = (Omega_new{f} + Omega_new{f}')/2;
-            try S_next = inv(Om + 1e-12*eye(Nr)); catch, S_next = pinv(Om); end
+            [Om_spd, ~] = utils_math.project_spd(Om, 1e-8);
+            try
+                S_next = inv(Om_spd);
+            catch
+                S_next = pinv(Om_spd);
+            end
             S_next = (S_next + S_next')/2;
-            
-            % Momentum Update
+
             Sigma_source_curr{f} = (1-UPDATE_RATE)*Sigma_source_curr{f} + UPDATE_RATE*S_next;
         end
         

@@ -225,7 +225,7 @@ for em_iter = 1:MAX_EM_ITER
     m5_params.tol      = 1e-7;
 
     m5_params.max_iter = 100;
-    m5_params.verbose  = false; % 关掉内部打印，避免刷屏
+    m5_params.verbose  = true; % 关掉内部打印，避免刷屏
     m5_params.auto_tune = false; % 关掉内部 Gershgorin，我们手动控制了 alpha
     m5_params.weight_mode = 'hadamard';
 
