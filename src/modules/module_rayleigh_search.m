@@ -1,13 +1,12 @@
-function [Gamma_best, best_r, stats] = module_rayleigh_search(Gamma_debiased, S_whitened, n_samples, K, W, params)
-% MODULE_RAYLEIGH_SEARCH Grid search for optimal Rayleigh threshold.
+function [best_r, mask_cell, Var_proxies, stats] = module_rayleigh_search(Gamma_debiased, S_whitened, n_samples, K, W, params)
+% MODULE_RAYLEIGH_SEARCH Grid search for optimal Rayleigh threshold (mask only).
 %
 % Score(r) = sum_w [logdet(G_w) - tr(S_w G_w)]
 %            - lambda1 * sum_{w<w'} k_{w,w'} ||G_w - G_w'||_W^2
 %            - lambda3 * sum_w ||G_w||_W^2
 %
-% L1 is excluded because the Rayleigh threshold itself sparsifies the graph.
+% Returns best_r and masks; does not perform final SPD refit.
 
-    % ----------------------- setup -----------------------
     F = numel(Gamma_debiased);
     if nargin < 6, params = struct(); end
 
@@ -33,7 +32,7 @@ function [Gamma_best, best_r, stats] = module_rayleigh_search(Gamma_debiased, S_
 
     Ksym = (K + K') / 2;
 
-    % ----------------------- variance proxy -----------------------
+    % variance proxies
     Var_proxies = cell(F, 1);
     for f = 1:F
         if strcmp(var_src, 'hat') && ~isempty(Gamma_hat_cells)
@@ -47,7 +46,7 @@ function [Gamma_best, best_r, stats] = module_rayleigh_search(Gamma_debiased, S_
 
     scores = -inf(length(r_grid), 1);
 
-    % ----------------------- grid search -----------------------
+    % grid search
     for i = 1:length(r_grid)
         r = r_grid(i);
         G_candidate = cell(F, 1);
@@ -62,30 +61,31 @@ function [Gamma_best, best_r, stats] = module_rayleigh_search(Gamma_debiased, S_
 
             G_sparse = G_dense;
             G_sparse(~mask) = 0;
+            G_sparse(1:size(G_sparse,1)+1:end) = real(diag(G_sparse));
 
-            [G_final, ~] = utils_math.project_spd(G_sparse, 1e-8);
-            G_candidate{f} = G_final;
+            if exist('regularize_spd','file') == 2
+                G_final = regularize_spd(G_sparse);
+            else
+                [G_final, ~] = utils_math.project_spd(G_sparse, 1e-8);
+            end
+            G_candidate{f} = utils_math.make_hermitian(G_final);
         end
 
         scores(i) = compute_score(G_candidate, S_whitened, Ksym, W, lambda1, lambda3, mode);
     end
 
-    % ----------------------- select best -----------------------
+    % select best and build masks
     [max_score, best_idx] = max(scores);
     best_r = r_grid(best_idx);
 
-    % Reconstruct with best r
-    Gamma_best = cell(F, 1);
+    mask_cell = cell(F, 1);
     for f = 1:F
         G_dense = Gamma_debiased{f};
         V_proxy = Var_proxies{f};
         Threshold = (best_r / sqrt(complex(n_samples))) * sqrt(complex(V_proxy));
         mask = abs(G_dense) >= Threshold;
         mask(1:size(G_dense,1)+1:end) = true;
-
-        G_sparse = G_dense;
-        G_sparse(~mask) = 0;
-        [Gamma_best{f}, ~] = utils_math.project_spd(G_sparse, 1e-8);
+        mask_cell{f} = mask;
     end
 
     stats.r_grid = r_grid;
@@ -99,7 +99,6 @@ function score = compute_score(Gamma_cell, S_cell, Ksym, W, lambda1, lambda3, mo
     F = numel(Gamma_cell);
     log_lik = 0;
 
-    % Log-likelihood part
     for f = 1:F
         G = Gamma_cell{f};
         S = S_cell{f};
@@ -111,7 +110,6 @@ function score = compute_score(Gamma_cell, S_cell, Ksym, W, lambda1, lambda3, mo
         log_lik = log_lik + (ld - real(trace(S * G)));
     end
 
-    % Frequency smoothing penalty
     freq_pen = 0;
     if lambda1 > 0
         for f1 = 1:F
@@ -130,7 +128,6 @@ function score = compute_score(Gamma_cell, S_cell, Ksym, W, lambda1, lambda3, mo
         end
     end
 
-    % Spatial smoothing penalty
     space_pen = 0;
     if lambda3 > 0
         for f = 1:F

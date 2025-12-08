@@ -1,4 +1,4 @@
-function [Gamma_debiased, Gamma_rayleigh] = module_debias(Gamma_hat_cell, S_whitened_cell, n_samples)
+function [Gamma_debiased, Gamma_rayleigh, Var_proxies, masks] = module_debias(Gamma_hat_cell, S_whitened_cell, n_samples)
 % MODULE_DEBIAS - One-step Debiasing & Rayleigh Thresholding
 %
 % Purpose:
@@ -22,6 +22,8 @@ function [Gamma_debiased, Gamma_rayleigh] = module_debias(Gamma_hat_cell, S_whit
     F = numel(Gamma_hat_cell);
     Gamma_debiased = cell(F, 1);
     Gamma_rayleigh = cell(F, 1);
+    Var_proxies = cell(F, 1);
+    masks = cell(F, 1);
     
     % Robust default threshold (r=3.0 corresponds to p < 0.01 significance)
     r_th = 3.0; 
@@ -49,6 +51,7 @@ function [Gamma_debiased, Gamma_rayleigh] = module_debias(Gamma_hat_cell, S_whit
         % Use the original (biased) estimator for the variance proxy as in the docs
         d = diag(G);
         Var_proxy = real(d * d') + abs(G).^2;
+        Var_proxies{f} = Var_proxy;
         
         % --- 3. Rayleigh Thresholding (Eq 7.12) ---
         % Statistical significance test
@@ -60,6 +63,7 @@ function [Gamma_debiased, Gamma_rayleigh] = module_debias(Gamma_hat_cell, S_whit
         % Always keep diagonal (self-loops are essential)
         p = size(G, 1);
         mask(1:p+1:end) = true;
+        masks{f} = mask;
         
         % Apply Mask
         G_ray = G_tilde;

@@ -86,8 +86,7 @@ function [Psijj_cell, stats] = module2_estep(Svv_cell, L, Sigmajj_cell, Sigma_no
         [L_chol, is_spd] = utils_math.safe_log_det(Q);
         if is_spd
             term1 = L_chol; % log|Q|
-            term2 = real(trace(K_gain' * (Svv / L') )); % approx trace(Q^-1 Svv)
-            % Simplified trace: real(trace(Q \ Svv))
+            % Use only the stable solve against Q to avoid rank warnings from dividing by L'
             term2 = real(trace(Q \ Svv));
             log_lik_sum = log_lik_sum - 0.5 * (term1 + term2);
         end

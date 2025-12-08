@@ -125,6 +125,16 @@ function [Gamma_cells, results] = module5_proximal_main(input_data, params)
         % ---------------------------------------------------
         % module_gradient handles LogDet, Trace, and Smoothing terms
         Grad_curr = module_gradient.compute(Gamma_curr, Sigmas, Kernel, W, params);
+        if params.verbose && iter == 1
+            % Diagnostic: gradient and iterate norms at start
+            grad_norm = 0; gamma_norm = 0;
+            for f=1:F
+                grad_norm = grad_norm + norm(Grad_curr{f}, 'fro')^2;
+                gamma_norm = gamma_norm + norm(Gamma_curr{f}, 'fro')^2;
+            end
+            grad_norm = sqrt(grad_norm); gamma_norm = sqrt(gamma_norm);
+            fprintf('    [Diag] grad_norm=%.3e, gamma_norm=%.3e\n', grad_norm, gamma_norm);
+        end
         
         % ---------------------------------------------------
         % B. Step Size Update (Barzilai-Borwein)

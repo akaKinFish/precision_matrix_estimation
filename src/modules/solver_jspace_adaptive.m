@@ -55,21 +55,31 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
     end
 
     % --- 2. Initialization ---
+    % --- 2. Initialization ---
     if VERBOSE, fprintf('[Init] Running eLORETA...\n'); end
+    % 频率平均的传感器协方差，类型跟 Svv_cell{1} 保持一致（CPU/GPU）
     S_avg = zeros(Ns, Ns, 'like', Svv_cell{1});
-    for f=1:F, S_avg = S_avg + Svv_cell{f}; end
-    S_avg = S_avg / F;
-    [~, W_eloreta] = run_eloreta_core(L, S_avg, 0.05);
-    
-    diag_power = diag(W_eloreta).^2;
-    L_norm = sum(L.^2, 1)';
-    scale_factor = trace(S_avg) / (sum(L_norm .* diag_power) + 1e-10);
-    
-    Sigma_source_curr = cell(F, 1);
-    for f=1:F
-        Sigma_source_curr{f} = diag(diag_power * scale_factor);
-        if USE_GPU, Sigma_source_curr{f} = gpuArray(Sigma_source_curr{f}); end
+    for f = 1:F
+        S_avg = S_avg + Svv_cell{f};
     end
+    S_avg = S_avg / F;
+
+    % eLORETA 反演算子（run_eloreta_core 会自己根据 L 的类型返回 CPU/GPU）
+    [T_eloreta, ~] = run_eloreta_core(L, S_avg, 0.05);
+
+    % 用 eLORETA 把每个频段的 Svv 投到源域，得到 full covariance 初始化
+    Sigma_source_curr = cell(F, 1);
+    for f = 1:F
+        Svv_f = Svv_cell{f};                              % 已经可能在 GPU 上
+        Sjj_eloreta = T_eloreta * Svv_f * T_eloreta';     % 源域协方差估计
+        Sjj_eloreta = utils_math.make_hermitian(Sjj_eloreta); % 数值对称
+
+        % 轻微 SPD 投影（project_spd 本身已经在别处用于 GPU，所以直接用）
+        [Sjj_spd, ~] = utils_math.project_spd(Sjj_eloreta, 1e-8);
+
+        Sigma_source_curr{f} = Sjj_spd;                   % 类型随 T_eloreta（CPU/GPU）
+    end
+
     
     Gamma_warm_start = cell(F, 1);
     for f=1:F, Gamma_warm_start{f} = eye(Nr, 'like', L); end
@@ -118,13 +128,23 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         m5_in.weight_matrix = W_gamma;
         m5_in.active_mask = module3_active_set(Sjj_tilde, struct('quantile_level', ACT_Q));
         
-        m5_p.lambda1 = hp.lambda1 * L1_RATIO;
-        m5_p.lambda3 = m5_p.lambda1 * L3_RATIO;
-        m5_p.alpha0 = hp.alpha;
+    m5_p.lambda1 = hp.lambda1 * L1_RATIO;
+    m5_p.lambda3 = m5_p.lambda1 * L3_RATIO;
+    m5_p.alpha0 = hp.alpha;
+        m5_p.min_eig = get_cfg(cfg, 'min_eig', 1e-6); % floor for SPD projections
         m5_p.spatial_graph_matrix = GraphLaplacian;
         m5_p.spatial_graph_is_laplacian = true;
-        m5_p.max_iter = 100; m5_p.tol = 1e-4; m5_p.verbose = false;
+        m5_p.max_iter = 100; m5_p.tol = 1e-4; m5_p.verbose = true;
         m5_p.weight_mode = 'hadamard'; m5_p.auto_tune = false;
+
+        if VERBOSE
+            fprintf('  [Diag] lambda1=%.2e lambda3=%.2e min_eig=%.1e maxK=%.2f maxW=%.2f\n', ...
+                m5_p.lambda1, m5_p.lambda3, m5_p.min_eig, max(K_freq(:)), max(W_gamma(:)));
+            fprintf('  [Diag] lambda grid: [%.2e .. %.2e] (logspace %d)\n', max_val, min_val, GRID_SIZE);
+            % Active mask size
+            nnz_mask = 0; for f=1:F, nnz_mask = nnz_mask + nnz(m5_in.active_mask{f}); end
+            fprintf('  [Diag] active mask nnz=%d (per freq avg %.1f)\n', nnz_mask, nnz_mask/F);
+        end
         
         best_score = Inf; best_G = Gamma_warm_start; best_lam = 0; best_den = 0;
         curr_G = Gamma_warm_start;
@@ -158,6 +178,11 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
                 best_score = score; best_G = G_temp; best_lam = lam; best_den = den;
             end
             curr_G = G_temp;
+
+            if VERBOSE && (k == 1 || k == GRID_SIZE || n_edges == 0 || ~isfinite(score))
+                fprintf('          [Diag] k=%d lam=%.2e dens=%.2f%% edges=%d score=%.2e\n', ...
+                    k, lam, den*100, n_edges, score);
+            end
         end
         
         Gamma_warm_start = best_G;
@@ -167,7 +192,7 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         end
         
         % Debiasing (dense)
-        [Gamma_debiased, ~] = module_debias(best_G, Sjj_tilde, M_SAMPLES);
+        [Gamma_debiased, ~, Var_proxies, masks0] = module_debias(best_G, Sjj_tilde, M_SAMPLES);
 
         % Rayleigh threshold search (uses debiased matrices, variance from Gamma_hat)
         ray_params.lambda1 = m5_p.lambda1;
@@ -177,34 +202,29 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         ray_params.Gamma_hat = best_G;
         if isfield(cfg, 'rayleigh_range')
             ray_params.r_range = cfg.rayleigh_range;
+        else
+            ray_params.r_range = 2.0:0.2:5.0;
         end
-
-        [Gamma_ray, best_r, ~] = module_rayleigh_search( ...
-            Gamma_debiased, Sjj_tilde, M_SAMPLES, K_freq, W_gamma, ray_params);
-
-        % Support mask for SPD refit (lambda2 = 0)
-        refit_mask = cell(F, 1);
-        for f=1:F
-            refit_mask{f} = abs(Gamma_ray{f}) > 0;
-            refit_mask{f}(1:Nr+1:end) = true;
-        end
-
-        refit_in = m5_in;
-        refit_in.precision_matrices = Gamma_ray;
-        refit_in.active_mask = refit_mask;
-
-        refit_params = m5_p;
-        refit_params.lambda2 = 0;
-        refit_params.max_iter = min(50, m5_p.max_iter);
-        refit_params.tol = min(m5_p.tol, 5e-4);
-
-        [Gamma_refit, ~] = module5_proximal_main(refit_in, refit_params);
-        best_G = Gamma_refit;
-        Gamma_warm_start = best_G;
 
         if VERBOSE
-            fprintf('  Rayleigh best r=%.2f | Refitting on support with lambda2=0\n', best_r);
+            fprintf('  [Rayleigh] Searching best threshold (Range: %.1f-%.1f)...\n', ...
+                    min(ray_params.r_range), max(ray_params.r_range));
         end
+
+        [best_r, mask_cell, Var_proxies, ~] = module_rayleigh_search( ...
+            Gamma_debiased, Sjj_tilde, M_SAMPLES, K_freq, W_gamma, ray_params);
+
+        if VERBOSE
+            total_support = 0;
+            for f=1:F, total_support = total_support + nnz(mask_cell{f}) - Nr; end
+            fprintf('  Rayleigh best r=%.2f | support edges=%d | Quadratic refit on support\n', best_r, total_support/2);
+        end
+
+        % Quadratic refit (edge-wise) instead of PGD refit
+        L_freq = diag(sum(K_freq, 2)) - K_freq;
+        lambda4 = 0;
+        best_G = module_refit_quadratic(Gamma_debiased, Var_proxies, mask_cell, L_freq, m5_p.lambda1, m5_p.lambda3, lambda4, M_SAMPLES, W_gamma);
+        Gamma_warm_start = best_G;
 
         % Recoloring
         m8_in.whitened_precision_matrices = best_G;
@@ -215,12 +235,12 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         % Inertia Update with SPD projection before inversion
         for f=1:F
             Om = (Omega_new{f} + Omega_new{f}')/2;
-            [Om_spd, ~] = utils_math.project_spd(Om, 1e-8);
-            try
-                S_next = inv(Om_spd);
-            catch
-                S_next = pinv(Om_spd);
+            if exist('regularize_spd','file') == 2
+                Om_spd = regularize_spd(Om);
+            else
+                [Om_spd, ~] = utils_math.project_spd(Om, 1e-8);
             end
+            S_next = inv(Om_spd);
             S_next = (S_next + S_next')/2;
 
             Sigma_source_curr{f} = (1-UPDATE_RATE)*Sigma_source_curr{f} + UPDATE_RATE*S_next;
@@ -240,21 +260,50 @@ end
 
 % (Helper functions same as above)
 function [T, W] = run_eloreta_core(L, Svv, regu)
+    % RUN_ELORETA_CORE - eLORETA depth weighting & inverse operator
+    % L   : [nchan x ndip] leadfield (CPU or GPU)
+    % Svv : [nchan x nchan] sensor covariance (同 L 类型)
+    % regu: regularization scalar
+
     [nchan, ndum] = size(L);
     if nargin < 3, regu = 0.05; end
+
+    % W 与 L 同类型（CPU/GPU）
     W = eye(ndum, 'like', L);
+
     for k = 1:15
-        K = (L * W) * L';
+        K = (L * W) * L.';   % 注意用 .' 保持类型一致（对实数来说等价于转置）
+        % 单位矩阵也要跟 L 同类型
+        I_n = eye(nchan, 'like', L);
+
         alpha = regu * trace(K) / nchan;
-        M = inv(K + alpha * eye(nchan));
+
+        % 解线性系统代替 inv，兼容 GPU
+        M = (K + alpha * I_n) \ I_n;
+
         W_old = W;
         for i = 1:ndum
             li = L(:, i);
             val = real(li' * M * li);
             W(i, i) = sqrt(complex(max(val, 1e-12)));
         end
-        if norm(diag(W) - diag(W_old)) / norm(diag(W_old)) < 1e-3, break; end
+
+        % 简单收敛判据
+        diff_diag = diag(W) - diag(W_old);
+        if norm(diff_diag) / (norm(diag(W_old)) + 1e-12) < 1e-3
+            break;
+        end
     end
-    T = W * L' * inv((L * W * L') + alpha * eye(nchan));
+
+    % 最终 inverse operator: T = W L' (L W L' + alpha I)^{-1}
+    I_n = eye(nchan, 'like', L);
+    K_final = (L * W) * L.';
+    alpha = regu * trace(K_final) / nchan;
+    A = K_final + alpha * I_n;
+
+    % 用线性方程求逆算子：X = A \ I_n，然后 T = W L' X
+    X = A \ I_n;
+    T = W * (L.' * X);
 end
+
 function val = get_cfg(s, f, d), if isfield(s, f), val = s.(f); else, val = d; end, end

@@ -65,8 +65,16 @@ classdef module_gradient
                 G = Gamma_cells{f};
                 S = Sigma_cells{f};
 
-                % A. Log-det and trace parts
-                invG = inv(G);
+                % A. Log-det and trace parts (use SPD projection + stable solve)
+                if isfield(params, 'min_eig'), min_eig = params.min_eig; else, min_eig = 1e-8; end
+                [G_pd, ~] = utils_math.project_spd(G, min_eig);
+                % Use linear solve instead of explicit inv to improve conditioning
+                invG = G_pd \ eye(p);
+                if isfield(params, 'verbose') && params.verbose && f == 1
+                    % Eigen diagnostics for the first frequency only to limit spam
+                    ev = eig(full((G_pd+G_pd')/2));
+                    fprintf('    [Diag] invG eig min/max=%.3e/%.3e\n', min(real(ev)), max(real(ev)));
+                end
                 grad_data_fitting = -invG + S;
 
                 % B. Frequency smoothing gradient

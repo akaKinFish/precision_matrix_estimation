@@ -52,6 +52,18 @@ L1_RATIO    = get_cfg(cfg, 'lambda1_ratio', 1.0); % Frequency smoothing scaling
 L3_RATIO    = get_cfg(cfg, 'lambda3_ratio', 0.1); % Spatial smoothing scaling
 ACT_Q       = get_cfg(cfg, 'active_set_q', 0.5); % Keep top 15% initially
 
+% Frequency kernel and precision weight matrix
+K_freq   = get_cfg(cfg, 'freq_kernel', eye(F));
+if isfield(cfg, 'weight_matrix')
+    W_gamma = cfg.weight_matrix;
+elseif ~isempty(GraphLaplacian)
+    W_gamma = GraphLaplacian;
+else
+    W_gamma = eye(Nr);
+end
+K_freq = (K_freq + K_freq') / 2;
+W_gamma = (W_gamma + W_gamma') / 2;
+
 % Sample size (Critical for EBIC)
 if isfield(cfg, 'm_samples')
     M_SAMPLES = cfg.m_samples;
@@ -93,6 +105,9 @@ if isempty(GraphLaplacian)
 
     % Option B: Create dummy zero matrix (safe for multiplication)
     GraphLaplacian = zeros(Nr, Nr, 'like', L);
+    if isempty(W_gamma)
+        W_gamma = GraphLaplacian;
+    end
 end
 
 % History Storage
@@ -180,8 +195,8 @@ for em_iter = 1:MAX_EM_ITER
     % --------------------------------------------------------
     % Calculate theoretical bounds for Alpha and Lambda1
     m6_input.whitened_covariances = Sjj_tilde;
-    m6_input.kernel_matrix = eye(F); % Default freq kernel (update if needed)
-    m6_input.weight_matrix = eye(Nr);
+    m6_input.kernel_matrix = K_freq; % Use provided frequency kernel
+    m6_input.weight_matrix = W_gamma;
 
     hp_theory = module6_hyperparameters(m6_input, 'verbose', false);
 
@@ -209,8 +224,8 @@ for em_iter = 1:MAX_EM_ITER
 
     % B. Prepare Fixed Params for PGD
     m5_input.whitened_covariances = Sjj_tilde;
-    m5_input.smoothing_kernel     = m6_input.kernel_matrix;
-    m5_input.weight_matrix        = eye(Nr);
+    m5_input.smoothing_kernel     = K_freq;
+    m5_input.weight_matrix        = W_gamma;
     m5_input.active_mask          = active_mask;
 
     m5_params.lambda1 = lambda1_used;
@@ -220,6 +235,7 @@ for em_iter = 1:MAX_EM_ITER
 
     % [FIX 1] 激进的步长：不要用保守的 alpha_used，给个大初值，靠回溯去缩减
     m5_params.alpha0   = 0.5;
+    m5_params.min_eig  = get_cfg(cfg, 'min_eig', 1e-6); % floor for SPD projections
 
     % [FIX 2] 更严格的容差，防止早停
     m5_params.tol      = 1e-7;
@@ -228,6 +244,14 @@ for em_iter = 1:MAX_EM_ITER
     m5_params.verbose  = true; % 关掉内部打印，避免刷屏
     m5_params.auto_tune = false; % 关掉内部 Gershgorin，我们手动控制了 alpha
     m5_params.weight_mode = 'hadamard';
+
+    if VERBOSE
+        fprintf('  [Diag] lambda1=%.2e lambda3=%.2e min_eig=%.1e maxK=%.2f maxW=%.2f\n', ...
+            m5_params.lambda1, m5_params.lambda3, m5_params.min_eig, max(K_freq(:)), max(W_gamma(:)));
+        fprintf('  [Diag] lambda grid: [%.2e .. %.2e] (logspace %d)\n', max_val, min_val, GRID_SIZE);
+        nnz_mask = 0; for f=1:F, nnz_mask = nnz_mask + nnz(m5_input.active_mask{f}); end
+        fprintf('  [Diag] active mask nnz=%d (per freq avg %.1f)\n', nnz_mask, nnz_mask/F);
+    end
 
     % C. Run Grid Search
     best_score = Inf;
@@ -309,6 +333,9 @@ for em_iter = 1:MAX_EM_ITER
         if VERBOSE
             fprintf('          %.4e | %5.2f%%     | %.2e    | %.4e %s\n', ...
                 lam, density*100, final_alpha, current_score, is_best);
+            if (k == 1 || k == GRID_SIZE || num_edges == 0 || ~isfinite(current_score))
+                fprintf('          [Diag] k=%d edges=%d score=%.2e\n', k, num_edges, current_score);
+            end
         end
 
         current_G = G_temp;
@@ -326,18 +353,15 @@ for em_iter = 1:MAX_EM_ITER
     enable_r_search = isfield(cfg, 'enable_rayleigh_search') && cfg.enable_rayleigh_search;
 
     if enable_debias
-        % 1. Debiasing (Dense)
-        Gamma_debiased_cell = cell(F, 1);
-        for f=1:F
-            G = best_Gamma{f};
-            S = Sjj_tilde{f};
-            G_tilde = 2*G - G*S*G;
-            Gamma_debiased_cell{f} = utils_math.make_hermitian(G_tilde);
-        end
+        % 1. Debiasing (dense)
+        [Gamma_debiased_cell, ~, Var_proxies, masks0] = module_debias(best_Gamma, Sjj_tilde, M_SAMPLES);
 
         % Prepare Params for Search
         ray_params.lambda1 = lambda1_used;
         ray_params.lambda3 = lambda3_used;
+        ray_params.weight_mode = m5_params.weight_mode;
+        ray_params.variance_source = 'hat';
+        ray_params.Gamma_hat = best_Gamma;
 
         % Define Range
         if isfield(cfg, 'rayleigh_range')
@@ -350,23 +374,22 @@ for em_iter = 1:MAX_EM_ITER
             if VERBOSE, fprintf('  [Rayleigh] Searching best threshold (Range: %.1f-%.1f)...\n', ...
                     min(ray_params.r_range), max(ray_params.r_range)); end
 
-            % Pass GraphLaplacian as 'W' argument for spatial smoothing context
-            [Gamma_ray, best_r, ~] = module_rayleigh_search(...
+            [best_r, mask_cell, Var_proxies, ~] = module_rayleigh_search(...
                 Gamma_debiased_cell, Sjj_tilde, M_SAMPLES, ...
-                m6_input.kernel_matrix, GraphLaplacian, ray_params);
-
-            best_Gamma = Gamma_ray;
+                K_freq, W_gamma, ray_params);
 
             if VERBOSE
-                fprintf('           Selected r_th=%.1f\n', best_r);
+                fprintf('           Selected r_th=%.1f | Quadratic refit on support\n', best_r);
             end
         else
-            % Default Fixed
-            [Gamma_ray, ~, ~] = module_rayleigh_search(...
-                Gamma_debiased_cell, Sjj_tilde, M_SAMPLES, ...
-                m6_input.kernel_matrix, GraphLaplacian, struct('r_range', 3.5));
-            best_Gamma = Gamma_ray;
+            mask_cell = masks0;
         end
+
+        % 2. Quadratic refit (edge-wise)
+        L_freq = diag(sum(K_freq, 2)) - K_freq;
+        lambda4 = 0;
+        best_Gamma = module_refit_quadratic(Gamma_debiased_cell, Var_proxies, mask_cell, L_freq, lambda1_used, lambda3_used, lambda4, M_SAMPLES, W_gamma);
+        Gamma_warm_start = best_Gamma;
     end
 
     % --------------------------------------------------------
@@ -384,43 +407,31 @@ for em_iter = 1:MAX_EM_ITER
         % 1. Symmetrize Precision Matrix
         Om = (Omega_new{f} + Omega_new{f}') / 2;
 
-        % 2. Robust Inversion via Eigendecomposition
-        %    Direct inv() is unstable for sparse/ill-conditioned matrices.
-        %    We use eig() to floor tiny eigenvalues before inversion.
-
-        % Ensure we are working with full matrices for eig()
-        if issparse(Om), Om = full(Om); end
-
-        [V, D_vec] = eig(Om, 'vector');
-
-        % Floor eigenvalues: Precision eigenvalues correspond to 1/Variance.
-        % Extremely small precision eigenvalues (< 1e-9) lead to exploding variance.
-        % We clamp them to a safe minimum (e.g., 1e-8).
-        min_prec_tol = 1e-8;
-        D_safe = max(real(D_vec), min_prec_tol);
-
-        % Reconstruct Covariance: Sigma = V * D^{-1} * V'
-        % Optimized multiplication: V * ( (1./D) .* V' )
-        S_next = V * ( (1 ./ D_safe) .* V' );
-
-        % 3. Numerical Sanitization
-        % Remove imaginary dust and force symmetry
-        S_next = real((S_next + S_next') / 2);
-
-        % 4. Physics Constraint: Diagonal Positivity
-        % Variance (Power) implies diagonal elements MUST be positive.
-        d_diag = diag(S_next);
-        if any(d_diag <= 0)
-            % Fix invalid diagonals caused by numerical undershoot
-            d_diag(d_diag <= 0) = 1e-12;
-            S_next(1:Nr+1:end) = d_diag;
-
-            % Optional: strict SPD projection if needed
-            % [S_next, ~] = utils_math.project_spd(S_next, 1e-12);
+        % 2. SPD projection for stability before inversion
+        if exist('regularize_spd','file') == 2
+            Om_spd = regularize_spd(Om);
+        else
+            [Om_spd, ~] = utils_math.project_spd(Om, 1e-8);
         end
 
-        % 5. Momentum / Inertia Update
-        % Sigma_new = (1 - rate) * Sigma_old + rate * Sigma_estimated
+        % 3. Robust inversion
+        try
+            S_next = inv(Om_spd);
+        catch
+            S_next = pinv(Om_spd);
+        end
+
+        % 4. Numerical Sanitization
+        S_next = real((S_next + S_next') / 2);
+
+        % 5. Physics Constraint: Diagonal Positivity
+        d_diag = diag(S_next);
+        if any(d_diag <= 0)
+            d_diag(d_diag <= 0) = 1e-12;
+            S_next(1:Nr+1:end) = d_diag;
+        end
+
+        % 6. Momentum / Inertia Update
         Sigma_source_curr{f} = (1 - UPDATE_RATE) * Sigma_source_curr{f} + UPDATE_RATE * S_next;
 
     end
