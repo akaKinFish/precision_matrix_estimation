@@ -134,33 +134,46 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         m6_in.weight_matrix = W_gamma;
         hp = module6_hyperparameters(m6_in, 'verbose', false);
         
-        % M-Step Grid Search (Internal) - data-driven lambda2 range (deeper)
+        % M-Step Grid Search (Internal) - data-driven lambda2 range (off-diag only)
         S_ref = Sjj_tilde{1};
         mask_off = ~eye(Nr);
         abs_S_off = abs(S_ref(mask_off));
         if isempty(abs_S_off)
             max_corr = 1e-3;
         else
-            max_corr = max(abs_S_off);
+            max_corr = quantile(abs_S_off, 0.999);
         end
-        if max_corr < 1e-4, max_corr = 1e-3; end
-        % Search range based on true off-diagonal strength
-        min_val = max_corr * 0.01;
+        if max_corr > 0.5, max_corr = 0.5; end
+        if max_corr < 1e-3, max_corr = 0.1; end
+        min_val = max_corr * 0.001; 
+        
         lambda_grid = logspace(log10(max_corr), log10(min_val), GRID_SIZE);
+
+
+
+        
+        if VERBOSE
+             fprintf('  [Grid] Data-driven Range: %.2e to %.2e (Max99.9%%=%.2e)\n', ...
+                 lambda_grid(1), lambda_grid(end), max_corr);
+        end
         
         m5_in.whitened_covariances = Sjj_tilde;
         m5_in.smoothing_kernel = K_freq;
         m5_in.weight_matrix = W_gamma;
         m5_in.active_mask = module3_active_set(Sjj_tilde, struct('quantile_level', ACT_Q));
         
-    m5_p.lambda1 = hp.lambda1 * L1_RATIO;
-    m5_p.lambda3 = m5_p.lambda1 * L3_RATIO;
-    m5_p.alpha0 = hp.alpha;
+        m5_p.lambda1 = hp.lambda1 * L1_RATIO;
+        m5_p.lambda3 = m5_p.lambda1 * L3_RATIO;
+        m5_p.alpha0 = 0.1; % allow internal scaling to pick a safe step
         m5_p.min_eig = get_cfg(cfg, 'min_eig', 1e-6); % floor for SPD projections
         m5_p.spatial_graph_matrix = GraphLaplacian;
         m5_p.spatial_graph_is_laplacian = true;
-        m5_p.max_iter = 100; m5_p.tol = 1e-4; m5_p.verbose = true;
-        m5_p.weight_mode = 'hadamard'; m5_p.auto_tune = false;
+        % Grid search speed-up: fewer iters, looser tol
+        m5_p.max_iter = 40; 
+        m5_p.tol = 1e-3; 
+        m5_p.verbose = false;
+        m5_p.weight_mode = 'hadamard'; 
+        m5_p.auto_tune = false;
 
         if VERBOSE
             fprintf('  [Diag] lambda1=%.2e lambda3=%.2e min_eig=%.1e maxK=%.2f maxW=%.2f\n', ...
@@ -247,7 +260,7 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         end
 
         % Rayleigh support density check and robust refit
-        % Use mask_cell to count support edges
+        % Use mask_cell to count support edges (Gamma_ray not available here)
         G_mask = mask_cell{1};
         G_mask(1:Nr+1:end) = 0;
         ray_edges = nnz(G_mask)/2;
@@ -259,70 +272,56 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         proceed_to_refit = true;
         if ray_den > 0.10
             if VERBOSE
-                fprintf('  [Warning] Rayleigh density too high (>10%%). Thinning masks before refit.\n');
+                fprintf('  [Warning] Rayleigh density too high (>10%%). Skipping Refit to avoid singularity.\n');
+                fprintf('            Reverting to Grid Search result (L1 penalized).\n');
             end
-            % Thin masks to top 10%% edges by magnitude per frequency
+            Gamma_refit = best_G;
+            proceed_to_refit = false;
+        else
+            refit_mask = cell(F, 1);
             for f=1:F
-                msk = mask_cell{f};
-                msk(1:Nr+1:end) = false;
-                idx = find(msk);
-                if isempty(idx), continue; end
-                Gf = Gamma_debiased{f};
-                vals = abs(Gf(idx));
-                [~, order] = sort(vals, 'descend');
-                keep_k = max(1, round(0.10 * numel(order)));
-                keep_idx = idx(order(1:keep_k));
-                new_mask = false(Nr, Nr);
-                new_mask(keep_idx) = true;
-                new_mask = new_mask | new_mask'; % symmetrize
-                new_mask(1:Nr+1:end) = true;
-                mask_cell{f} = new_mask;
-            end
-            % Recompute density after thinning
-            G_mask = mask_cell{1}; G_mask(1:Nr+1:end)=0;
-            ray_edges = nnz(G_mask)/2;
-            ray_den = ray_edges / (Nr*(Nr-1)/2);
-            if VERBOSE
-                fprintf('  [Rayleigh] After thinning: Edges=%d (%.1f%%)\n', ray_edges, ray_den*100);
-            end
-            if ray_den > 0.15
-                if VERBOSE
-                    fprintf('  [Warning] Still too dense (>15%%). Skipping Refit; keep L1 result.\n');
-                end
-                proceed_to_refit = false;
+                refit_mask{f} = abs(Gamma_ray{f}) > 0;
+                refit_mask{f}(1:Nr+1:end) = true;
             end
         end
 
         if proceed_to_refit
-            refit_mask = mask_cell;
-
             refit_in = m5_in;
-            refit_in.precision_matrices = Gamma_debiased;
+            refit_in.precision_matrices = Gamma_ray;
             refit_in.active_mask = refit_mask;
 
             refit_params = m5_p;
             refit_params.lambda2 = 0;
-            refit_params.lambda3 = max(m5_p.lambda3, 1e-2); % enforce ridge
-            refit_params.max_iter = min(50, m5_p.max_iter);
-            refit_params.tol = 1e-3;
+            refit_params.lambda3 = max(m5_p.lambda3, 1e-2);
+            refit_params.max_iter = 100;
+            refit_params.tol = 1e-4;
+            refit_params.verbose = false;
+
+            [f_before, ~] = module_objective.compute(Gamma_ray, Sjj_tilde, K_freq, W_gamma, refit_params);
 
             try
-                [Gamma_refit, ~] = module5_proximal_main(refit_in, refit_params);
-                if rcond(Gamma_refit{1}) < 1e-12
-                    error('Refit produced singular matrix');
+                [Gamma_new_refit, ~] = module5_proximal_main(refit_in, refit_params);
+                [f_after, ~] = module_objective.compute(Gamma_new_refit, Sjj_tilde, K_freq, W_gamma, refit_params);
+                if rcond(Gamma_new_refit{1}) < 1e-12
+                    error('Refit produced singular matrix (rcond < 1e-12)');
                 end
-                best_G = Gamma_refit;
-                if VERBOSE, fprintf('  [Refit] Completed successfully.\n'); end
+                if f_after > f_before && (f_after - f_before) > 1e3
+                    error('Refit objective exploded (%.2e -> %.2e)', f_before, f_after);
+                end
+                Gamma_refit = Gamma_new_refit;
+                if VERBOSE, fprintf('  [Refit] Success. Obj: %.2e -> %.2e\n', f_before, f_after); end
             catch ME
                 if VERBOSE
-                    fprintf('  [Warning] Refit failed (%s). Reverting to Rayleigh estimate.\n', ME.message);
+                    fprintf('  [Warning] Refit failed (%s). Reverting to L1 estimate.\n', ME.message);
                 end
+                Gamma_refit = best_G;
                 for f=1:F
-                    best_G{f} = utils_math.project_spd(Gamma_debiased{f}, 1e-5);
+                    Gamma_refit{f} = utils_math.project_spd(Gamma_refit{f}, 1e-5);
                 end
             end
         end
 
+        best_G = Gamma_refit;
         Gamma_warm_start = best_G;
 
         % Recoloring
@@ -406,3 +405,4 @@ function [T, W] = run_eloreta_core(L, Svv, regu)
 end
 
 function val = get_cfg(s, f, d), if isfield(s, f), val = s.(f); else, val = d; end, end
+

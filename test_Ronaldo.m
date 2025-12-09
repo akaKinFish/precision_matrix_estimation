@@ -225,7 +225,7 @@ for j = 1:Nsub
         % eLORETA power (not log-transformed)
         lo(:, i) = real(diag(eL_Sjj_cross(:, :, i)));
         % J-SPACE power [ADDED]
-        js(:, i, j) = log10(real(diag(JS_Sjj_cross(:, :, i))) + eps);
+        js(:, i, j) = log10(real(diag(JS_Sjj_cross{i})) + eps);
         % Mean cross-spectrum power
         mn_power(:, i) = real(diag(mn_Sjj_cross(:, :, i)));
     end
