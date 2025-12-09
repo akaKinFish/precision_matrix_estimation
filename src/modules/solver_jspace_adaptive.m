@@ -11,7 +11,19 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
     if nargin < 4, cfg = struct(); end
 
     % --- 1. Setup & Defaults ---
-    if ~iscell(Svv_cell), Svv_cell = {Svv_cell}; end
+    % Normalize input to cell-of-matrices
+    if ~iscell(Svv_cell)
+        if ndims(Svv_cell) == 3
+            F_in = size(Svv_cell, 3);
+            tmp = cell(F_in, 1);
+            for f = 1:F_in
+                tmp{f} = Svv_cell(:, :, f);
+            end
+            Svv_cell = tmp;
+        else
+            Svv_cell = {Svv_cell};
+        end
+    end
     F = numel(Svv_cell);
     [Ns, Nr] = size(L);
     
@@ -110,6 +122,11 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         
         % M-Step Prep
         [Sjj_tilde, D_cell, ~] = module1_data_whitening(Psijj_cell, 'smoothing_window', 1);
+        if VERBOSE
+            diag_stats = cellfun(@(S) [mean(real(diag(S))), min(real(diag(S))), max(real(diag(S)))], Sjj_tilde, 'UniformOutput', false);
+            dmat = vertcat(diag_stats{:});
+            fprintf('  [Diag] Sjj_tilde diag mean/min/max (freq1): %.3e / %.3e / %.3e\n', dmat(1,1), dmat(1,2), dmat(1,3));
+        end
         
         % Hyperparams
         m6_in.whitened_covariances = Sjj_tilde;
@@ -117,11 +134,19 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         m6_in.weight_matrix = W_gamma;
         hp = module6_hyperparameters(m6_in, 'verbose', false);
         
-        % M-Step Grid Search (Internal)
+        % M-Step Grid Search (Internal) - data-driven lambda2 range (deeper)
         S_ref = Sjj_tilde{1};
-        max_val = max(abs(S_ref(tril(true(Nr), -1))));
-        min_val = max_val * 0.01;
-        lambda_grid = logspace(log10(max_val), log10(min_val), GRID_SIZE);
+        mask_off = ~eye(Nr);
+        abs_S_off = abs(S_ref(mask_off));
+        if isempty(abs_S_off)
+            max_corr = 1e-3;
+        else
+            max_corr = max(abs_S_off);
+        end
+        if max_corr < 1e-4, max_corr = 1e-3; end
+        % Search range based on true off-diagonal strength
+        min_val = max_corr * 0.01;
+        lambda_grid = logspace(log10(max_corr), log10(min_val), GRID_SIZE);
         
         m5_in.whitened_covariances = Sjj_tilde;
         m5_in.smoothing_kernel = K_freq;
@@ -140,10 +165,11 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
         if VERBOSE
             fprintf('  [Diag] lambda1=%.2e lambda3=%.2e min_eig=%.1e maxK=%.2f maxW=%.2f\n', ...
                 m5_p.lambda1, m5_p.lambda3, m5_p.min_eig, max(K_freq(:)), max(W_gamma(:)));
-            fprintf('  [Diag] lambda grid: [%.2e .. %.2e] (logspace %d)\n', max_val, min_val, GRID_SIZE);
+            fprintf('  [Grid] Range: %.2e to %.2e (logspace %d, Max99.9%%=%.2e)\n', lambda_grid(1), lambda_grid(end), GRID_SIZE, max_corr);
             % Active mask size
             nnz_mask = 0; for f=1:F, nnz_mask = nnz_mask + nnz(m5_in.active_mask{f}); end
             fprintf('  [Diag] active mask nnz=%d (per freq avg %.1f)\n', nnz_mask, nnz_mask/F);
+            fprintf('  [Diag] lambda2 first three = %.2e, %.2e, %.2e\n', lambda_grid(1), lambda_grid(min(2,GRID_SIZE)), lambda_grid(min(3,GRID_SIZE)));
         end
         
         best_score = Inf; best_G = Gamma_warm_start; best_lam = 0; best_den = 0;
@@ -220,10 +246,83 @@ function [Omega_est, Sigma_src_est, outs] = solver_jspace_adaptive(Svv_cell, L, 
             fprintf('  Rayleigh best r=%.2f | support edges=%d | Quadratic refit on support\n', best_r, total_support/2);
         end
 
-        % Quadratic refit (edge-wise) instead of PGD refit
-        L_freq = diag(sum(K_freq, 2)) - K_freq;
-        lambda4 = 0;
-        best_G = module_refit_quadratic(Gamma_debiased, Var_proxies, mask_cell, L_freq, m5_p.lambda1, m5_p.lambda3, lambda4, M_SAMPLES, W_gamma);
+        % Rayleigh support density check and robust refit
+        % Use mask_cell to count support edges
+        G_mask = mask_cell{1};
+        G_mask(1:Nr+1:end) = 0;
+        ray_edges = nnz(G_mask)/2;
+        ray_den = ray_edges / (Nr*(Nr-1)/2);
+        if VERBOSE
+            fprintf('  [Rayleigh] r=%.1f | Edges=%d (%.1f%%)\n', best_r, ray_edges, ray_den*100);
+        end
+
+        proceed_to_refit = true;
+        if ray_den > 0.10
+            if VERBOSE
+                fprintf('  [Warning] Rayleigh density too high (>10%%). Thinning masks before refit.\n');
+            end
+            % Thin masks to top 10%% edges by magnitude per frequency
+            for f=1:F
+                msk = mask_cell{f};
+                msk(1:Nr+1:end) = false;
+                idx = find(msk);
+                if isempty(idx), continue; end
+                Gf = Gamma_debiased{f};
+                vals = abs(Gf(idx));
+                [~, order] = sort(vals, 'descend');
+                keep_k = max(1, round(0.10 * numel(order)));
+                keep_idx = idx(order(1:keep_k));
+                new_mask = false(Nr, Nr);
+                new_mask(keep_idx) = true;
+                new_mask = new_mask | new_mask'; % symmetrize
+                new_mask(1:Nr+1:end) = true;
+                mask_cell{f} = new_mask;
+            end
+            % Recompute density after thinning
+            G_mask = mask_cell{1}; G_mask(1:Nr+1:end)=0;
+            ray_edges = nnz(G_mask)/2;
+            ray_den = ray_edges / (Nr*(Nr-1)/2);
+            if VERBOSE
+                fprintf('  [Rayleigh] After thinning: Edges=%d (%.1f%%)\n', ray_edges, ray_den*100);
+            end
+            if ray_den > 0.15
+                if VERBOSE
+                    fprintf('  [Warning] Still too dense (>15%%). Skipping Refit; keep L1 result.\n');
+                end
+                proceed_to_refit = false;
+            end
+        end
+
+        if proceed_to_refit
+            refit_mask = mask_cell;
+
+            refit_in = m5_in;
+            refit_in.precision_matrices = Gamma_debiased;
+            refit_in.active_mask = refit_mask;
+
+            refit_params = m5_p;
+            refit_params.lambda2 = 0;
+            refit_params.lambda3 = max(m5_p.lambda3, 1e-2); % enforce ridge
+            refit_params.max_iter = min(50, m5_p.max_iter);
+            refit_params.tol = 1e-3;
+
+            try
+                [Gamma_refit, ~] = module5_proximal_main(refit_in, refit_params);
+                if rcond(Gamma_refit{1}) < 1e-12
+                    error('Refit produced singular matrix');
+                end
+                best_G = Gamma_refit;
+                if VERBOSE, fprintf('  [Refit] Completed successfully.\n'); end
+            catch ME
+                if VERBOSE
+                    fprintf('  [Warning] Refit failed (%s). Reverting to Rayleigh estimate.\n', ME.message);
+                end
+                for f=1:F
+                    best_G{f} = utils_math.project_spd(Gamma_debiased{f}, 1e-5);
+                end
+            end
+        end
+
         Gamma_warm_start = best_G;
 
         % Recoloring

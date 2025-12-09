@@ -37,7 +37,18 @@ if nargin < 4, cfg = struct(); end
 % ============================================================
 
 % Ensure inputs are Cell Arrays
-if ~iscell(Svv_cell), Svv_cell = {Svv_cell}; end
+if ~iscell(Svv_cell)
+    if ndims(Svv_cell) == 3
+        F_in = size(Svv_cell, 3);
+        tmp = cell(F_in, 1);
+        for f = 1:F_in
+            tmp{f} = Svv_cell(:, :, f);
+        end
+        Svv_cell = tmp;
+    else
+        Svv_cell = {Svv_cell};
+    end
+end
 F = numel(Svv_cell);
 [Ns, Nr] = size(L);
 
@@ -177,6 +188,11 @@ for em_iter = 1:MAX_EM_ITER
     % --------------------------------------------------------
     % Transform Psijj to Whitened Space: Sigma_tilde = D * Psijj * D
     [Sjj_tilde, D_cell, ~] = module1_data_whitening(Psijj_cell, 'smoothing_window', 1);
+    if VERBOSE
+        diag_stats = cellfun(@(S) [mean(real(diag(S))), min(real(diag(S))), max(real(diag(S)))], Sjj_tilde, 'UniformOutput', false);
+        dmat = vertcat(diag_stats{:});
+        fprintf('  [Diag] Sjj_tilde diag mean/min/max (freq1): %.3e / %.3e / %.3e\n', dmat(1,1), dmat(1,2), dmat(1,3));
+    end
 
     % --------------------------------------------------------
     % M-Step Part 2: Active Set Selection (Module 3)
@@ -251,6 +267,7 @@ for em_iter = 1:MAX_EM_ITER
         fprintf('  [Diag] lambda grid: [%.2e .. %.2e] (logspace %d)\n', max_val, min_val, GRID_SIZE);
         nnz_mask = 0; for f=1:F, nnz_mask = nnz_mask + nnz(m5_input.active_mask{f}); end
         fprintf('  [Diag] active mask nnz=%d (per freq avg %.1f)\n', nnz_mask, nnz_mask/F);
+        fprintf('  [Diag] lambda2 first three = %.2e, %.2e, %.2e\n', lambda_grid(1), lambda_grid(min(2,GRID_SIZE)), lambda_grid(min(3,GRID_SIZE)));
     end
 
     % C. Run Grid Search

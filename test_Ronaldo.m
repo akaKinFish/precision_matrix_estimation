@@ -197,11 +197,22 @@ for j = 1:Nsub
         source = inverse(Svv_cross(:,:,i), L);
         eL_Sjj_cross(:,:,i) = source.eloreata.Sjj;
     end
-    
+
     % [ADDED] J-SPACE Processing
     disp('->> J-SPACE Processing...');
     % Assuming run_jspace_for_comparison is in path
-    JS_Sjj_cross = run_jspace_for_comparison(Svv_cross, L, freq);
+    cfg_js = struct();
+    cfg_js.max_em_iter   = 5;
+    cfg_js.grid_size     = 100;
+    cfg_js.verbose       = true;
+    cfg_js.use_gpu       = true;
+    cfg_js.lambda1_ratio = 1.0;
+    cfg_js.lambda3_ratio = 0.1;
+    cfg_js.enable_debias = true;
+    cfg_js.enable_rayleigh_search = true;
+    % Explicit effective sample size to avoid overly liberal Rayleigh thresholds
+    cfg_js.m_samples     = 1000;
+    JS_Sjj_cross = solver_jspace_adaptive(Svv_cross, L, [], cfg_js);
 
     % Initialize mean power array for each ROI and frequency
     mn_power = zeros(Nroi, Nw);

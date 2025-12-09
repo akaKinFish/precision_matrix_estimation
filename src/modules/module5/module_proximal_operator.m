@@ -50,10 +50,6 @@ classdef module_proximal_operator
             % -------------------------------------------------------
             % Moving in the direction of negative gradient
             G_step = Gamma_curr - alpha * Grad;
-            % Diagnostics: norms before prox
-            if isfield(opts, 'verbose') && opts.verbose
-                fprintf('        [Diag] step_norm=%.3e, gamma_norm=%.3e\n', norm(G_step,'fro'), norm(Gamma_curr,'fro'));
-            end
             
             % -------------------------------------------------------
             % 2. Proximal Operator (L1 Soft Thresholding)
@@ -109,11 +105,6 @@ classdef module_proximal_operator
                 Gamma_new = regularize_spd(Gamma_prox);
             else
                 [Gamma_new, ~] = utils_math.project_spd(Gamma_prox, min_eig);
-            end
-            
-            if isfield(opts, 'verbose') && opts.verbose
-                eigs_G = eig(full((Gamma_new+Gamma_new')/2));
-                fprintf('        [Diag] post-prox eig min/max = %.3e / %.3e\n', min(real(eigs_G)), max(real(eigs_G)));
             end
             
         end
