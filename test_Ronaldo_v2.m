@@ -11,7 +11,7 @@ import functions.auxx.ZeroInflatedModels.*;
 import functions.auxx.Refine_Solution.*;
 import functions.auxx.OptimizedOperations.*;
 Cortex = load("templates/Cortex.mat");
-
+rng(2026);
 % Path to the JSON file with model result metadata. Modify this directions
 % manually acording to the location of the downloaded data 
 json_path = 'G:\OneDrive - CCLAB\New_Data_XiAlphaNET\xialphanet_newresults22\XIALPHANET.json';
@@ -146,6 +146,14 @@ JS_Phase_FroR = zeros(Nsub, 1);
 JS_Phase_L1 = zeros(Nsub, 1);
 JS_Phase_L1R = zeros(Nsub, 1);
 
+% ============================================================
+% [J-SPACE] Warm-start state across subjects (DO NOT TOUCH OTHERS)
+% ============================================================
+eta_prev = [];          % 1x3 best eta from previous subject
+eta_bank = [];          % Kx3 bank of good etas
+eta_span_decades = 1.0; % +/- decades around eta_prev (1.0 => ±1 decade)
+eta_bank_keep = 8;      % keep last K etas (simple & robust)
+
 
 % Simulation loop
 for j = 1:Nsub
@@ -191,7 +199,7 @@ end
 diag_mask = repmat(logical(eye(n)), [1, 1, F]);
 
 Svv_cross(diag_mask) = real(Svv_cross(diag_mask));
-    plot(freq,Log_Spec')
+    % plot(freq,Log_Spec')
 
     %
     toc;
@@ -217,70 +225,151 @@ Svv_cross(diag_mask) = real(Svv_cross(diag_mask));
         eL_Sjj_cross(:,:,i) = source.eloreata.Sjj;
     end
 
-   % [ADDED] J-SPACE Processing
-    disp('->> J-SPACE Processing (Dynamic Grid Search)...');
-    
-    % 配置结构体
-    cfg_js = struct();
-    cfg_js.max_em_iter   = 5;
-    cfg_js.grid_size     = 20;    % 决定在 [Max/1000, Max] 范围内搜索多少个点
-    cfg_js.verbose       = true;
-    cfg_js.use_gpu       = false; 
-    cfg_js.debug_print   = true;  % 开启调试打印以便观察自动计算过程
-    cfg_js.debug_thr     = 1e-5;
-    
-    % --- 关键设置 ---
-    % 设置为非 'external_fixed' 模式，触发 Dynamic Grid Search
-    cfg_js.hyperparam_mode = 'auto_grid'; 
-    
-    % 算法参数
-    cfg_js.optimizer     = 'fista';
-    cfg_js.m_samples     = 1000;  % 样本量，影响 BIC/EBIC 计算
-    
-    % Rayleigh / Rescue 配置
-    cfg_js.enable_debias = true;  % 建议开启，Grid Search 后去偏
-    cfg_js.rayleigh_range = 2.0:0.2:5.0; % Rayleigh 搜索范围
-    
-    % --- 调用核心函数 ---
-    % 注意：这里直接调用你修改好的 solver_jspace_adaptive
-    [~, JS_Sjj_cross, outs_js] = solver_jspace_adaptive(Svv_cross, L, [], cfg_js);
+% [ADDED] J-SPACE Processing (Plan-1: DWI soft prior + eta-search + dynamic lambdas)
+disp('->> J-SPACE Processing (Global 3D Surrogate Opt)...');
 
-    % --- 结果打印 ---
-    if cfg_js.verbose
-        fprintf('\n[J-SPACE] Result Summary:\n');
-        
-        % 1. 打印最终选中的超参数
-        if isfield(outs_js, 'global_hyperparams')
-            hp = outs_js.global_hyperparams;
-            fprintf('  > Selected Hyperparams (Auto-Grid):\n');
-            fprintf('    Lambda1 (Fixed Base) : %.2e\n', hp.lambda1);
-            fprintf('    Lambda2 (Selected)   : %.2e\n', hp.lambda2);
-            fprintf('    Lambda3 (Fixed Base) : %.2e\n', hp.lambda3);
-        end
-        
-        % 2. 打印搜索范围 (从最后一次迭代的历史记录中获取)
-        if isfield(outs_js, 'grid_history') && ~isempty(outs_js.grid_history)
-            last_iter = outs_js.grid_history(end);
-            if isfield(last_iter, 'lambda')
-                l_range = last_iter.lambda;
-                fprintf('  > Search Range (Lambda2): [%.2e, %.2e] (Auto-calculated from Data)\n', ...
-                    min(l_range), max(l_range));
-            end
-        end
-        
-        % 3. 打印阈值
-        if isfield(outs_js, 'thresholds')
-            thr = outs_js.thresholds;
-            fprintf('  > Thresholds used:\n');
-            fprintf('    t_active (Mask)  : %.2e\n', thr.t_active);
-            fprintf('    t_rescue (Rescue): %.2e\n', thr.t_rescue);
-        end
-        
-        % 4. 打印最终 LogLik
-        if isfield(outs_js, 'loglik') && ~isempty(outs_js.loglik)
-            fprintf('  > Final LogLik     : %.2e\n', outs_js.loglik(end));
-        end
+% --- Build cfg for J-SPACE ---
+cfg_js = struct();
+cfg_js.max_em_iter   = 10;
+cfg_js.verbose       = true;
+cfg_js.use_gpu       = false;
+cfg_js.debug_print   = false;
+
+% --- Optimizer settings ---
+cfg_js.opt_max_evals = 50;
+cfg_js.opt_min_points = 10;
+cfg_js.opt_use_parallel = true;
+
+% --- Objective / EBIC sample size ---
+cfg_js.m_samples     = 1000;
+
+% --- M-step solver choice ---
+cfg_js.optimizer     = 'fista';
+
+% --- (PLAN-1) Pass DWI connectivity as soft prior ---
+cfg_js.dwi_C = parameters.Compact_Model.C;
+cfg_js.freq = parameters.Data.freq;
+cfg_js.dwi_weight_mode   = 'power';
+cfg_js.dwi_weight_alpha  = 1.0;
+cfg_js.dwi_weight_clip   = [0.25, 4];
+cfg_js.dwi_weight_normalize_median = true;
+cfg_js.postprocess_enable = false;
+cfg_js.stoch.mode = 'B';
+% ============================================================
+% [J-SPACE MOD-1] Tighten eta bounds (hard safety + warm-start bounds)
+% ============================================================
+% Global safety bounds (recommended based on your observed BEST etas)
+eta_global_lb = [3e-4, 3e-4, 3e-4];
+eta_global_ub = [3e-2, 3e-1, 5e-2];     % NOTE: eta2_ub tightened to 0.3
+
+if ~isempty(eta_prev)
+    cen_log = log10(eta_prev(:)');
+    lb = 10.^(cen_log - eta_span_decades);
+    ub = 10.^(cen_log + eta_span_decades);
+
+    % clamp to global safety bounds
+    lb = max(lb, eta_global_lb);
+    ub = min(ub, eta_global_ub);
+else
+    lb = eta_global_lb;
+    ub = eta_global_ub;
+end
+
+% pass to solver (it reads eta1_lb/ub, eta2_lb/ub, eta3_lb/ub)
+cfg_js.eta1_lb = lb(1);  cfg_js.eta1_ub = ub(1);
+cfg_js.eta2_lb = lb(2);  cfg_js.eta2_ub = ub(2);
+cfg_js.eta3_lb = lb(3);  cfg_js.eta3_ub = ub(3);
+
+% ============================================================
+% [J-SPACE MOD-2] Provide MULTI initial points to surrogateopt
+%   - best from previous subject
+%   - a small bank of historical best etas
+%   - plus a few LHS/random points inside the (shrunk) bounds
+% ============================================================
+init_eta = [];
+
+% default anchor
+eta0_default = [0.1, 0.2, 0.1];
+eta0_default = min(max(eta0_default, lb), ub);
+init_eta = [init_eta; eta0_default];
+
+% warm start from last run
+if ~isempty(eta_prev)
+    init_eta = [init_eta; min(max(eta_prev, lb), ub)];
+end
+
+% add bank (most recent first)
+if ~isempty(eta_bank)
+    k = min(size(eta_bank,1), 6);
+    cand = eta_bank(end-k+1:end, :);
+    cand = min(max(cand, lb), ub);
+    init_eta = [init_eta; cand];
+end
+
+% fill to at least cfg_js.opt_min_points with LHS/random points
+need_extra = max(0, cfg_js.opt_min_points - size(init_eta,1));
+if need_extra > 0
+    try
+        X = lhsdesign(need_extra, 3);   % Stats toolbox
+    catch
+        X = rand(need_extra, 3);
     end
+    lb_log = log10(lb); ub_log = log10(ub);
+    extra_eta = 10.^(lb_log + X .* (ub_log - lb_log));
+    init_eta = [init_eta; extra_eta];
+end
+
+% remove duplicates (stable)
+init_eta = unique(round(init_eta, 12), 'rows', 'stable');
+
+% pass to solver as log10 points (surrogateopt is run in log-space)
+cfg_js.opt_initial_points_log = log10(init_eta);
+
+% also set a single eta init (used if solver falls back to scalar init)
+cfg_js.eta1_init = init_eta(1,1);
+cfg_js.eta2_init = init_eta(1,2);
+cfg_js.eta3_init = init_eta(1,3);
+
+% --- Call the solver ---
+% [Omega_est, JS_Sjj_cross, outs_js] = solver_jspace_3d_opt(Svv_cross, L, [], cfg_js);
+% [Omega_est, JS_Sjj_cross, outs_js] = solver_jspace_3d_opt_bayesopt(Svv_cross, L, [], cfg_js);
+[Omega_est, JS_Sjj_cross, outs_js] = solver_jspace_3d_opt_stoch(Svv_cross, L, [], cfg_js);
+% ============================================================
+% [J-SPACE] Update warm-start state for next subject
+% ============================================================
+if isfield(outs_js, 'best_eta')
+    eta_prev = [outs_js.best_eta.eta1, outs_js.best_eta.eta2, outs_js.best_eta.eta3];
+else
+    % fallback if field name differs
+    try
+        eta_prev = [outs_js.global_hyperparams.eta1, outs_js.global_hyperparams.eta2, outs_js.global_hyperparams.eta3];
+    catch
+        eta_prev = [];
+    end
+end
+if ~isempty(eta_prev)
+    eta_bank = [eta_bank; eta_prev];
+    if size(eta_bank,1) > eta_bank_keep
+        eta_bank = eta_bank(end-eta_bank_keep+1:end, :);
+    end
+end
+
+% --- (Optional) Print results ---
+if cfg_js.verbose
+    fprintf('\n[J-SPACE] 3D Optimization Summary:\n');
+    if isfield(outs_js,'best_eta')
+        fprintf('  > BEST eta: eta1=%.3e | eta2=%.3e | eta3=%.3e\n', ...
+            outs_js.best_eta.eta1, outs_js.best_eta.eta2, outs_js.best_eta.eta3);
+    end
+    if isfield(outs_js,'em_lambdas') && ~isempty(outs_js.em_lambdas)
+        lam_last = outs_js.em_lambdas(end,:);
+        fprintf('  > Final EM lambdas: [%.3e %.3e %.3e]\n', lam_last(1), lam_last(2), lam_last(3));
+    end
+    if isfield(outs_js,'opt_results') && isfield(outs_js.opt_results,'fval')
+        fprintf('  > Best AIC+Penalty: %.3e\n', outs_js.opt_results.fval);
+    end
+end
+
 
     % Initialize mean power array for each ROI and frequency
     mn_power = zeros(Nroi, Nw);

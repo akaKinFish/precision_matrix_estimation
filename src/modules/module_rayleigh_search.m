@@ -1,38 +1,22 @@
+% ------------------------------------------------------------
+% LOCAL Module: Rayleigh Search (Updated for PCOR + Penalty)
+% ------------------------------------------------------------
 function [best_r, mask_cell, Var_proxies, stats] = module_rayleigh_search(Gamma_debiased, S_whitened, n_samples, K, W, params)
-% MODULE_RAYLEIGH_SEARCH Grid search for optimal Rayleigh threshold (mask only).
-%
-% Score(r) = sum_w [logdet(G_w) - tr(S_w G_w)]
-%            - lambda1 * sum_{w<w'} k_{w,w'} ||G_w - G_w'||_W^2
-%            - lambda3 * sum_w ||G_w||_W^2
-%
-% Returns best_r and masks; does not perform final SPD refit.
-
     F = numel(Gamma_debiased);
     if nargin < 6, params = struct(); end
-
     if isfield(params, 'r_range') && ~isempty(params.r_range)
         r_grid = params.r_range;
     else
         r_grid = 2.0:0.2:5.0;
     end
-
     if isfield(params, 'lambda1'), lambda1 = params.lambda1; else, lambda1 = 0; end
     if isfield(params, 'lambda3'), lambda3 = params.lambda3; else, lambda3 = 0; end
     if isfield(params, 'weight_mode'), mode = params.weight_mode; else, mode = 'matrix'; end
-    if isfield(params, 'variance_source')
-        var_src = params.variance_source;
-    else
-        var_src = 'debiased'; % options: 'debiased', 'hat'
-    end
-    if isfield(params, 'Gamma_hat')
-        Gamma_hat_cells = params.Gamma_hat;
-    else
-        Gamma_hat_cells = [];
-    end
+    if isfield(params, 'variance_source'), var_src = params.variance_source; else, var_src = 'debiased'; end
+    if isfield(params, 'Gamma_hat'), Gamma_hat_cells = params.Gamma_hat; else, Gamma_hat_cells = []; end
+    if isfield(params, 'threshold_domain'), thresh_domain = params.threshold_domain; else, thresh_domain = 'entry'; end
 
     Ksym = (K + K') / 2;
-
-    % variance proxies
     Var_proxies = cell(F, 1);
     for f = 1:F
         if strcmp(var_src, 'hat') && ~isempty(Gamma_hat_cells)
@@ -45,60 +29,83 @@ function [best_r, mask_cell, Var_proxies, stats] = module_rayleigh_search(Gamma_
     end
 
     scores = -inf(length(r_grid), 1);
-
-    % grid search
+    
     for i = 1:length(r_grid)
         r = r_grid(i);
         G_candidate = cell(F, 1);
-
         for f = 1:F
             G_dense = Gamma_debiased{f};
-            V_proxy = Var_proxies{f};
-            Threshold = (r / sqrt(complex(n_samples))) * sqrt(complex(V_proxy));
-
-            mask = abs(G_dense) >= Threshold;
-            mask(1:size(G_dense,1)+1:end) = true; % keep diagonal
-
+            p = size(G_dense,1);
+            if strcmpi(thresh_domain, 'pcor')
+                d = real(diag(G_dense)); d = max(d, 1e-12);
+                denom = sqrt(d * d.');
+                P = -G_dense ./ denom; P(1:p+1:end) = 0;
+                ThresholdP = (r / sqrt(n_samples));
+                mask = abs(P) >= ThresholdP;
+            else
+                V_proxy = Var_proxies{f};
+                Threshold = (r / sqrt(complex(n_samples))) * sqrt(complex(V_proxy));
+                mask = abs(G_dense) >= Threshold;
+            end
+            mask(1:p+1:end) = true;
             G_sparse = G_dense;
             G_sparse(~mask) = 0;
             G_sparse(1:size(G_sparse,1)+1:end) = real(diag(G_sparse));
-
-            if exist('regularize_spd','file') == 2
-                G_final = regularize_spd(G_sparse);
-            else
-                [G_final, ~] = utils_math.project_spd(G_sparse, 1e-8);
-            end
+            [G_final, ~] = utils_math.project_spd(G_sparse, 1e-8);
             G_candidate{f} = utils_math.make_hermitian(G_final);
         end
-
-        scores(i) = compute_score(G_candidate, S_whitened, Ksym, W, lambda1, lambda3, mode);
+        
+        % Calculate Score
+        base_score = compute_score(G_candidate, S_whitened, Ksym, W, lambda1, lambda3, mode);
+        
+        % Add Density Penalty
+        penalty = 0;
+        if isfield(params,'density_min') && isfield(params,'density_max') && isfield(params,'density_penalty_weight')
+            den_list = zeros(F,1);
+            for ff = 1:F
+                Gtmp = G_candidate{ff};
+                Mtmp = abs(Gtmp) > 0; 
+                Mtmp(1:size(Gtmp,1)+1:end) = false;
+                den_list(ff) = (nnz(Mtmp)/2) / (size(Gtmp,1)*(size(Gtmp,1)-1)/2);
+            end
+            den_med = median(den_list);
+            if den_med < params.density_min
+                penalty = params.density_penalty_weight * ((params.density_min - den_med)/max(params.density_min,eps))^2;
+            elseif den_med > params.density_max
+                penalty = params.density_penalty_weight * ((den_med - params.density_max)/max(params.density_max,eps))^2;
+            end
+        end
+        scores(i) = base_score - penalty;
     end
 
-    % select best and build masks
     [max_score, best_idx] = max(scores);
     best_r = r_grid(best_idx);
-
     mask_cell = cell(F, 1);
     for f = 1:F
         G_dense = Gamma_debiased{f};
-        V_proxy = Var_proxies{f};
-        Threshold = (best_r / sqrt(complex(n_samples))) * sqrt(complex(V_proxy));
-        mask = abs(G_dense) >= Threshold;
-        mask(1:size(G_dense,1)+1:end) = true;
+        p = size(G_dense,1);
+        if strcmpi(thresh_domain, 'pcor')
+             d = real(diag(G_dense)); d = max(d, 1e-12);
+             denom = sqrt(d * d.');
+             P = -G_dense ./ denom; P(1:p+1:end) = 0;
+             ThresholdP = (best_r / sqrt(n_samples));
+             mask = abs(P) >= ThresholdP;
+        else
+             V_proxy = Var_proxies{f};
+             Threshold = (best_r / sqrt(complex(n_samples))) * sqrt(complex(V_proxy));
+             mask = abs(G_dense) >= Threshold;
+        end
+        mask(1:p+1:end) = true;
         mask_cell{f} = mask;
     end
-
     stats.r_grid = r_grid;
     stats.scores = scores;
     stats.best_score = max_score;
 end
 
-% ============================================================
 function score = compute_score(Gamma_cell, S_cell, Ksym, W, lambda1, lambda3, mode)
-    % Helper: structural posterior score
     F = numel(Gamma_cell);
     log_lik = 0;
-
     for f = 1:F
         G = Gamma_cell{f};
         S = S_cell{f};
@@ -109,7 +116,6 @@ function score = compute_score(Gamma_cell, S_cell, Ksym, W, lambda1, lambda3, mo
         end
         log_lik = log_lik + (ld - real(trace(S * G)));
     end
-
     freq_pen = 0;
     if lambda1 > 0
         for f1 = 1:F
@@ -127,7 +133,6 @@ function score = compute_score(Gamma_cell, S_cell, Ksym, W, lambda1, lambda3, mo
             end
         end
     end
-
     space_pen = 0;
     if lambda3 > 0
         for f = 1:F
@@ -142,6 +147,5 @@ function score = compute_score(Gamma_cell, S_cell, Ksym, W, lambda1, lambda3, mo
             space_pen = space_pen + term;
         end
     end
-
     score = log_lik - lambda1 * freq_pen - lambda3 * space_pen;
 end

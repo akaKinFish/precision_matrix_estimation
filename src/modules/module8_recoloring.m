@@ -108,7 +108,8 @@ function [out, info] = normalize_recoloring_input_(S)
         Gc{f} = spd_floor_(Gc{f}, 0);       % Γ̃ 不必 SPD，但对称即可
     end
 
-    out = struct();
+    % Preserve optional diagnostic fields while normalizing core matrices.
+    out = S;
     out.whitened_precision_matrices = Gc;
     out.whitening_matrices          = Dc;
 
