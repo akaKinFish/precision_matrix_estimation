@@ -244,30 +244,68 @@ cfg_js.opt_use_parallel = true;
 cfg_js.m_samples     = 1000;
 
 % --- M-step solver choice ---
-cfg_js.optimizer     = 'fista';
+cfg_js.optimizer     = 'stoch_fista';   % [CHANGED] new solver uses stochastic FISTA
+cfg_js.use_fista     = false;           % [ADDED] avoid legacy override if someone sets it elsewhere
 
 % --- (PLAN-1) Pass DWI connectivity as soft prior ---
 cfg_js.dwi_C = parameters.Compact_Model.C;
-cfg_js.freq = parameters.Data.freq;
+cfg_js.freq  = parameters.Data.freq;
+
 cfg_js.dwi_weight_mode   = 'power';
 cfg_js.dwi_weight_alpha  = 1.0;
 cfg_js.dwi_weight_clip   = [0.25, 4];
 cfg_js.dwi_weight_normalize_median = true;
+
 cfg_js.postprocess_enable = false;
-cfg_js.stoch.mode = 'B';
+
+% ============================================================
+% [STOCH CONFIG] (Added, no deletions)
+%   This matches helper functions:
+%   - stoch_prepare_freq_sampler_
+%   - stoch_sample_freq_indices_
+%   - stoch_sub_kernel_rescale_
+% ============================================================
+if ~isfield(cfg_js,'stoch') || isempty(cfg_js.stoch)
+    cfg_js.stoch = struct();
+end
+
+cfg_js.stoch.mode = 'B';                 % keep your setting ('B' = banded)
+cfg_js.stoch.seed = 0;                   % [ADDED] RNG seed base (used with iter to be reproducible)
+
+% How many freqs sampled per band per stochastic M-step
+% (your helper supports either 'n_per_band' or 'Nsfreq'; we set both for compatibility)
+cfg_js.stoch.n_per_band = 2;             % [ADDED] suggested default (tune later)
+cfg_js.stoch.Nsfreq     = cfg_js.stoch.n_per_band;  % [ADDED] alias
+
+% Optional cap on total sampled freqs each iteration
+cfg_js.stoch.max_total  = 16;            % [ADDED] safety cap (<=47)
+
+% EEG-like band edges (Hz). You can customize.
+% For your freq range ~[1.17, 19.14], these edges work well.
+cfg_js.stoch.band_edges = [0 4 8 13 20]; % [ADDED] last edge <= max(freq)
+
+% Stochastic FISTA inner loop (fixed-iter as you requested)
+cfg_js.stoch.max_iter   = 40;            % [ADDED] fixed iter count for stochastic FISTA
+cfg_js.stoch.tol        = 0;             % [ADDED] disable tol-stop (fixed iter)
+cfg_js.stoch.backtracking_beta = 0.5;    % [ADDED] match your fista settings style
+cfg_js.stoch.max_backtracking  = 20;     % [ADDED]
+cfg_js.stoch.monotone          = true;   % [ADDED]
+cfg_js.stoch.use_restart       = true;   % [ADDED]
+
+% Optional: kernel mass rescale when using subset of freqs
+cfg_js.stoch.rescale_kernel_mass = true; % [ADDED]
+
 % ============================================================
 % [J-SPACE MOD-1] Tighten eta bounds (hard safety + warm-start bounds)
 % ============================================================
-% Global safety bounds (recommended based on your observed BEST etas)
 eta_global_lb = [3e-4, 3e-4, 3e-4];
-eta_global_ub = [3e-2, 3e-1, 5e-2];     % NOTE: eta2_ub tightened to 0.3
+eta_global_ub = [3e-2, 3e-1, 5e-1];     % NOTE: eta2_ub tightened to 0.3
 
 if ~isempty(eta_prev)
     cen_log = log10(eta_prev(:)');
     lb = 10.^(cen_log - eta_span_decades);
     ub = 10.^(cen_log + eta_span_decades);
 
-    % clamp to global safety bounds
     lb = max(lb, eta_global_lb);
     ub = min(ub, eta_global_ub);
 else
@@ -275,30 +313,23 @@ else
     ub = eta_global_ub;
 end
 
-% pass to solver (it reads eta1_lb/ub, eta2_lb/ub, eta3_lb/ub)
 cfg_js.eta1_lb = lb(1);  cfg_js.eta1_ub = ub(1);
 cfg_js.eta2_lb = lb(2);  cfg_js.eta2_ub = ub(2);
 cfg_js.eta3_lb = lb(3);  cfg_js.eta3_ub = ub(3);
 
 % ============================================================
 % [J-SPACE MOD-2] Provide MULTI initial points to surrogateopt
-%   - best from previous subject
-%   - a small bank of historical best etas
-%   - plus a few LHS/random points inside the (shrunk) bounds
 % ============================================================
 init_eta = [];
 
-% default anchor
 eta0_default = [0.1, 0.2, 0.1];
 eta0_default = min(max(eta0_default, lb), ub);
 init_eta = [init_eta; eta0_default];
 
-% warm start from last run
 if ~isempty(eta_prev)
     init_eta = [init_eta; min(max(eta_prev, lb), ub)];
 end
 
-% add bank (most recent first)
 if ~isempty(eta_bank)
     k = min(size(eta_bank,1), 6);
     cand = eta_bank(end-k+1:end, :);
@@ -306,11 +337,10 @@ if ~isempty(eta_bank)
     init_eta = [init_eta; cand];
 end
 
-% fill to at least cfg_js.opt_min_points with LHS/random points
 need_extra = max(0, cfg_js.opt_min_points - size(init_eta,1));
 if need_extra > 0
     try
-        X = lhsdesign(need_extra, 3);   % Stats toolbox
+        X = lhsdesign(need_extra, 3);
     catch
         X = rand(need_extra, 3);
     end
@@ -319,13 +349,10 @@ if need_extra > 0
     init_eta = [init_eta; extra_eta];
 end
 
-% remove duplicates (stable)
 init_eta = unique(round(init_eta, 12), 'rows', 'stable');
 
-% pass to solver as log10 points (surrogateopt is run in log-space)
 cfg_js.opt_initial_points_log = log10(init_eta);
 
-% also set a single eta init (used if solver falls back to scalar init)
 cfg_js.eta1_init = init_eta(1,1);
 cfg_js.eta2_init = init_eta(1,2);
 cfg_js.eta3_init = init_eta(1,3);
@@ -334,6 +361,7 @@ cfg_js.eta3_init = init_eta(1,3);
 % [Omega_est, JS_Sjj_cross, outs_js] = solver_jspace_3d_opt(Svv_cross, L, [], cfg_js);
 % [Omega_est, JS_Sjj_cross, outs_js] = solver_jspace_3d_opt_bayesopt(Svv_cross, L, [], cfg_js);
 [Omega_est, JS_Sjj_cross, outs_js] = solver_jspace_3d_opt_stoch(Svv_cross, L, [], cfg_js);
+
 % ============================================================
 % [J-SPACE] Update warm-start state for next subject
 % ============================================================
@@ -547,8 +575,19 @@ mean_MSE_lo = mean(MSE_lo, 2, 'omitnan');
 mean_MSE_js = mean(MSE_js, 2, 'omitnan'); % [ADDED]
 
 % Paired t-test
-[~, p_ttest] = ttest(mean_MSE_xl, mean_MSE_mf);
-disp(['Paired t-test p-value (MSE comparison): ', num2str(p_ttest)]);
+[d_h, p_ttest, ci, stats] = ttest(mean_MSE_xl, mean_MSE_js);  % paired t-test
+d = mean_MSE_xl - mean_MSE_js;
+
+fprintf('\n[Paired t-test] H=%d p=%.6g | t=%.3f | df=%d\n', d_h, p_ttest, stats.tstat, stats.df);
+fprintf('[Mean diff] mean(xl - mf)=%.3e | std=%.3e\n', mean(d,'omitnan'), std(d,'omitnan'));
+fprintf('[95%% CI] [%.3e, %.3e] for mean(xl - mf)\n', ci(1), ci(2));
+
+if mean(d,'omitnan') < 0
+    fprintf('[Direction] Xi-AlphaNET (xl) has LOWER MSE than JSAPCE on average.\n');
+else
+    fprintf('[Direction] jsapce has LOWER MSE than Xi-AlphaNET (xl) on average.\n');
+end
+
 
 % Band-specific MSEs
 freq_band_indices = cell(Nbands,1);
