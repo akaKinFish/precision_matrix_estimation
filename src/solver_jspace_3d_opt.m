@@ -89,11 +89,13 @@ end
 % Weight matrix W_gamma (DWI soft prior)
 W_gamma = get_cfg(cfg, 'weight_matrix', ones(Nr));
 dwi_mask = [];
+dwi_connectivity_mask = [];
 if isfield(cfg, 'dwi_C') && ~isempty(cfg.dwi_C)
     if VERBOSE
         fprintf('[J-SPACE-3D] Using DWI soft prior: building W_gamma from cfg.dwi_C.\n');
     end
     [W_gamma, dwi_mask] = build_dwi_soft_prior_(cfg.dwi_C, Nr, cfg);
+    [dwi_connectivity_mask, ~] = utils_build_dwi_connectivity_mask_gmm(cfg.dwi_C, cfg);
 end
 
 % ============================================================
@@ -196,10 +198,11 @@ if VERBOSE
 end
 
 % Initial active mask
-[mask0, ~] = threshold_active_mask_(m5_in_base.whitened_covariances, thr0.t_active);
-if ~isempty(dwi_mask)
+act_params = struct('quantile_level', -thr0.t_active, 'strategy', 'intersection', 'force_diagonal', true);
+[mask0, ~] = module3_active_set(m5_in_base.whitened_covariances, act_params);
+if ~isempty(dwi_connectivity_mask)
     for f = 1:F
-        mask0{f} = mask0{f} | dwi_mask;
+        mask0{f} = mask0{f} & dwi_connectivity_mask;
         mask0{f}(1:Nr+1:end) = true;
     end
 end
@@ -418,10 +421,10 @@ for em_iter = 1:MAX_EM_ITER
     outs.em_lambdas(em_iter, :) = [lam1, lam2, lam3];
     
     % ---- Build new mask ----
-    [mask_new, ~] = threshold_active_mask_with_floor_(m5_in_base.whitened_covariances, thr0.t_active, MASK_DENS_FLOOR);
-    if ~isempty(dwi_mask)
+    [mask_new, ~] = module3_active_set(m5_in_base.whitened_covariances, act_params);
+    if ~isempty(dwi_connectivity_mask)
         for f = 1:F
-            mask_new{f} = mask_new{f} | dwi_mask;
+            mask_new{f} = mask_new{f} & dwi_connectivity_mask;
             mask_new{f}(1:Nr+1:end) = true;
         end
     end
