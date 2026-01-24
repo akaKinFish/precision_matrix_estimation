@@ -95,12 +95,7 @@ if isfield(cfg, 'dwi_C') && ~isempty(cfg.dwi_C)
         fprintf('[J-SPACE-3D] Using DWI soft prior: building W_gamma from cfg.dwi_C.\n');
     end
     [W_gamma, dwi_mask] = build_dwi_soft_prior_(cfg.dwi_C, Nr, cfg);
-    C_conn = gather(cfg.dwi_C);
-    C_conn = real(C_conn);
-    C_conn = (C_conn ~= 0);
-    C_conn = C_conn | C_conn.';
-    C_conn(1:Nr+1:end) = true;
-    dwi_connectivity_mask = C_conn;
+    [dwi_connectivity_mask, ~] = utils_build_dwi_connectivity_mask_gmm(cfg.dwi_C, cfg);
 end
 
 % ============================================================
