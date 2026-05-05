@@ -28,53 +28,66 @@ function [best_r, mask_cell, Var_proxies, stats] = module_rayleigh_search(Gamma_
         Var_proxies{f} = real(d * d') + abs(G_src).^2;
     end
 
-    scores = -inf(length(r_grid), 1);
+   scores = -inf(length(r_grid), 1);
     
     for i = 1:length(r_grid)
         r = r_grid(i);
         G_candidate = cell(F, 1);
+        mask_current = cell(F, 1); % [新增]：记录真实的稀疏状态
+        
         for f = 1:F
             G_dense = Gamma_debiased{f};
             p = size(G_dense,1);
+            
+            % 1. 对应参考代码：mask = find(Thetajj_unb < (rth/sqrt(m))*Thetajj_var)
             if strcmpi(thresh_domain, 'pcor')
                 d = real(diag(G_dense)); d = max(d, 1e-12);
                 denom = sqrt(d * d.');
                 P = -G_dense ./ denom; P(1:p+1:end) = 0;
                 ThresholdP = (r / sqrt(n_samples));
-                mask = abs(P) >= ThresholdP;
+                mask = abs(P) >= ThresholdP; % >= 代表保留边
             else
                 V_proxy = Var_proxies{f};
-                Threshold = (r / sqrt(complex(n_samples))) * sqrt(complex(V_proxy));
-                mask = abs(G_dense) >= Threshold;
+                % 严格对齐参考代码：使用方差的平方根，去除多余的 complex() 避免计算错误
+                Threshold = (r / sqrt(n_samples)) * sqrt(max(V_proxy, 0));
+                mask = abs(G_dense) >= Threshold; 
             end
-            mask(1:p+1:end) = true;
+            
+            mask(1:p+1:end) = true; % 对角线强制保留
+            mask_current{f} = mask; % 存下这个绝对干净的 0/1 Mask
+            
+            % 2. 对应参考代码：Thetajj_mask(mask) = 0
             G_sparse = G_dense;
             G_sparse(~mask) = 0;
-            G_sparse(1:size(G_sparse,1)+1:end) = real(diag(G_sparse));
+            G_sparse(1:p+1:end) = real(diag(G_sparse)); % 恢复对角线
+            
+            % 3. 对应参考代码：higgs_eigendecomposition (保证能算 log_det)
             [G_final, ~] = utils_math.project_spd(G_sparse, 1e-8);
             G_candidate{f} = utils_math.make_hermitian(G_final);
         end
         
-        % Calculate Score
+        % 4. 计算基础得分（对数似然）
         base_score = compute_score(G_candidate, S_whitened, Ksym, W, lambda1, lambda3, mode);
         
-        % Add Density Penalty
+        % 5. 计算密度惩罚（关键修复：必须用 mask_current 计算，不能用 G_candidate）
         penalty = 0;
         if isfield(params,'density_min') && isfield(params,'density_max') && isfield(params,'density_penalty_weight')
             den_list = zeros(F,1);
             for ff = 1:F
-                Gtmp = G_candidate{ff};
-                Mtmp = abs(Gtmp) > 0; 
-                Mtmp(1:size(Gtmp,1)+1:end) = false;
-                den_list(ff) = (nnz(Mtmp)/2) / (size(Gtmp,1)*(size(Gtmp,1)-1)/2);
+                Mtmp = mask_current{ff}; 
+                Mtmp(1:p+1:end) = false; % 不统计对角线
+                den_list(ff) = (nnz(Mtmp)/2) / (p*(p-1)/2);
             end
             den_med = median(den_list);
+            
             if den_med < params.density_min
                 penalty = params.density_penalty_weight * ((params.density_min - den_med)/max(params.density_min,eps))^2;
             elseif den_med > params.density_max
                 penalty = params.density_penalty_weight * ((den_med - params.density_max)/max(params.density_max,eps))^2;
             end
         end
+        
+        % 最终得分
         scores(i) = base_score - penalty;
     end
 

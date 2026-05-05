@@ -38,29 +38,24 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
 %     .L_min             : Minimum L value (default 1e-3) [New A3]
 %     .L_max             : Maximum L value (default 1e8) [New A3]
 %     .L_shrink_on_success : Reduce L after successful step (default true) [New A3]
-
     % ---------------- Inputs ----------------
     Sigmas = input_data.whitened_covariances;
     Kernel = input_data.smoothing_kernel;
     W      = input_data.weight_matrix;
     F = numel(Sigmas);
     p = size(Sigmas{1}, 1);
-
     if isfield(input_data, 'precision_matrices') && ~isempty(input_data.precision_matrices)
         Gamma_curr = input_data.precision_matrices;
     else
         Gamma_curr = cell(F,1);
         for f = 1:F, Gamma_curr{f} = eye(p, 'like', Sigmas{1}); end
     end
-
     if isfield(input_data, 'active_mask') && ~isempty(input_data.active_mask)
         active_mask = input_data.active_mask;
     else
         active_mask = [];
     end
-
     if nargin < 2, params = struct(); end
-
     % ---------------- Defaults (core) ----------------
     params = set_default_(params, 'lambda1', 0);
     params = set_default_(params, 'lambda2', 0);
@@ -73,7 +68,6 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
     params = set_default_(params, 'rcond_min', 1e-12);
     params = set_default_(params, 'penalize_diagonal', false);
     params = set_default_(params, 'enforce_unit_diagonal', false);
-
     % ---------------- Defaults (stoch) ----------------
     if ~isfield(params, 'stoch'), params.stoch = struct(); end
     st = params.stoch;
@@ -91,7 +85,6 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
     st = set_default_(st, 'L_min', 1e-3);             % A3: Minimum L
     st = set_default_(st, 'L_max', 1e8);              % A3: Maximum L (anti-explosion)
     st = set_default_(st, 'L_shrink_on_success', true); % A3: Allow L to decrease
-
     % band definition
     if isfield(st,'band_groups') && ~isempty(st.band_groups)
         band_groups = st.band_groups;
@@ -112,20 +105,16 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
             end
         end
     end
-
     % local RNG stream
     stream = RandStream('twister','Seed', st.seed);
-
     % ---------------- Init: ensure Hermitian SPD ----------------
     for f = 1:F
         Gamma_curr{f} = utils_math.make_hermitian(Gamma_curr{f});
         [Gamma_curr{f}, ~] = utils_math.project_spd(Gamma_curr{f}, params.min_eig);
     end
-
     Y_curr = Gamma_curr;
     t_curr = 1;
     Ksym = (Kernel + Kernel')/2;
-
     % initial L for backtracking
     if params.alpha0 > 0
         L_curr = 1 / params.alpha0;
@@ -134,12 +123,10 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
     end
     % [A3] Initial Clamp
     L_curr = max(st.L_min, min(L_curr, st.L_max));
-
     % For histories
     batch_trace = cell(st.max_iter, 1);
     alpha_trace = zeros(st.max_iter, 1);
     bt_trace    = zeros(st.max_iter, 1);
-
     % ---------------- Main loop (fixed iters) ----------------
     for iter = 1:st.max_iter
         % ---- (A) sample batch indices ----
@@ -150,20 +137,15 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
         % [A1] Create membership lookup for this batch (fast O(1) access)
         inB = false(1, F);
         inB(batch) = true;
-
         batch_trace{iter} = batch;
-
         % ---- (B) gradient at Y (ONLY for batch freqs) ----
         grads = compute_grad_batch_(Y_curr, Sigmas, Ksym, W, params, batch);
-
         % ---- (C) (optional) local backtracking on smooth part ----
         bt_count = 0;
         accepted = false;
-
         % Precompute f(Y) local (smooth only)
         % [A1] Updated call signature to include inB
         fY_local = smooth_obj_local_(Y_curr, Sigmas, Ksym, W, params, batch, inB);
-
         while ~accepted
             alpha = 1 / L_curr;
             
@@ -180,7 +162,6 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
                 [Gamma_cand{f}, ~] = module_proximal_operator_fista.compute( ...
                     Z, params.lambda2 * alpha, mask_f, params);
             end
-
             if ~st.use_backtracking
                 accepted = true;
             else
@@ -197,7 +178,6 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
                 diff_norm_sq = cell_norm_sq_batch_(Delta, batch);
                 lin_term     = cell_inner_batch_(grads, Delta, batch);
                 majorant     = fY_local + lin_term + (L_curr/2) * diff_norm_sq;
-
                 if f_new_local <= majorant * (1 + 1e-12)
                     accepted = true;
                 else
@@ -219,11 +199,9 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
             % Clamp L to prevent underflow/overflow
             L_curr = min(max(L_curr, st.L_min), st.L_max);
         end
-
         % store step stats
         alpha_trace(iter) = 1 / L_curr;
         bt_trace(iter)    = bt_count;
-
         % ---- (D) Nesterov update (ONLY batch; freeze others) ----
         % [A2] Configurable Nesterov
         if st.use_nesterov
@@ -243,16 +221,13 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
             end
             t_curr = 1; % Reset momentum counter
         end
-
         Gamma_curr = Gamma_cand;
         Y_curr     = Y_next;
-
         if params.verbose && (iter == 1 || mod(iter,10)==0)
             fprintf('[StochFISTA] iter=%d/%d | |B|=%d | alpha=%.2e | bt=%d | Nes=%d\n', ...
                 iter, st.max_iter, numel(batch), alpha_trace(iter), bt_count, st.use_nesterov);
         end
     end
-
     Gamma_cells = Gamma_curr;
     
     % [B3] Enhanced Results
@@ -272,17 +247,14 @@ function [Gamma_cells, results] = module5_stoch_fista_main(input_data, params)
     results.L_min       = st.L_min;
     results.L_max       = st.L_max;
 end
-
 % =====================================================================
 % Helpers
 % =====================================================================
-
 function s = set_default_(s, field, val)
     if ~isfield(s, field) || isempty(s.(field))
         s.(field) = val;
     end
 end
-
 function band_groups = build_band_groups_(freq, edges)
     % edges: e.g. [0 4 8 13 inf]
     freq = freq(:).';
@@ -305,7 +277,6 @@ function band_groups = build_band_groups_(freq, edges)
         band_groups{end+1} = rest;
     end
 end
-
 function batch = sample_batch_(band_groups, m_per_band, mode, F, stream)
     if nargin < 4, F = 0; end %#ok<NASGU>
     if strcmpi(mode,'U')
@@ -328,7 +299,6 @@ function batch = sample_batch_(band_groups, m_per_band, mode, F, stream)
         batch = [batch, idx(rp)]; %#ok<AGROW>
     end
 end
-
 function batch2 = neighbor_closure_(batch, radius, F)
     if radius <= 0
         batch2 = batch;
@@ -343,7 +313,6 @@ function batch2 = neighbor_closure_(batch, radius, F)
     acc = acc(acc>=1 & acc<=F);
     batch2 = acc;
 end
-
 function grads = compute_grad_batch_(Gamma_cells, Sigma_cells, Ksym, W, params, batch)
     F = numel(Gamma_cells);
     p = size(Gamma_cells{1},1);
@@ -408,7 +377,6 @@ function grads = compute_grad_batch_(Gamma_cells, Sigma_cells, Ksym, W, params, 
         grads{f} = utils_math.make_hermitian(grad_fit + grad_smooth + grad_space);
     end
 end
-
 % [A1] & [B2] Modified: Added inB for weight logic and nz for speed
 function fval = smooth_obj_local_(Gamma_cells, Sigma_cells, Ksym, W, params, batch, inB)
     % Local smooth objective for backtracking.
@@ -483,7 +451,6 @@ function fval = smooth_obj_local_(Gamma_cells, Sigma_cells, Ksym, W, params, bat
         end
     end
 end
-
 function val = cell_norm_sq_batch_(Delta, batch)
     val = 0;
     for ii = 1:numel(batch)
@@ -492,7 +459,6 @@ function val = cell_norm_sq_batch_(Delta, batch)
         val = val + norm(Delta{f}, 'fro')^2;
     end
 end
-
 function val = cell_inner_batch_(A, B, batch)
     val = 0;
     for ii = 1:numel(batch)
@@ -501,7 +467,6 @@ function val = cell_inner_batch_(A, B, batch)
         val = val + real(sum(sum(conj(A{f}) .* B{f})));
     end
 end
-
 function A_clip = project_spd_cond_clip_(A, min_eig, cond_cap)
     A = (A + A')/2;
     [V,d] = eig(A,'vector');
@@ -511,7 +476,6 @@ function A_clip = project_spd_cond_clip_(A, min_eig, cond_cap)
     A_clip = V * diag(d) * V';
     A_clip = (A_clip + A_clip')/2;
 end
-
 function invA = inv_spd_chol_(A)
     A = (A + A')/2;
     [R,flag] = chol(A);

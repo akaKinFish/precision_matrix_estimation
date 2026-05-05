@@ -1,4 +1,4 @@
-function [Omega_est, Sigma_src_est, outs] = solver_jspace_3d_opt_stoch(Svv_cell, L, GraphLaplacian, cfg)
+function [Omega_est, Sigma_src_est, outs] = solver_jspace_3d_opt_stoch_v4(Svv_cell, L, GraphLaplacian, cfg)
 % SOLVER_JSPACE_3D_OPT_STOCH
 %   J-SPACE Scheme-1: eta-search (surrogateopt) + stable EM + Stochastic M-step.
 %
@@ -55,11 +55,21 @@ DENS_PEN_W         = get_cfg(cfg, 'density_penalty_weight', 1e7);
 MASK_DENS_FLOOR    = get_cfg(cfg, 'mask_density_floor', max(0.03, log(Nr)/Nr));
 MASK_UNION_MODE = get_cfg(cfg, 'mask_union', true);
 
-RAY_RANGE          = get_cfg(cfg, 'rayleigh_range', 2.0:0.2:5.0);
+RAY_RANGE          = get_cfg(cfg, 'rayleigh_range', 0.7:0.1:3.16);
 M_SAMPLES          = get_cfg(cfg, 'm_samples', 100 * Nr);
 UPDATE_RATE        = get_cfg(cfg, 'update_rate', 0.35);
 UPDATE_RATE = 1;
-DEBIAS_ONLY = true;
+
+% Post-EM post-processing config
+POST_RUN_SEARCH    = get_cfg(cfg, 'post_run_search', true);
+POST_RESCUE_MODE   = lower(get_cfg(cfg, 'post_rescue_mode', 'auto')); % off | auto | always
+POST_RESCUE_UNION  = get_cfg(cfg, 'post_rescue_union', false);
+POST_REFIT_MODE    = lower(get_cfg(cfg, 'post_refit_mode', 'fused_ridge_surrogate')); % debias_only | single_ridge | fused_ridge_surrogate | stoch_mstep
+POST_SEARCH_SCORE  = lower(get_cfg(cfg, 'post_search_score', 'hybrid')); % higgs | jspace | hybrid
+POST_RIDGE_PENALTY = get_cfg(cfg, 'post_ridge_penalty', []);
+POST_MIN_EIG       = get_cfg(cfg, 'post_min_eig', get_cfg(cfg, 'min_eig', 1e-8));
+POST_STORE_AUX     = get_cfg(cfg, 'post_store_aux', false);
+
 % Stoch-Specific Config (helper at bottom)
 stoch_cfg = get_stoch_cfg_(cfg);
 
@@ -77,10 +87,12 @@ else
 end
 
 W_gamma = get_cfg(cfg, 'weight_matrix', ones(Nr));
+W_gamma(1:Nr+1:end) = 0;
+dwi_aux = struct();
 dwi_mask = [];
 if isfield(cfg, 'dwi_C') && ~isempty(cfg.dwi_C)
     if VERBOSE, fprintf('[J-SPACE-3D-STOCH] Using DWI soft prior.\n'); end
-    [W_gamma, dwi_mask] = build_dwi_soft_prior_(cfg.dwi_C, Nr, cfg);
+    [W_gamma, dwi_mask, dwi_aux] = build_dwi_soft_prior_(cfg.dwi_C, Nr, cfg);
 end
 
 % Noise Covariance
@@ -173,6 +185,10 @@ max_den_limit = max(max_den_limit, min_den_limit * 1.5);
 
 % Initial Mask
 [mask0, ~] = threshold_active_mask_(m5_in_base.whitened_covariances, thr0.t_active);
+active_initial_packed = [];
+if get_cfg(cfg, 'store_active_masks', false)
+    active_initial_packed = pack_mask_cell_lower_(mask0);
+end
 if ~isempty(dwi_mask)
     for f = 1:F, mask0{f} = mask0{f} | dwi_mask; mask0{f}(1:Nr+1:end) = true; end
 end
@@ -266,6 +282,25 @@ if VERBOSE
 end
 
 outs = struct();
+outs.meta.Ns = Ns;
+outs.meta.Nr = Nr;
+outs.meta.F = F;
+outs.meta.T_spec = M_SAMPLES;
+outs.meta.m_samples = M_SAMPLES;
+outs.meta.freq_kernel = gather(K_freq);
+
+outs.dwi_prior = dwi_aux;
+outs.dwi_prior.has_dwi_mask = ~isempty(dwi_mask);
+if ~isempty(dwi_mask)
+    Mtmp = dwi_mask;
+    Mtmp(1:Nr+1:end) = false;
+    outs.dwi_prior.mask_density = nnz(tril(Mtmp, -1)) / (Nr*(Nr-1)/2);
+else
+    outs.dwi_prior.mask_density = NaN;
+end
+if get_cfg(cfg, 'store_weight_matrix', false)
+    outs.dwi_prior.W_gamma = gather(W_gamma);
+end
 outs.eta_bounds = eta_bounds; % Save bounds info from [CHECK-1]
 outs.opt_results.fval = fval;
 outs.opt_results.exitflag = exitflag;
@@ -426,107 +461,225 @@ for em_iter = 1:MAX_EM_ITER
 end
 
 % ============================================================
-% 8) Post-processing (Debias -> Rayleigh -> Refit)
+% 8) Post-processing (Debias -> Rayleigh Search -> Rescue -> HIGGS-like Refit)
 % ============================================================
 target_G = Gamma_new;
 target_S = m5_in_base.whitened_covariances;
 K_dev = gather(K_freq);
 W_dev = gather(W_gamma);
 
+if get_cfg(cfg, 'store_active_masks', false)
+    outs.active.final_mask = pack_mask_cell_lower_(active_mask_prev);
+    outs.active.final_mask_format = 'lower-triangular linear indices per frequency';
+    outs.active.final_mask_p = Nr;
+    outs.active.final_mask_F = F;
+    outs.active.initial_mask = active_initial_packed;
+
+end
+
 if DO_POST
-    if VERBOSE, fprintf('[J-SPACE-3D-STOCH] Robust Post-Processing...\n'); end
+    if VERBOSE
+        fprintf('[J-SPACE-3D-STOCH] Post-processing (debias -> search -> rescue -> refit)...\n');
+    end
 
-    % [EXTERNAL DEPENDENCY] module_debias
-    [Gamma_debiased, ~, ~, ~] = module_debias(target_G, target_S, M_SAMPLES);
+    ridge_penalty_post = POST_RIDGE_PENALTY;
+    if isempty(ridge_penalty_post)
+        ridge_penalty_post = max(outs.em_lambdas(end,2)^2, 1e-3);
+    end
 
-    if DEBIAS_ONLY
-        % ===== 新增分支：只做去偏，跳过后续所有步骤 =====
-        if VERBOSE, fprintf('  [Debias Only] Skipping Rayleigh Search and Refit.\n'); end
+    % ---- Debias only: no fixed Rayleigh threshold inside module_debias ----
+    debias_params = struct();
+    debias_params.variance_source = 'hat';
+    [Gamma_debiased, ~, Var_proxies, ~] = module_debias_v2(target_G, target_S, M_SAMPLES, debias_params);
 
-        % 将去偏后的结果直接作为最终输出
-        Gamma_refit = Gamma_debiased;
+    % ---- HIGGS-like single-frequency ridge/Frobenius template ----
+    [Gamma_base, base_aux] = module_higgs_ridge_template(target_S, ...
+        struct('ridge_penalty', ridge_penalty_post, 'min_eig', POST_MIN_EIG));
 
-        % 因为没有做稀疏化搜索，mask 默认全为 true
-        refit_mask = cell(F,1);
-        for f = 1:F
-            refit_mask{f} = true(Nr);
-        end
-
-        % 填充空缺的统计量，保持结构体完整
-        outs.post.best_r      = NaN;
-        outs.post.ray_den     = NaN;
-        outs.post.ray_den_vec = NaN;
-
-    else
-        % ===== 原有分支：完整的 Rayleigh Search + Refit =====
-
-        % Rayleigh Search
+    % ---- Rayleigh search: masks from debiased stats, scoring on ridge template ----
+    if POST_RUN_SEARCH
         ray_params = struct();
         ray_params.lambda1 = outs.em_lambdas(end,1);
+        ray_params.lambda2 = outs.em_lambdas(end,2);
         ray_params.lambda3 = outs.em_lambdas(end,3);
         ray_params.weight_mode = 'hadamard';
         ray_params.variance_source = 'hat';
         ray_params.Gamma_hat = target_G;
         ray_params.threshold_domain = 'entry';
+        ray_params.template_cell = Gamma_base;
         ray_params.r_range = RAY_RANGE;
+        ray_params.score_mode = POST_SEARCH_SCORE;
+        ray_params.density_min = min_den_limit;
+        ray_params.density_max = max_den_limit;
+        ray_params.density_penalty_weight = DENS_PEN_W;
+        ray_params.min_eig = POST_MIN_EIG;
 
-        % [EXTERNAL DEPENDENCY] module_rayleigh_search
-        [best_r, mask_cell, ~, ~] = module_rayleigh_search(Gamma_debiased, target_S, M_SAMPLES, K_dev, W_dev, ray_params);
+        [best_r, mask_cell, Var_proxies, ray_stats] = module_rayleigh_search_v2( ...
+            Gamma_debiased, target_S, M_SAMPLES, K_dev, W_dev, ray_params);
 
-        % Stats
-        [ray_den_vec, ray_den_med, ~, ~] = mask_density_stats_(mask_cell);
-        outs.post.best_r      = best_r;
-        outs.post.ray_den     = ray_den_med;
-        outs.post.ray_den_vec = ray_den_vec;
+        [ray_den_vec, ray_den_med, ray_den_min, ray_den_max] = mask_density_stats_(mask_cell);
+    else
+        best_r = NaN;
+        mask_cell = cell(F,1);
+        for f = 1:F
+            mask_cell{f} = true(Nr);
+        end
+        ray_den_vec = NaN(F,1);
+        ray_den_med = NaN;
+        ray_den_min = NaN;
+        ray_den_max = NaN;
+        ray_stats = struct();
+    end
 
-        % Rescue Decision
-        need_rescue = (ray_den_med < min_den_limit) || (ray_den_med > max_den_limit);
-        need_rescue = 1;
-        refit_mask = cell(F,1);
+    % ---- Rescue thresholds MUST be recomputed on the FINAL whitened covariances ----
+    [~, thr_end] = compute_scales_thresholds_(target_S, K_dev, W_dev, Nr, cfg);
 
-        if need_rescue
-            thr_rescue = thr0.t_rescue;
-            for f = 1:F
-                refit_mask{f} = abs(target_S{f}) > thr_rescue;
+    bad_ray = POST_RUN_SEARCH && ( ...
+        (~isfinite(best_r)) || ...
+        (ray_den_med < min_den_limit) || ...
+        (ray_den_med > max_den_limit));
+
+    switch POST_RESCUE_MODE
+        case 'off'
+            rescue_used = false;
+        case 'always'
+            rescue_used = true;
+        otherwise % auto
+            rescue_used = bad_ray;
+    end
+
+    refit_mask = cell(F,1);
+    if rescue_used
+        thr_rescue = thr_end.t_rescue;
+        for f = 1:F
+            refit_mask{f} = abs(target_S{f}) > thr_rescue;
+            refit_mask{f}(1:Nr+1:end) = true;
+
+            if POST_RESCUE_UNION && POST_RUN_SEARCH
+                refit_mask{f} = refit_mask{f} | mask_cell{f};
                 refit_mask{f}(1:Nr+1:end) = true;
             end
-        else
-            for f = 1:F
-                refit_mask{f} = mask_cell{f};
+
+            if ~isempty(dwi_mask)
+                refit_mask{f} = refit_mask{f} | dwi_mask;
                 refit_mask{f}(1:Nr+1:end) = true;
             end
         end
-
-        % Refit
-        refit_in = struct();
-        refit_in.whitened_covariances = target_S;
-        refit_in.smoothing_kernel     = K_dev;
-        refit_in.weight_matrix        = W_dev;
-        refit_in.precision_matrices   = target_G;
-        refit_in.active_mask          = refit_mask;
-
-        refit_params = m5_p_em;
-        refit_params.lambda2 = 0; % No sparsity penalty
-        refit_params.lambda3 = max(refit_params.lambda3, 1e-2);
-        refit_params.stoch.max_iter = EM_STOCH_MAX_ITER;
-
-        try
-            [Gamma_refit, ~] = mstep_solver(refit_in, refit_params);
-        catch
-            if VERBOSE, fprintf('  [Refit] Failed. Fallback to target_G.\n'); end
-            Gamma_refit = target_G;
+    else
+        for f = 1:F
+            refit_mask{f} = mask_cell{f};
+            refit_mask{f}(1:Nr+1:end) = true;
         end
+    end
+
+    % ---- Refit ----
+    refit_aux = struct();
+    switch POST_REFIT_MODE
+        case 'debias_only'
+            Gamma_refit = Gamma_debiased;
+
+        case 'single_ridge'
+            [Gamma_refit, refit_aux] = module_higgs_refit(target_S, refit_mask, K_dev, W_dev, ...
+                struct('mode', 'single_ridge', ...
+                       'lambda1', outs.em_lambdas(end,1), ...
+                       'lambda3', outs.em_lambdas(end,3), ...
+                       'ridge_penalty', ridge_penalty_post, ...
+                       'min_eig', POST_MIN_EIG));
+
+        case 'fused_ridge_surrogate'
+            [Gamma_refit, refit_aux] = module_higgs_refit(target_S, refit_mask, K_dev, W_dev, ...
+                struct('mode', 'fused_ridge_surrogate', ...
+                       'lambda1', outs.em_lambdas(end,1), ...
+                       'lambda3', outs.em_lambdas(end,3), ...
+                       'ridge_penalty', ridge_penalty_post, ...
+                       'min_eig', POST_MIN_EIG));
+
+        otherwise % 'stoch_mstep'
+            refit_in = struct();
+            refit_in.whitened_covariances = target_S;
+            refit_in.smoothing_kernel     = K_dev;
+            refit_in.weight_matrix        = W_dev;
+            refit_in.precision_matrices   = target_G;
+            refit_in.active_mask          = refit_mask;
+
+            refit_params = m5_p_em;
+            refit_params.lambda2 = 0; % no sparsity penalty after support selection
+            refit_params.stoch.max_iter = EM_STOCH_MAX_ITER;
+
+            try
+                [Gamma_refit, refit_aux] = mstep_solver(refit_in, refit_params);
+            catch
+                if VERBOSE
+                    fprintf('  [Refit] Stochastic refit failed. Falling back to HIGGS-like single_ridge.\n');
+                end
+                [Gamma_refit, refit_aux] = module_higgs_refit(target_S, refit_mask, K_dev, W_dev, ...
+                    struct('mode', 'single_ridge', ...
+                           'lambda1', outs.em_lambdas(end,1), ...
+                           'lambda3', outs.em_lambdas(end,3), ...
+                           'ridge_penalty', ridge_penalty_post, ...
+                           'min_eig', POST_MIN_EIG));
+            end
+    end
+
+    % ---- Diagnostics ----
+    outs.post.best_r            = best_r;
+    outs.post.ray_den           = ray_den_med;
+    outs.post.ray_den_vec       = ray_den_vec;
+    outs.post.ray_den_min       = ray_den_min;
+    outs.post.ray_den_max       = ray_den_max;
+    outs.post.rescue_used       = rescue_used;
+    outs.post.rescue_mode       = POST_RESCUE_MODE;
+    outs.post.search_score_mode = POST_SEARCH_SCORE;
+    outs.post.refit_mode        = POST_REFIT_MODE;
+    outs.post.post_ridge_penalty = ridge_penalty_post;
+    outs.post.t_active_final    = thr_end.t_active;
+    outs.post.t_rescue_final    = thr_end.t_rescue;
+    outs.post.variance_proxy_source = debias_params.variance_source;
+    if get_cfg(cfg, 'store_masks', true)
+        outs.post.rayleigh_mask = pack_mask_cell_lower_(mask_cell);
+        outs.post.final_mask = pack_mask_cell_lower_(refit_mask);
+        outs.post.mask_format = 'lower-triangular linear indices per frequency';
+        outs.post.mask_p = Nr;
+        outs.post.mask_F = F;
+
+        [final_den_vec, final_den_med, final_den_min, final_den_max] = mask_density_stats_(refit_mask);
+        outs.post.final_den_vec = final_den_vec;
+        outs.post.final_den = final_den_med;
+        outs.post.final_den_min = final_den_min;
+        outs.post.final_den_max = final_den_max;
+    end
+    if POST_STORE_AUX
+        outs.post.base_aux    = base_aux;
+        outs.post.ray_stats   = ray_stats;
+        outs.post.refit_aux   = refit_aux;
+        outs.post.Var_proxies = Var_proxies;
     end
 else
     % Post-process disabled
     Gamma_refit = target_G;
     refit_mask = cell(F,1);
-    for f=1:F
+    for f = 1:F
         refit_mask{f} = true(Nr);
     end
-    outs.post.best_r      = NaN;
-    outs.post.ray_den     = NaN;
-    outs.post.ray_den_vec = NaN; % 建议这里也补上 NaN 保持结构一致
+    outs.post.best_r             = NaN;
+    outs.post.ray_den            = NaN;
+    outs.post.ray_den_vec        = NaN(F,1);
+    outs.post.ray_den_min        = NaN;
+    outs.post.ray_den_max        = NaN;
+    outs.post.rescue_used        = false;
+    outs.post.rescue_mode        = 'off';
+    outs.post.search_score_mode  = POST_SEARCH_SCORE;
+    outs.post.refit_mode         = 'none';
+    outs.post.post_ridge_penalty = NaN;
+    outs.post.t_active_final     = NaN;
+    outs.post.t_rescue_final     = NaN;
+    if get_cfg(cfg, 'store_masks', true)
+        outs.post.rayleigh_mask = pack_mask_cell_lower_(refit_mask);
+        outs.post.final_mask = pack_mask_cell_lower_(refit_mask);
+        outs.post.mask_format = 'lower-triangular linear indices per frequency';
+        outs.post.mask_p = Nr;
+        outs.post.mask_F = F;
+    end
 end
 
 % Final Recolor
@@ -541,8 +694,61 @@ Omega_final = recol.recolored_precision_matrices;
 % ============================================================
 % 9) Return
 % ============================================================
+% ============================================================
+% 9) Return
+% ============================================================
+% ============================================================
+% 9) Return
+% ============================================================
 Omega_est = Omega_final;
-Sigma_src_est = Sigma_source_curr;
+
+% ---- 终极修复：基于自适应条件数 (Adaptive Condition Number) 的安全求逆 ----
+Sigma_src_est = cell(F, 1);
+for f = 1:F
+    % 1. 严格对称化最终的精度矩阵
+    Om = (Omega_final{f} + Omega_final{f}') / 2;
+    
+    % 2. 转换到对角线为 1 的标准相关空间 (隔离物理尺度的畸变)
+    d_Om = abs(diag(Om)); 
+    d_Om(d_Om < 1e-15) = 1e-15; 
+    D_scale = diag(1 ./ sqrt(d_Om));
+    Om_scaled = D_scale * Om * D_scale;
+    Om_scaled = (Om_scaled + Om_scaled') / 2;
+    
+    % ==========================================================
+    % 3. 【自适应正则化核心】动态计算最优 epsilon
+    % ==========================================================
+    % 提取所有特征值 (由于矩阵是 360x360，eig 计算在毫秒级，毫无压力)
+    eig_vals = real(eig(Om_scaled));
+    max_eig = max(eig_vals);
+    min_eig = min(eig_vals);
+    
+    % 设定目标最大条件数 (1e4 是复杂网络求逆的黄金安全水位)
+    target_cond = 1e4; 
+    
+    % 计算要达到该条件数，矩阵需要的"最小特征值底线"
+    safe_min_eig = max_eig / target_cond;
+    
+    % 如果当前最小特征值已经跌破底线 (甚至为负)，则自适应补足差值
+    if min_eig < safe_min_eig
+        epsilon = safe_min_eig - min_eig;
+    else
+        epsilon = 1e-12; % 如果原本就很健康，只加一个机器极小值防浮点误差
+    end
+    
+    % 施加自适应扰动
+    Om_safe = Om_scaled + epsilon * eye(Nr, 'like', Om_scaled);
+    % ==========================================================
+    
+    % 4. 此时求逆极度安全，且信号无损
+    S_scaled = inv(Om_safe);
+    
+    % 5. 还原到真实的物理量级
+    S_paired = D_scale * S_scaled * D_scale;
+    
+    % 6. 保证输出协方差矩阵的绝对对称性
+    Sigma_src_est{f} = (S_paired + S_paired') / 2;
+end
 
 outs.global_hyperparams.eta1 = eta_best(1);
 outs.global_hyperparams.eta2 = eta_best(2);
@@ -550,6 +756,7 @@ outs.global_hyperparams.eta3 = eta_best(3);
 outs.global_hyperparams.lambda1_final = outs.em_lambdas(end,1);
 outs.global_hyperparams.lambda2_final = outs.em_lambdas(end,2);
 outs.global_hyperparams.lambda3_final = outs.em_lambdas(end,3);
+
 end
 
 % ============================================================
@@ -789,35 +996,74 @@ if isfield(cfg,'t_active_override') && ~isempty(cfg.t_active_override)
 end
 end
 
-function [W_gamma, dwi_mask] = build_dwi_soft_prior_(C_in, Nr, cfg)
-C = gather(C_in); C = real(C); C = max(C, 0); C(1:Nr+1:end) = 0;
-mx = max(C(:));
-if mx <= 0
-    W_gamma = ones(Nr); dwi_mask = []; return;
-end
-C_norm = C / mx;
-mode = get_cfg(cfg, 'dwi_weight_mode', 'power');
-alpha = get_cfg(cfg, 'dwi_weight_alpha', 2.0);
-w_floor = get_cfg(cfg, 'dwi_w_floor', 0.2);
-q = get_cfg(cfg, 'dwi_mask_quantile', 0.90);
+function [W_gamma, dwi_mask, aux] = build_dwi_soft_prior_(C_in, Nr, cfg)
+C = gather(C_in);
+C = real(C);
+C = max(C, 0);
 
-switch mode
-    case 'power', base = (1 - C_norm).^alpha;
-    case 'exp', base = exp(-alpha * C_norm);
-    case 'linear', base = max(0, 1 - alpha * C_norm);
-    otherwise, error('Unknown dwi_weight_mode');
-end
-W_gamma = w_floor + (1 - w_floor) * base;
-W_gamma(1:Nr+1:end) = 1;
+% Undirected precision graph: symmetrize DWI affinity.
+C = 0.5 * (C + C.');
+C(1:Nr+1:end) = 0;
 
-dwi_mask = [];
 maskL = tril(true(Nr), -1);
-cvals = C_norm(maskL);
-if ~isempty(cvals)
-    tq = quantile(cvals, q);
-    M = (C_norm >= tq); M = M | M'; M(1:Nr+1:end) = true;
-    dwi_mask = logical(M);
+mx = max(C(maskL));
+
+aux = struct();
+aux.mode = get_cfg(cfg, 'dwi_weight_mode', 'power');
+aux.alpha = get_cfg(cfg, 'dwi_weight_alpha', 1.0);
+aux.w_floor = get_cfg(cfg, 'dwi_w_floor', 0.2);
+aux.mask_quantile = get_cfg(cfg, 'dwi_mask_quantile', 0.90);
+
+if mx <= 0
+    W_gamma = ones(Nr);
+    W_gamma(1:Nr+1:end) = 0;
+    dwi_mask = [];
+    aux.available = false;
+    aux.W_min = NaN;
+    aux.W_median = NaN;
+    aux.W_max = NaN;
+    aux.dwi_mask_density = NaN;
+    return;
 end
+
+aux.available = true;
+C_norm = C / mx;
+
+mode = aux.mode;
+alpha = aux.alpha;
+w_floor = aux.w_floor;
+
+switch lower(mode)
+    case 'power'
+        base = (1 - C_norm).^alpha;
+    case 'exp'
+        base = exp(-alpha * C_norm);
+    case 'linear'
+        base = max(0, 1 - alpha * C_norm);
+    otherwise
+        error('Unknown dwi_weight_mode: %s', mode);
+end
+
+W_gamma = w_floor + (1 - w_floor) * base;
+W_gamma = 0.5 * (W_gamma + W_gamma.');
+W_gamma(1:Nr+1:end) = 0;
+
+wvals = W_gamma(maskL);
+aux.W_min = min(wvals);
+aux.W_median = median(wvals);
+aux.W_max = max(wvals);
+
+q = aux.mask_quantile;
+cvals = C_norm(maskL);
+tq = quantile(cvals, q);
+M = (C_norm >= tq);
+M = M | M.';
+M(1:Nr+1:end) = true;
+dwi_mask = logical(M);
+
+Moff = dwi_mask;
+Moff(1:Nr+1:end) = false;
+aux.dwi_mask_density = nnz(tril(Moff, -1)) / (Nr*(Nr-1)/2);
 end
 
 function K = build_default_freq_kernel_(F)
@@ -1000,4 +1246,21 @@ end
 
 function val = get_cfg_(s, f, d)
 if isfield(s, f), val = s.(f); else, val = d; end
+end
+
+function packed = pack_mask_cell_lower_(mask_cell)
+%PACK_MASK_CELL_LOWER Pack logical masks as lower-triangular linear indices.
+%   packed{f} contains uint32 indices into the p-by-p matrix for edges
+%   in tril(mask,-1). Diagonal entries are not stored.
+
+F = numel(mask_cell);
+packed = cell(F, 1);
+
+for f = 1:F
+    M = logical(mask_cell{f});
+    p = size(M, 1);
+    M(1:p+1:end) = false;
+    idx = find(tril(M, -1));
+    packed{f} = uint32(idx);
+end
 end

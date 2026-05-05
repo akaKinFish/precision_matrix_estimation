@@ -6,7 +6,7 @@ cfg_js.max_em_iter   = 10;
 cfg_js.verbose       = true;
 cfg_js.use_gpu       = false;
 
-cfg_js.m_samples     = 1000;
+cfg_js.m_samples     = 6000;
 cfg_js.optimizer     = 'stoch_fista';
 cfg_js.freq          = freq;
 
@@ -23,13 +23,13 @@ end
 cfg_js.stoch = struct();
 cfg_js.stoch.mode = 'B';
 cfg_js.stoch.seed = 0;
-cfg_js.stoch.n_per_band = 2;
+cfg_js.stoch.n_per_band  = 2;
 cfg_js.stoch.Nsfreq = cfg_js.stoch.n_per_band;
 cfg_js.stoch.max_total  = 16;
 cfg_js.stoch.band_edges = [0 4 8 13 20];
 cfg_js.stoch.max_iter   = 40;
 cfg_js.stoch.tol        = 0;
-cfg_js.stoch.backtracking_beta = 0.5;
+cfg_js.stoch.backtracking_factor = 2.0;
 cfg_js.stoch.max_backtracking  = 20;
 cfg_js.stoch.monotone          = true;
 cfg_js.stoch.use_restart       = true;
@@ -37,7 +37,7 @@ cfg_js.stoch.rescale_kernel_mass = true;
 
 cfg_js.opt_max_evals   = 80;     % 先加一点
 cfg_js.opt_min_points  = 10;
-cfg_js.opt_use_parallel = true;
+cfg_js.opt_use_parallel = false;
 
 % ---- eta bounds (looser lbs) ----
 cfg_js.eta1_lb = 1e-4;  cfg_js.eta1_ub = 3e-2;
@@ -94,8 +94,48 @@ for i = 1:Nw
     Svv_cross(:,:,i) = Si;
 end
 
+cfg_js.postprocess_enable = true;
 
+cfg_js.lowrank_enable = true;
+
+% 共享 mode u 的估计频带：可以稍微放宽
+cfg_js.lowrank_alpha_band = [6 14];
+
+% alpha_f 的跨频平滑（你原来的）
+cfg_js.lowrank_alpha_smooth = 0.25;
+
+% ===== NEW adaptive gate =====
+cfg_js.lowrank_gate_enable = true;
+cfg_js.lowrank_gate_search_band = [6 14];   % 只是找峰的候选带，不是最终门控范围
+cfg_js.lowrank_gate_smooth = 0.15;          % 对 gate envelope 的轻平滑
+cfg_js.lowrank_gate_fraction = 0.45;        % 以 45% 峰值位置估宽度
+cfg_js.lowrank_gate_floor = 0.02;           % 频带外留一点点，不要硬清零
+cfg_js.lowrank_gate_min_width_hz = 0.8;
+cfg_js.lowrank_gate_max_width_hz = 3.0;
+
+cfg_js.internal_debias = true;
+cfg_js.debias_blend = 1.0;          % 若内部 debias 太激进，可改 0.3~0.7
+cfg_js.surrogate_mode = 'mini_em';  % 'mini_em' 或 'mstep1'
+cfg_js.surrogate_em_iter = 3;       % 建议先 2；更贴近 full EM 可试 3
+cfg_js.warm_start_from_search = true;
+cfg_js.warm_start_sigma_from_search = false;
+cfg_js.mask_union = true;
+cfg_js.update_rate = 0.35;
+
+cfg_js.obj_stoch_max_iter = 8;      % surrogate 每轮 M-step 截断迭代
+cfg_js.em_stoch_max_iter = 30;      % full EM 的 M-step 迭代
+
+cfg_js.post_run_search   = true;
+cfg_js.post_rescue_mode  = 'auto';
+cfg_js.post_refit_mode   = 'single_ridge';          % 先跑这个
+cfg_js.post_search_score = 'hybrid';
+
+cfg_js.post_store_aux    = true;
+cfg_js.store_masks       = true;
+cfg_js.store_active_masks = true; 
+cfg_js.store_weight_matrix = true;
 % Call solver
-[Omega_est, Sjj_est, outs_js] = solver_jspace_3d_opt_stoch(Svv_cross, L, [], cfg_js);
+% [Omega_est, Sjj_est, outs_js] = solver_jspace_3d_opt_stoch_v3(Svv_cross, L, [], cfg_js);
+[Omega_est, Sjj_est, outs_js] = solver_jspace_3d_opt_stoch_v4(Svv_cross, L, [], cfg_js);
 
 end

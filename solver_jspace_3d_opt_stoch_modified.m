@@ -1,4 +1,4 @@
-function [Omega_est, Sigma_src_est, outs] = solver_jspace_3d_opt_stoch(Svv_cell, L, GraphLaplacian, cfg)
+function [Omega_est, Sigma_src_est, outs] = solver_jspace_3d_opt_stoch_modified(Svv_cell, L, GraphLaplacian, cfg)
 % SOLVER_JSPACE_3D_OPT_STOCH
 %   J-SPACE Scheme-1: eta-search (surrogateopt) + stable EM + Stochastic M-step.
 %
@@ -58,8 +58,14 @@ MASK_UNION_MODE = get_cfg(cfg, 'mask_union', true);
 RAY_RANGE          = get_cfg(cfg, 'rayleigh_range', 2.0:0.2:5.0);
 M_SAMPLES          = get_cfg(cfg, 'm_samples', 100 * Nr);
 UPDATE_RATE        = get_cfg(cfg, 'update_rate', 0.35);
-UPDATE_RATE = 1;
-DEBIAS_ONLY = true;
+
+% Post-processing policy
+POST_MODE              = lower(get_cfg(cfg, 'post_mode', 'debiased_support_refit'));
+POST_DENSITY_MULT      = get_cfg(cfg, 'post_density_multiplier', 1.25);
+POST_TARGET_DENSITY    = get_cfg(cfg, 'post_target_density', NaN);
+POST_SUPPORT_TAU_MIN   = get_cfg(cfg, 'post_support_tau_min', PCOR_EPS);
+POST_SUPPORT_USE_DWI   = get_cfg(cfg, 'post_support_union_dwi', true);
+
 % Stoch-Specific Config (helper at bottom)
 stoch_cfg = get_stoch_cfg_(cfg);
 
@@ -360,8 +366,7 @@ for em_iter = 1:MAX_EM_ITER
 
     % Set deterministic seed based on EM iter for reproducibility
     m5_p_em.stoch.seed = stoch_cfg.seed + em_iter;
-    % m5_p_em.stoch.band_groups = {1:F};   % 只有一个 band，包含全部频点
-    m5_p_em.stoch.m_per_band = 3;  
+
     [Gamma_new, res] = mstep_solver(local_in, m5_p_em);
     %%% batch coverage in this M-step call
     covered = false(1,F);
@@ -426,7 +431,7 @@ for em_iter = 1:MAX_EM_ITER
 end
 
 % ============================================================
-% 8) Post-processing (Debias -> Rayleigh -> Refit)
+% 8) Post-processing (Debias -> Debiased-Support Refit)
 % ============================================================
 target_G = Gamma_new;
 target_S = m5_in_base.whitened_covariances;
@@ -434,115 +439,189 @@ K_dev = gather(K_freq);
 W_dev = gather(W_gamma);
 
 if DO_POST
-    if VERBOSE, fprintf('[J-SPACE-3D-STOCH] Robust Post-Processing...\n'); end
+    if VERBOSE, fprintf('[J-SPACE-3D-STOCH] Post-Processing mode: %s\n', POST_MODE); end
 
     % [EXTERNAL DEPENDENCY] module_debias
     [Gamma_debiased, ~, ~, ~] = module_debias(target_G, target_S, M_SAMPLES);
+    Gamma_debiased = project_spd_cell_(Gamma_debiased, m5_p_base.min_eig);
 
-    if DEBIAS_ONLY
-        % ===== 新增分支：只做去偏，跳过后续所有步骤 =====
-        if VERBOSE, fprintf('  [Debias Only] Skipping Rayleigh Search and Refit.\n'); end
+    outs.post.mode = POST_MODE;
 
-        % 将去偏后的结果直接作为最终输出
-        Gamma_refit = Gamma_debiased;
+    switch POST_MODE
+        case 'debiased_only'
+            if VERBOSE, fprintf('  [Post] Debias only. No support refit.\n'); end
+            Gamma_final = Gamma_debiased;
+            refit_mask = cell(F,1);
+            for f = 1:F, refit_mask{f} = true(Nr); end
+            outs.post.support_tau = NaN;
+            outs.post.support_density = NaN;
+            outs.post.support_density_vec = NaN;
+            outs.post.support_target_density = NaN;
+            outs.post.best_r = NaN;
+            outs.post.ray_den = NaN;
+            outs.post.ray_den_vec = NaN;
 
-        % 因为没有做稀疏化搜索，mask 默认全为 true
-        refit_mask = cell(F,1);
-        for f = 1:F
-            refit_mask{f} = true(Nr);
-        end
+        case 'legacy_rayleigh_refit'
+            if VERBOSE, fprintf('  [Post] Legacy Rayleigh + refit branch.\n'); end
+            ray_params = struct();
+            ray_params.lambda1 = outs.em_lambdas(end,1);
+            ray_params.lambda3 = outs.em_lambdas(end,3);
+            ray_params.weight_mode = 'hadamard';
+            ray_params.variance_source = 'hat';
+            ray_params.Gamma_hat = target_G;
+            ray_params.threshold_domain = 'entry';
+            ray_params.r_range = RAY_RANGE;
 
-        % 填充空缺的统计量，保持结构体完整
-        outs.post.best_r      = NaN;
-        outs.post.ray_den     = NaN;
-        outs.post.ray_den_vec = NaN;
+            [best_r, mask_cell, ~, ~] = module_rayleigh_search(Gamma_debiased, target_S, M_SAMPLES, K_dev, W_dev, ray_params);
+            [ray_den_vec, ray_den_med, ~, ~] = mask_density_stats_(mask_cell);
+            outs.post.best_r      = best_r;
+            outs.post.ray_den     = ray_den_med;
+            outs.post.ray_den_vec = ray_den_vec;
 
-    else
-        % ===== 原有分支：完整的 Rayleigh Search + Refit =====
-
-        % Rayleigh Search
-        ray_params = struct();
-        ray_params.lambda1 = outs.em_lambdas(end,1);
-        ray_params.lambda3 = outs.em_lambdas(end,3);
-        ray_params.weight_mode = 'hadamard';
-        ray_params.variance_source = 'hat';
-        ray_params.Gamma_hat = target_G;
-        ray_params.threshold_domain = 'entry';
-        ray_params.r_range = RAY_RANGE;
-
-        % [EXTERNAL DEPENDENCY] module_rayleigh_search
-        [best_r, mask_cell, ~, ~] = module_rayleigh_search(Gamma_debiased, target_S, M_SAMPLES, K_dev, W_dev, ray_params);
-
-        % Stats
-        [ray_den_vec, ray_den_med, ~, ~] = mask_density_stats_(mask_cell);
-        outs.post.best_r      = best_r;
-        outs.post.ray_den     = ray_den_med;
-        outs.post.ray_den_vec = ray_den_vec;
-
-        % Rescue Decision
-        need_rescue = (ray_den_med < min_den_limit) || (ray_den_med > max_den_limit);
-        need_rescue = 1;
-        refit_mask = cell(F,1);
-
-        if need_rescue
-            thr_rescue = thr0.t_rescue;
-            for f = 1:F
-                refit_mask{f} = abs(target_S{f}) > thr_rescue;
-                refit_mask{f}(1:Nr+1:end) = true;
+            need_rescue = (ray_den_med < min_den_limit) || (ray_den_med > max_den_limit);
+            refit_mask = cell(F,1);
+            if need_rescue
+                thr_rescue = thr0.t_rescue;
+                for f = 1:F
+                    refit_mask{f} = abs(target_S{f}) > thr_rescue;
+                    refit_mask{f}(1:Nr+1:end) = true;
+                end
+            else
+                for f = 1:F
+                    refit_mask{f} = mask_cell{f};
+                    refit_mask{f}(1:Nr+1:end) = true;
+                end
             end
-        else
-            for f = 1:F
-                refit_mask{f} = mask_cell{f};
-                refit_mask{f}(1:Nr+1:end) = true;
+
+            refit_in = struct();
+            refit_in.whitened_covariances = target_S;
+            refit_in.smoothing_kernel     = K_dev;
+            refit_in.weight_matrix        = W_dev;
+            refit_in.precision_matrices   = target_G;
+            refit_in.active_mask          = refit_mask;
+
+            refit_params = m5_p_em;
+            refit_params.lambda2 = 0;
+            refit_params.stoch.max_iter = EM_STOCH_MAX_ITER;
+
+            try
+                [Gamma_refit, ~] = mstep_solver(refit_in, refit_params);
+                Gamma_final = Gamma_refit;
+            catch
+                if VERBOSE, fprintf('  [Refit] Legacy refit failed. Falling back to debiased Gamma.\n'); end
+                Gamma_final = Gamma_debiased;
             end
-        end
 
-        % Refit
-        refit_in = struct();
-        refit_in.whitened_covariances = target_S;
-        refit_in.smoothing_kernel     = K_dev;
-        refit_in.weight_matrix        = W_dev;
-        refit_in.precision_matrices   = target_G;
-        refit_in.active_mask          = refit_mask;
+            outs.post.support_tau = NaN;
+            outs.post.support_density = NaN;
+            outs.post.support_density_vec = NaN;
+            outs.post.support_target_density = NaN;
 
-        refit_params = m5_p_em;
-        refit_params.lambda2 = 0; % No sparsity penalty
-        refit_params.lambda3 = max(refit_params.lambda3, 1e-2);
-        refit_params.stoch.max_iter = EM_STOCH_MAX_ITER;
+        otherwise  % debiased_support_refit
+            if isnan(POST_TARGET_DENSITY)
+                base_density = outs.em_density_trace(end);
+                if ~isfinite(base_density) || base_density <= 0
+                    base_density = thr0.data_density;
+                end
+                target_density_post = base_density * POST_DENSITY_MULT;
+            else
+                target_density_post = POST_TARGET_DENSITY;
+            end
+            target_density_post = min(max(target_density_post, min_den_limit), max_den_limit);
 
-        try
-            [Gamma_refit, ~] = mstep_solver(refit_in, refit_params);
-        catch
-            if VERBOSE, fprintf('  [Refit] Failed. Fallback to target_G.\n'); end
-            Gamma_refit = target_G;
-        end
+            [refit_mask, sup_stats] = support_from_debiased_pcor_( ...
+                Gamma_debiased, target_density_post, POST_SUPPORT_TAU_MIN, dwi_mask, POST_SUPPORT_USE_DWI);
+
+            outs.post.support_tau = sup_stats.tau;
+            outs.post.support_density = sup_stats.density;
+            outs.post.support_density_vec = sup_stats.density_vec;
+            outs.post.support_target_density = target_density_post;
+            outs.post.best_r = NaN;
+            outs.post.ray_den = NaN;
+            outs.post.ray_den_vec = NaN;
+
+            if VERBOSE
+                fprintf('  [Post] Debiased support refit: tau=%.3e | targetDen=%.3f | actualDen=%.3f\n', ...
+                    sup_stats.tau, target_density_post, sup_stats.density);
+            end
+
+            refit_in = struct();
+            refit_in.whitened_covariances = target_S;
+            refit_in.smoothing_kernel     = K_dev;
+            refit_in.weight_matrix        = W_dev;
+            refit_in.precision_matrices   = target_G;   % warm start stays SPD
+            refit_in.active_mask          = refit_mask;
+
+            refit_params = m5_p_em;
+            refit_params.lambda2 = 0;  % remove L1 shrinkage on fixed support
+            refit_params.stoch.max_iter = EM_STOCH_MAX_ITER;
+
+            try
+                [Gamma_refit, ~] = mstep_solver(refit_in, refit_params);
+                Gamma_final = Gamma_refit;
+            catch
+                if VERBOSE, fprintf('  [Refit] Debiased-support refit failed. Falling back to debiased Gamma.\n'); end
+                Gamma_final = Gamma_debiased;
+            end
     end
 else
     % Post-process disabled
-    Gamma_refit = target_G;
+    Gamma_final = target_G;
     refit_mask = cell(F,1);
-    for f=1:F
-        refit_mask{f} = true(Nr);
-    end
-    outs.post.best_r      = NaN;
-    outs.post.ray_den     = NaN;
-    outs.post.ray_den_vec = NaN; % 建议这里也补上 NaN 保持结构一致
+    for f = 1:F, refit_mask{f} = true(Nr); end
+    outs.post.mode = 'disabled';
+    outs.post.best_r = NaN;
+    outs.post.ray_den = NaN;
+    outs.post.ray_den_vec = NaN;
+    outs.post.support_tau = NaN;
+    outs.post.support_density = NaN;
+    outs.post.support_density_vec = NaN;
+    outs.post.support_target_density = NaN;
 end
 
 % Final Recolor
 m8_in = struct();
-m8_in.whitened_precision_matrices = Gamma_refit;
+m8_in.whitened_precision_matrices = Gamma_final;
 m8_in.whitening_matrices          = D_cell;
 m8_in.active_set_masks            = refit_mask;
 m8_in.original_covariances        = Sigma_source_curr;
 recol = module8_recoloring(m8_in, struct('verbose', false));
-Omega_final = recol.recolored_precision_matrices;
+Omega_final_raw = recol.recolored_precision_matrices;
 
 % ============================================================
-% 9) Return
+% 9) Build final paired outputs from Omega_final
 % ============================================================
-Omega_est = Omega_final;
-Sigma_src_est = Sigma_source_curr;
+Omega_final_spd = cell(F,1);
+Sigma_final     = cell(F,1);
+pair_relerr_vs_state = zeros(F,1);
+for f = 1:F
+    Om = (Omega_final_raw{f} + Omega_final_raw{f}')/2;
+    [Om_spd, ~] = utils_math.project_spd(Om, m5_p_base.min_eig);
+    Om_spd = utils_math.make_hermitian(Om_spd);
+    Omega_final_spd{f} = Om_spd;
+
+    I_nr = eye(Nr, 'like', Om_spd);
+    Sf = Om_spd \ I_nr;
+    Sf = utils_math.make_hermitian(Sf);
+    Sigma_final{f} = Sf;
+
+    S_state = utils_math.make_hermitian(Sigma_source_curr{f});
+    pair_relerr_vs_state(f) = norm(Sf - S_state, 'fro') / max(norm(Sf, 'fro'), 1e-12);
+end
+
+% ============================================================
+% 10) Return
+% ============================================================
+Omega_est = Omega_final_spd;
+Sigma_src_est = Sigma_final;
+
+outs.sigma_state_em = Sigma_source_curr;
+outs.omega_final_raw = Omega_final_raw;
+outs.omega_final_spd = Omega_final_spd;
+outs.sigma_pair_from_omega = Sigma_final;
+outs.sigma_pair_relerr_vs_state = pair_relerr_vs_state;
+outs.output_semantics = ...
+    'Omega_est is the final SPD precision; Sigma_src_est is reconstructed as inv(Omega_est). outs.sigma_state_em stores the EM internal covariance state.';
 
 outs.global_hyperparams.eta1 = eta_best(1);
 outs.global_hyperparams.eta2 = eta_best(2);
@@ -723,13 +802,19 @@ for f = 1:F, Sbar = Sbar + Sjj_cpu_cell{f}; end
 Sbar = utils_math.make_hermitian(Sbar / F);
 I = eye(p);
 
+l2_scale_mode = lower(get_cfg(cfg, 'lambda2_scale_mode', 'unweighted'));
 if p < 2
     lambda2_max = 0;
 else
     maskL = tril(true(p), -1);
     S_off = abs(Sbar(maskL));
-    W_off = abs(W_gamma_cpu(maskL));
-    ratios = S_off ./ max(W_off, eps);
+    switch l2_scale_mode
+        case 'weighted'
+            W_off = abs(W_gamma_cpu(maskL));
+            ratios = S_off ./ max(W_off, eps);
+        otherwise
+            ratios = S_off;
+    end
     ratios = ratios(isfinite(ratios));
     if isempty(ratios), lambda2_max = 0; else, lambda2_max = max(ratios); end
 end
@@ -780,12 +865,72 @@ sc.lambda1_scale = lambda1_scale;
 sc.lambda2_max   = lambda2_max;
 sc.lambda3_scale = lambda3_scale;
 sc.lk_norm       = lk_norm;
+sc.lambda2_scale_mode = l2_scale_mode;
 thr.t_active     = t_active;
 thr.t_rescue     = max(t_active, q95);
 thr.data_density = data_density;
 
 if isfield(cfg,'t_active_override') && ~isempty(cfg.t_active_override)
     thr.t_active = cfg.t_active_override;
+end
+end
+
+
+function [mask_cell, stats] = support_from_debiased_pcor_(G_cell, target_density, tau_min, dwi_mask, use_dwi)
+if nargin < 5, use_dwi = true; end
+F = numel(G_cell);
+p = size(G_cell{1},1);
+maskL = tril(true(p), -1);
+vals = [];
+for f = 1:F
+    P = pcor_from_G_(G_cell{f});
+    vals = [vals; P(maskL)]; %#ok<AGROW>
+end
+vals = vals(isfinite(vals));
+vals = vals(vals > 0);
+if isempty(vals)
+    tau = inf;
+else
+    target_density = max(0, min(1, target_density));
+    q = max(0, min(1, 1 - target_density));
+    tau = quantile(vals, q);
+    tau = max(tau, tau_min);
+end
+mask_cell = cell(F,1);
+dens_vec = zeros(F,1);
+for f = 1:F
+    P = pcor_from_G_(G_cell{f});
+    M = P >= tau;
+    M(1:p+1:end) = true;
+    if use_dwi && ~isempty(dwi_mask)
+        M = M | dwi_mask;
+        M(1:p+1:end) = true;
+    end
+    mask_cell{f} = M;
+    dens_vec(f) = ((nnz(M) - p) / 2) / (p*(p-1)/2);
+end
+stats.tau = tau;
+stats.density_vec = dens_vec;
+stats.density = median(dens_vec);
+stats.target_density = target_density;
+end
+
+function P = pcor_from_G_(G)
+G = utils_math.make_hermitian(G);
+p = size(G,1);
+d = max(real(diag(G)), 1e-12);
+P = abs(-G ./ sqrt(d*d.'));
+P(1:p+1:end) = 0;
+end
+
+function G_out = project_spd_cell_(G_in, min_eig)
+if ~iscell(G_in), G_in = {G_in}; end
+F = numel(G_in);
+G_out = cell(F,1);
+for f = 1:F
+    G = utils_math.make_hermitian(G_in{f});
+    [Gspd, ~] = utils_math.project_spd(G, min_eig);
+    G_out{f} = utils_math.make_hermitian(Gspd);
 end
 end
 
@@ -822,7 +967,7 @@ end
 
 function K = build_default_freq_kernel_(F)
 if F <= 1, K = 1; return; end
-K = zeros(F);
+K = eye(F);
 for i = 1:(F-1), K(i, i+1) = 1; K(i+1, i) = 1; end
 end
 
